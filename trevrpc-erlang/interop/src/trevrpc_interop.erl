@@ -10,7 +10,8 @@
 %% trevrpc-interop-erlang bench  --addr <host:port> --ca <pem> [--server-name localhost]
 %%                               --transport quic|tcp [--tcp-addr <host:port>] --scenario <name>
 %%                               [--size N] [--concurrency N] [--connections N]
-%%                               [--min-quic-connections N] [--duration S]
+%%                               [--min-quic-connections N] [--max-quic-connections N]
+%%                               [--duration S]
 %%                               [--warmup S] [--messages N] [--rate N] [--metadata-size N]
 %%                               [--metadata-scope call] [--payload repeat|records]
 %%                               [--compression MODE] [--dictionary <file>] [--validation none]
@@ -104,6 +105,7 @@ run(["bench" | Args]) ->
             "concurrency",
             "connections",
             "min-quic-connections",
+            "max-quic-connections",
             "duration",
             "warmup",
             "messages",

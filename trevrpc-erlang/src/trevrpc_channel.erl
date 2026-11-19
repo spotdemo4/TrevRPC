@@ -23,13 +23,17 @@
 %% reconnects use it directly until the reprobe interval (5 minutes) has
 %% passed, then race again. `quic' and `tcp' pin one transport.
 %%
-%% Over native QUIC, `min_quic_connections' keeps a pool of that many
-%% connections and spreads the calls over it, each to the connection with
-%% the fewest in flight. The generation's own connection is the pool's
-%% first and decides its life; the others, its extras, are dialled when it
-%% is ready and again when lost, which fails only their own calls. When the
-%% generation ends its extras drain: they take no new calls and close after
-%% their last.
+%% Over native QUIC, a generation keeps a pool of connections: at least
+%% `min_quic_connections' (1 by default), and under load up to
+%% `max_quic_connections' (the schedulers online, from one to four, by
+%% default), as trevrpc_quic_pool describes. The generation's own
+%% connection is the pool's first and decides its life; the others, its
+%% extras, are dialled when it is ready, or when the pool grows. An extra
+%% that is lost fails only its own calls, and one of the minimum is dialled
+%% again; one the pool added closes once it went unused for
+%% `quic_connection_idle_timeout' (30 s by default). When the generation
+%% ends its extras drain: they take no new calls and close after their
+%% last.
 %%
 %% The channel process owns the connection and routes each stream's events
 %% to the process that made the call, which reads and writes the stream
@@ -53,7 +57,8 @@
     unsubscribe/1,
     close/1
 ]).
--export([open_stream/2, open_stream/3, stream_done/3, learn/3, reserve/4, release/4, optimism/3]).
+-export([open_stream/2, open_stream/3, open_stream/4]).
+-export([stream_done/3, learn/3, reserve/4, release/4, optimism/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, stream_info/0, state/0]).
@@ -82,7 +87,16 @@
     idle_timeout => pos_integer(),
     compression => trevrpc_zstd:settings(),
     stream_compression_memory => non_neg_integer(),
-    min_quic_connections => pos_integer()
+    min_quic_connections => pos_integer(),
+    max_quic_connections => pos_integer(),
+    %% Calls and bytes per second, per connection, the pool spreads and
+    %% grows at (5000 and 20 MB/s by default).
+    quic_connection_call_rate => pos_integer(),
+    quic_connection_byte_rate => pos_integer(),
+    %% How long a streaming call that finds its connection crowded waits for
+    %% the connection the pool dials, in milliseconds (100 by default).
+    quic_crowded_dial_wait => non_neg_integer(),
+    quic_connection_idle_timeout => pos_integer()
 }.
 
 %% What a calling process needs to use a stream it opened.
@@ -103,27 +117,42 @@
     %% The stream's datagram flow and its credit, when the calling process
     %% asked for one and the connection carries datagrams.
     flow := {pos_integer(), trevrpc_datagram_flows:credit()} | undefined,
-    %% The generation's connections, numbered, as of a version, and the
-    %% counters callers read to open their own streams (see open_stream/3).
-    pool := {non_neg_integer(), [{pos_integer(), trevrpc_transport:t()}]},
-    counters := atomics:atomics_ref()
+    %% The generation's connections, numbered, as of a version, with the
+    %% pool's limits, and the counters callers read to open their own
+    %% streams (see open_stream/3).
+    pool := {non_neg_integer(), [{pos_integer(), trevrpc_transport:t()}], pool_limits()},
+    counters := trevrpc_quic_pool:counters()
 }.
+
+%% The pool's limits, and how long a streaming call waits for a connection
+%% the pool dials.
+-type pool_limits() :: {trevrpc_quic_pool:limits(), non_neg_integer()}.
 
 %% Whether a call asks for a datagram flow, and whether it reads a stream of
 %% responses on it.
 -type datagrams() :: boolean() | undefined.
 
+%% The process that opens a stream, whether its call asks for a datagram
+%% flow, and whether it is streaming.
+-type opener() :: {pid(), datagrams(), boolean()}.
+
 -define(INITIAL_DELAY, 100).
 -define(MAX_DELAY, 30000).
 -define(CANCELLED, 1).
 -define(STREAM_COMPRESSION_MEMORY, 67108864).
-%% The counters a channel publishes for callers that open their own
-%% streams: the opens it holds for stream credit, the version of its pool
-%% of connections, and from ?LOADS + 1 on, the calls in flight on each of
-%% the pool's connections, by number.
--define(QUEUED, 1).
--define(VERSION, 2).
--define(LOADS, 2).
+-define(CALL_RATE, 5000).
+%% A fifth of what one erlang_quic connection carried on 4 KiB bidirectional
+%% streams, and more than a 100 Mbit/s link can.
+-define(BYTE_RATE, 20000000).
+-define(CROWDED_DIAL_WAIT, 100).
+-define(POOL_IDLE_TIMEOUT, 30000).
+%% How long the pool waits after a failed dial before it grows again.
+-define(GROW_RETRY, 5000).
+%% How long the channel waits for its connections' bytes and round trips.
+-define(SAMPLE_TIMEOUT, 1000).
+%% The highest number of the extras of the pool's minimum: those above it
+%% the pool added as it grew.
+-define(MIN_SLOT(Limits), trevrpc_quic_pool:min(Limits)).
 
 %% A stream, by its connection's process and its ID on that connection.
 -type key() :: {pid(), non_neg_integer()}.
@@ -199,12 +228,11 @@
     streams = #{} :: #{key() => {pid(), reference(), reference()}},
     refs = #{} :: #{reference() => key()},
     monitors = #{} :: #{reference() => key()},
-    %% Opens refused for lack of stream credit, waiting for more, with the
-    %% calling process and whether it asked for a datagram flow.
-    pending_opens = [] :: [{gen_server:from(), {pid(), datagrams()}, reference()}],
-    %% The counters callers that open their own streams read (?QUEUED and
-    %% the others).
-    counters :: atomics:atomics_ref(),
+    %% Opens refused for lack of stream credit, waiting for more.
+    pending_opens = [] :: [{gen_server:from(), opener(), reference()}],
+    %% The counters callers that open their own streams read (see
+    %% trevrpc_quic_pool).
+    counters :: trevrpc_quic_pool:counters(),
     %% The datagram flows of the connection's calls, the flow of each
     %% stream that has one, and whether the connection carries datagrams,
     %% once a call asked.
@@ -214,11 +242,16 @@
     %% Processes waiting for each connection's send queue to drain.
     send_waiters = #{} :: #{pid() => [{pid(), reference()}]},
     %% Over native QUIC, the generation's own connection is number 1 of its
-    %% pool, and min_quic_connections - 1 more, the extras, join it: each
-    %% with its number, monitor and parent, while they are dialled, and with
-    %% the delay before one lost is dialled again. Extras of a generation
-    %% that ended drain: they take no new calls and close after their last.
-    min_quic = 1 :: pos_integer(),
+    %% pool, and up to quic_limits' maximum - 1 more, the extras, join it:
+    %% each with its number, monitor and parent, while they are dialled, and
+    %% with the delay before one of the minimum, lost, is dialled again.
+    %% Extras of a generation that ended drain: they take no new calls and
+    %% close after their last. The current generation's limits are QMux's
+    %% single connection over QMux.
+    quic_limits :: trevrpc_quic_pool:limits(),
+    limits :: trevrpc_quic_pool:limits(),
+    crowded_dial_wait = ?CROWDED_DIAL_WAIT :: non_neg_integer(),
+    pool_idle_timeout = ?POOL_IDLE_TIMEOUT :: pos_integer(),
     version = 0 :: non_neg_integer(),
     extras = #{} :: #{pid() => extra()},
     draining = #{} :: #{pid() => extra()},
@@ -229,8 +262,22 @@
     %% still dials extras, which holds back wait_until_ready/2.
     held_events = #{} :: #{pid() => [term()]},
     pool_settling = false :: boolean(),
-    %% The calls in flight on each connection.
+    %% The calls in flight on each connection, and the streaming calls.
     loads = #{} :: #{pid() => non_neg_integer()},
+    streaming = #{} :: #{key() => true},
+    %% Opens of streaming calls that found their connection crowded, held
+    %% for the connection the pool dials, the extras the pool added that
+    %% took a call since the last idle check, and whether that check is
+    %% armed.
+    crowded_opens = [] :: [{gen_server:from(), opener(), trevrpc_stream:deadline(), reference()}],
+    used = #{} :: #{pid() => true},
+    idle_check = false :: boolean(),
+    %% The measure of the connections' bytes and round trips under way, by
+    %% its tag, process and timer, and the bytes each had moved, and when,
+    %% as last measured.
+    sampling = false :: false | {reference(), pid(), reference()},
+    sampled_at :: integer() | undefined,
+    sampled_bytes = #{} :: #{pid() => non_neg_integer()},
     %% Processes told of every change of state.
     subscribers = #{} :: #{reference() => pid()}
 }).
@@ -317,54 +364,73 @@ close(Channel) ->
 -spec open_stream(pid(), trevrpc_stream:deadline()) ->
     {ok, stream_info()} | {error, trevrpc_status:status()}.
 open_stream(Channel, Deadline) ->
-    open_stream(Channel, Deadline, undefined).
+    open_stream(Channel, Deadline, undefined, false).
+
+%% @private Opens a stream for a call that is not streaming, as {@link
+%% open_stream/4} does.
+-spec open_stream(pid(), trevrpc_stream:deadline(), datagrams()) ->
+    {ok, stream_info()} | {error, trevrpc_status:status()}.
+open_stream(Channel, Deadline, Datagrams) ->
+    open_stream(Channel, Deadline, Datagrams, false).
 
 %% @private Opens a stream as {@link open_stream/2} does, giving it a
 %% datagram flow if `Datagrams' asks for one (`true' when the call reads a
 %% stream of responses, `false' when it reads one response) and the
-%% connection carries datagrams.
+%% connection carries datagrams. `Streaming' says whether the call streams
+%% requests or responses, which crowd a connection (see trevrpc_quic_pool).
 %%
 %% The calling process remembers the channel's connections and their
-%% generation from its last stream, opens the stream itself on the one with
-%% the fewest calls in flight (the generation's own for a call that asks
-%% for a datagram flow), and registers it with the channel before it writes
-%% to it, so no event of the stream can reach the channel first. The
-%% channel opens it instead when the process knows no connection yet, its
-%% connections changed, the server's stream limit is reached (the channel
-%% waits for credit, and the process waits behind the opens already
-%% waiting), or the connection is gone or was replaced.
--spec open_stream(pid(), trevrpc_stream:deadline(), datagrams()) ->
+%% generation from its last stream, opens the stream itself on the one
+%% trevrpc_quic_pool:choose/5 picks, and registers it with the channel
+%% before it writes to it, so no event of the stream can reach the channel
+%% first. The channel opens it instead when the process knows no connection
+%% yet, its connections changed, the server's stream limit is reached (the
+%% channel waits for credit, and the process waits behind the opens already
+%% waiting), the connection is gone or was replaced, or the process waited
+%% for a connection the pool dialled.
+-spec open_stream(pid(), trevrpc_stream:deadline(), datagrams(), boolean()) ->
     {ok, stream_info()} | {error, trevrpc_status:status()}.
-open_stream(Channel, Deadline, Datagrams) ->
+open_stream(Channel, Deadline, Datagrams, Streaming) ->
+    Opener = {self(), Datagrams, Streaming},
     case get({?MODULE, Channel}) of
-        {Generation, Version, Pool, Counters} ->
+        {Generation, Version, Pool, Counters, {Limits, Wait}} ->
             case
-                atomics:get(Counters, ?QUEUED) =:= 0 andalso
-                    atomics:get(Counters, ?VERSION) =:= Version
+                trevrpc_quic_pool:queued(Counters) =:= 0 andalso
+                    trevrpc_quic_pool:version(Counters) =:= Version
             of
                 true ->
-                    Transport = place(Pool, Counters, Datagrams),
-                    own_open(Channel, Generation, Transport, Deadline, Datagrams);
+                    case trevrpc_quic_pool:choose(Pool, Counters, Limits, Datagrams, Streaming) of
+                        {_Transport, _Grow, true, Sample} when Wait > 0 ->
+                            %% Crowded: the channel holds the open for the
+                            %% connection the pool dials.
+                            sample(Channel, Sample),
+                            channel_open(Channel, Deadline, Opener, true);
+                        {Transport, Grow, _Crowded, Sample} ->
+                            sample(Channel, Sample),
+                            grow(Channel, Counters, Grow),
+                            own_open(Channel, Generation, Transport, Deadline, Opener)
+                    end;
                 false ->
-                    channel_open(Channel, Deadline, Datagrams)
+                    channel_open(Channel, Deadline, Opener, false)
             end;
         undefined ->
-            channel_open(Channel, Deadline, Datagrams)
+            channel_open(Channel, Deadline, Opener, false)
     end.
 
-%% The connection a call goes to: the generation's own, number 1, for a
-%% call with a datagram flow, else the one with the fewest calls in flight,
-%% the lowest numbered of those, as the channel's own opens order them.
-place([{1, Own}], _Counters, _Datagrams) ->
-    Own;
-place([{1, Own} | _], _Counters, Datagrams) when Datagrams =/= undefined ->
-    Own;
-place(Pool, Counters, _Datagrams) ->
-    {_Load, _Slot, Transport} = lists:min([
-        {atomics:get(Counters, ?LOADS + Slot), Slot, Transport}
-     || {Slot, Transport} <- Pool
-    ]),
-    Transport.
+%% Asks the channel to measure its connections' bytes and round trips, once
+%% a call ended the window the rates are measured over.
+sample(Channel, true) -> gen_server:cast(Channel, sample);
+sample(_Channel, false) -> ok.
+
+%% Asks the channel to dial another connection, unless the pool is growing
+%% already.
+grow(Channel, Counters, true) ->
+    case trevrpc_quic_pool:claim_growth(Counters) of
+        true -> gen_server:cast(Channel, grow);
+        false -> ok
+    end;
+grow(_Channel, _Counters, false) ->
+    ok.
 
 %% Opens the stream on the remembered connection and registers it. A
 %% caller killed in between leaves a stream nobody registered. A QMux
@@ -372,29 +438,31 @@ place(Pool, Counters, _Datagrams) ->
 %% once its REQUEST does not come, and the channel cancels it, as any
 %% stream it gets data for and does not know. A QUIC server never hears of
 %% it, so it keeps one stream credit until the connection closes.
-own_open(Channel, Generation, Transport, Deadline, Datagrams) ->
+own_open(Channel, Generation, Transport, Deadline, Opener) ->
     case trevrpc_transport:open_stream(Transport) of
         {ok, Id} ->
             ok = trevrpc_transport:manual_flow_control(Transport, Id),
             Conn = trevrpc_transport:pid(Transport),
-            case register_stream(Channel, Generation, Conn, Id, Datagrams) of
+            case register_stream(Channel, Generation, Conn, Id, Opener) of
                 {ok, Info} ->
                     {ok, Info};
                 stale ->
                     cancel_stream(Transport, Id),
-                    channel_open(Channel, Deadline, Datagrams)
+                    channel_open(Channel, Deadline, Opener, true)
             end;
         {error, _} ->
-            channel_open(Channel, Deadline, Datagrams)
+            channel_open(Channel, Deadline, Opener, true)
     end.
 
 %% Has the channel open the stream, and remembers its connections. A
-%% channel that is gone is forgotten.
-channel_open(Channel, Deadline, Datagrams) ->
+%% channel that is gone is forgotten. Counted says whether the call was
+%% counted toward the pool's call rate already.
+channel_open(Channel, Deadline, Opener, Counted) ->
     _ = erase({?MODULE, Channel}),
-    try gen_server:call(Channel, {open_stream, {self(), Datagrams}, Deadline}, infinity) of
-        {ok, #{generation := Generation, pool := {Version, Pool}, counters := Counters}} = Opened ->
-            put({?MODULE, Channel}, {Generation, Version, Pool, Counters}),
+    try gen_server:call(Channel, {open_stream, Opener, Deadline, Counted}, infinity) of
+        {ok, #{generation := Generation, pool := {Version, Pool, Limits}, counters := Counters}} =
+                Opened ->
+            put({?MODULE, Channel}, {Generation, Version, Pool, Counters, Limits}),
             Opened;
         Error ->
             Error
@@ -402,11 +470,9 @@ channel_open(Channel, Deadline, Datagrams) ->
         exit:_ -> {error, closed_status()}
     end.
 
-register_stream(Channel, Generation, Conn, Id, Datagrams) ->
+register_stream(Channel, Generation, Conn, Id, Opener) ->
     try
-        gen_server:call(
-            Channel, {register_stream, Generation, Conn, Id, {self(), Datagrams}}, infinity
-        )
+        gen_server:call(Channel, {register_stream, Generation, Conn, Id, Opener}, infinity)
     catch
         exit:_ -> stale
     end.
@@ -471,10 +537,20 @@ init(Opts, Compression) ->
         }
     ),
     TcpHost = host(maps:get(tcp_host, Opts, Host)),
-    MinQuic = max(1, maps:get(min_quic_connections, Opts, 1)),
+    QuicLimits = trevrpc_quic_pool:limits(
+        maps:get(min_quic_connections, Opts, 1),
+        maps:get(max_quic_connections, Opts, default_max_quic_connections()),
+        maps:get(quic_connection_call_rate, Opts, ?CALL_RATE),
+        maps:get(quic_connection_byte_rate, Opts, ?BYTE_RATE)
+    ),
     State = #state{
-        min_quic = MinQuic,
-        counters = atomics:new(?LOADS + MinQuic, [{signed, true}]),
+        quic_limits = QuicLimits,
+        limits = trevrpc_quic_pool:single(),
+        crowded_dial_wait = maps:get(quic_crowded_dial_wait, Opts, ?CROWDED_DIAL_WAIT),
+        pool_idle_timeout = max(
+            1, maps:get(quic_connection_idle_timeout, Opts, ?POOL_IDLE_TIMEOUT)
+        ),
+        counters = trevrpc_quic_pool:new(trevrpc_quic_pool:max(QuicLimits)),
         host = Host,
         port = Port,
         tcp_host = TcpHost,
@@ -501,6 +577,15 @@ init(Opts, Compression) ->
 
 host(Host) when is_binary(Host) -> binary_to_list(Host);
 host(Host) -> Host.
+
+%% The schedulers online, from one to four. An erlang_quic connection is
+%% one process, so connections run in parallel only on schedulers that run
+%% them. On four schedulers, 64 concurrent streams of 4 KiB messages ran 3.5
+%% times as fast over four connections as over one, and 2 times as fast as
+%% over two: unlike the Rust channel's, whose connections contend for
+%% threads, the Erlang channel's are each slow to queue many streams' data.
+default_max_quic_connections() ->
+    max(1, min(4, erlang:system_info(schedulers_online))).
 
 %% TLS for QMux: the trust the options name, and for a host name, SNI and a
 %% check of the certificate against it. For an IP address only the chain is
@@ -625,10 +710,12 @@ handle_call({unsubscribe, Pid}, _From, #state{subscribers = Subscribers} = State
     {reply, ok, State#state{subscribers = maps:without(Gone, Subscribers)}};
 handle_call(close, _From, State) ->
     {stop, normal, ok, State};
-handle_call({open_stream, _Owner, _Deadline}, _From, #state{status = connecting} = State) ->
+handle_call({open_stream, _Owner, _Deadline, _Counted}, _From, #state{status = connecting} = State) ->
     {reply, {error, trevrpc_status:new(unavailable, <<"channel is reconnecting">>)}, State};
-handle_call({open_stream, Owner, Deadline}, From, State) ->
-    open(From, Owner, Deadline, State);
+handle_call({open_stream, Owner, Deadline, false}, From, State) ->
+    open(From, Owner, Deadline, wait, State);
+handle_call({open_stream, Owner, Deadline, true}, From, State) ->
+    open(From, Owner, Deadline, wait_counted, State);
 handle_call(
     {register_stream, Generation, Conn, Id, Opener},
     _From,
@@ -690,7 +777,11 @@ handle_cast({release, Id, Ref, Cost}, #state{reserved = Reserved} = State) ->
 handle_cast({optimism, Generation, Optimistic}, #state{generation = Generation} = State) ->
     {noreply, State#state{optimistic = Optimistic}};
 handle_cast({optimism, _Generation, _Optimistic}, State) ->
-    {noreply, State}.
+    {noreply, State};
+handle_cast(grow, State) ->
+    {noreply, grow_pool(State)};
+handle_cast(sample, State) ->
+    {noreply, sample_pool(State)}.
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info({Tag, Pid, Event}, #state{status = ready, transport = Transport} = State) when
@@ -748,6 +839,42 @@ handle_info({timeout, _Timer, {extra_timeout, Ref}}, #state{extra_attempts = Att
         #{Ref := _} -> {noreply, extra_failed(Ref, State)};
         #{} -> {noreply, State}
     end;
+handle_info({timeout, _Timer, {grow_retry, Generation}}, #state{generation = Generation} = State) ->
+    trevrpc_quic_pool:end_growth(State#state.counters),
+    {noreply, State};
+handle_info({timeout, _Timer, {grow_retry, _Generation}}, State) ->
+    {noreply, State};
+handle_info({timeout, _Timer, {idle_check, Generation}}, #state{generation = Generation} = State) ->
+    {noreply, idle_check(State#state{idle_check = false})};
+handle_info({timeout, _Timer, {idle_check, _Generation}}, State) ->
+    {noreply, State};
+handle_info({timeout, Timer, {crowded_timeout, From}}, #state{crowded_opens = Held} = State) ->
+    case lists:keytake(From, 1, Held) of
+        {value, {From, _Opener, _Deadline, Timer} = Open, Rest} ->
+            {From, Opener, Deadline, _Timer} = Open,
+            case open(From, Opener, Deadline, no_wait, State#state{crowded_opens = Rest}) of
+                {reply, Reply, Next} ->
+                    gen_server:reply(From, Reply),
+                    {noreply, Next};
+                {noreply, Next} ->
+                    {noreply, Next}
+            end;
+        _ ->
+            {noreply, State}
+    end;
+handle_info(
+    {pool_sample, Ref, Generation, At, Samples}, #state{sampling = {Ref, _Pid, Timer}} = State
+) ->
+    _ = erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
+    {noreply, settle(sampled(Generation, At, Samples, State#state{sampling = false}))};
+handle_info({pool_sample, _Ref, _Generation, _At, _Samples}, State) ->
+    {noreply, State};
+handle_info({timeout, _Timer, {sample_timeout, Ref}}, #state{sampling = {Ref, Pid, _}} = State) ->
+    %% A connection that does not answer: the pool goes without this measure.
+    exit(Pid, kill),
+    {noreply, settle(State#state{sampling = false})};
+handle_info({timeout, _Timer, {sample_timeout, _Ref}}, State) ->
+    {noreply, State};
 handle_info(
     {timeout, _Timer, {redial, Slot, Generation}},
     #state{status = ready, generation = Generation} = State
@@ -1235,20 +1362,64 @@ cancel_stream(Transport, Id) ->
 
 %%% Streams
 
-open(From, Opener, Deadline, #state{pending_opens = [_ | _]} = State) ->
+%% Opens a stream for a call, or holds the open: for stream credit, or for
+%% the connection the pool dials because the call is streaming and found
+%% its connection crowded. Wait says whether it may wait for that: `wait'
+%% for an open that did not yet, which the open counts toward the pool's
+%% call rate, `wait_counted' for one its caller counted, {waited, Timer}
+%% for one held before, whose timer bounds its wait for all the connections
+%% it waits for, or `no_wait'. Only `wait' counts the call: the others were
+%% counted when the caller or the channel first picked for them.
+open(From, Opener, Deadline, _Wait, #state{pending_opens = [_ | _]} = State) ->
     %% Opens wait for stream credit: this one waits behind them, even if
     %% credit came back and the channel has not heard of it yet.
     queue_open(From, Opener, Deadline, State);
-open(From, {_Owner, Datagrams} = Opener, Deadline, State) ->
-    %% The connections in the order a call goes to them, as place/3 picks.
-    Candidates =
-        case pool(State) of
-            [{1, Own} | _] when Datagrams =/= undefined ->
-                [Own];
-            Pool ->
-                [T || {_, _, T} <- lists:sort([{load(Slot, State), Slot, T} || {Slot, T} <- Pool])]
+open(From, {_Owner, Datagrams, Streaming} = Opener, Deadline, Wait, State0) ->
+    %% The connection trevrpc_quic_pool:choose/5 picks, then the others, by
+    %% their calls in flight, should the server's stream limit refuse it.
+    Pool = pool(State0),
+    #state{counters = Counters, limits = Limits} = State0,
+    {Chosen, Grow, Crowded, Sample} =
+        trevrpc_quic_pool:choose(Pool, Counters, Limits, Datagrams, Streaming, Wait =:= wait),
+    State1 =
+        case Sample of
+            true -> sample_pool(State0);
+            false -> State0
         end,
-    open_on(Candidates, From, Opener, Deadline, false, State).
+    State =
+        case Grow andalso trevrpc_quic_pool:claim_growth(Counters) of
+            true -> grow_pool(State1);
+            false -> State1
+        end,
+    Candidates =
+        case Datagrams of
+            undefined ->
+                Others = lists:sort([
+                    {load(Slot, State), Slot, T}
+                 || {Slot, T} <- Pool, T =/= Chosen
+                ]),
+                [Chosen | [T || {_, _, T} <- Others]];
+            _ ->
+                [Chosen]
+        end,
+    MayWait = Wait =/= no_wait andalso State#state.crowded_dial_wait > 0,
+    case {Crowded andalso MayWait andalso growing_attempt(State), Wait} of
+        {true, New} when New =:= wait; New =:= wait_counted ->
+            Timer = erlang:start_timer(
+                State#state.crowded_dial_wait, self(), {crowded_timeout, From}
+            ),
+            {noreply, hold_crowded(From, Opener, Deadline, Timer, State)};
+        {true, {waited, Timer}} ->
+            {noreply, hold_crowded(From, Opener, Deadline, Timer, State)};
+        {false, {waited, Timer}} ->
+            _ = erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
+            open_on(Candidates, From, Opener, Deadline, false, State);
+        {false, _} ->
+            open_on(Candidates, From, Opener, Deadline, false, State)
+    end.
+
+hold_crowded(From, Opener, Deadline, Timer, #state{crowded_opens = Held} = State) ->
+    State#state{crowded_opens = Held ++ [{From, Opener, Deadline, Timer}]}.
 
 open_on([Transport | Rest], From, Opener, Deadline, Limited, State0) ->
     case trevrpc_transport:open_stream(Transport) of
@@ -1269,7 +1440,7 @@ open_on([], _From, _Opener, _Deadline, false, State) ->
 %% Routes the events of stream `Id', open on connection Conn of the current
 %% generation, to the process that opened it, and what that process needs
 %% to use it.
-opened(Conn, Id, {Owner, Datagrams}, State0) ->
+opened(Conn, Id, {Owner, Datagrams, Streaming}, State0) ->
     Key = {Conn, Id},
     Ref = make_ref(),
     Monitor = monitor(process, Owner),
@@ -1289,15 +1460,45 @@ opened(Conn, Id, {Owner, Datagrams}, State0) ->
         shared => State#state.shared,
         stream_budget => State#state.stream_budget,
         optimistic => State#state.optimistic,
-        pool => {State#state.version, pool(State)},
+        pool => {State#state.version, pool(State), {
+            State#state.limits, State#state.crowded_dial_wait
+        }},
         counters => State#state.counters
     },
+    Loaded = add_load(Conn, 1, State#state{
+        streams = (State#state.streams)#{Key => {Owner, Ref, Monitor}},
+        refs = (State#state.refs)#{Ref => Key},
+        monitors = (State#state.monitors)#{Monitor => Key},
+        used = used(Conn, State)
+    }),
     {Info,
-        add_load(Conn, 1, State#state{
-            streams = (State#state.streams)#{Key => {Owner, Ref, Monitor}},
-            refs = (State#state.refs)#{Ref => Key},
-            monitors = (State#state.monitors)#{Monitor => Key}
-        })}.
+        case Streaming of
+            true ->
+                add_streams(Key, 1, Loaded#state{streaming = (Loaded#state.streaming)#{Key => true}});
+            false ->
+                Loaded
+        end}.
+
+%% Marks an extra the pool added as used since the last idle check.
+used(Conn, #state{used = Used, extras = Extras, limits = Limits}) ->
+    case Extras of
+        #{Conn := #{slot := Slot}} ->
+            case Slot > ?MIN_SLOT(Limits) andalso not is_map_key(Conn, Used) of
+                true -> Used#{Conn => true};
+                false -> Used
+            end;
+        #{} ->
+            Used
+    end.
+
+%% Counts N more streaming calls in flight on stream Key's connection.
+add_streams({Conn, _Id}, N, #state{counters = Counters} = State) ->
+    _ =
+        case slot(Conn, State) of
+            undefined -> ok;
+            Slot -> trevrpc_quic_pool:add_streams(Counters, Slot, N)
+        end,
+    State.
 
 %% The stream of a call, by its ID and routing tag.
 stream_key(Id, Ref, #state{refs = Refs}) ->
@@ -1338,7 +1539,7 @@ flow(Key, Owner, Ref, Receives, #state{flows = Flows, stream_flows = StreamFlows
 retry_opens(#state{pending_opens = []} = State) ->
     {noreply, State};
 retry_opens(#state{pending_opens = [{From, Owner, Timer} | Rest]} = State) ->
-    case open(From, Owner, infinity, State#state{pending_opens = []}) of
+    case open(From, Owner, infinity, no_wait, State#state{pending_opens = []}) of
         {reply, Reply, Opened} ->
             _ = erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
             gen_server:reply(From, Reply),
@@ -1350,7 +1551,7 @@ retry_opens(#state{pending_opens = [{From, Owner, Timer} | Rest]} = State) ->
 
 %% Sets the opens waiting for stream credit, and publishes their number.
 pending(Pending, #state{counters = Counters} = State) ->
-    atomics:put(Counters, ?QUEUED, length(Pending)),
+    trevrpc_quic_pool:set_queued(Counters, length(Pending)),
     State#state{pending_opens = Pending}.
 
 %% Forgets stream Key, giving back what it held of the stream compression
@@ -1363,7 +1564,12 @@ forget({Conn, _Id} = Key, #state{streams = Streams, reserved = Reserved} = State
             {Flow, Rest} -> {trevrpc_datagram_flows:release(Flow, State#state.flows), Rest};
             error -> {State#state.flows, State#state.stream_flows}
         end,
-    add_load(Conn, -1, State#state{
+    Unstreamed =
+        case maps:take(Key, State#state.streaming) of
+            {true, Streaming} -> add_streams(Key, -1, State#state{streaming = Streaming});
+            error -> State
+        end,
+    add_load(Conn, -1, Unstreamed#state{
         streams = maps:remove(Key, Streams),
         refs = maps:remove(Ref, State#state.refs),
         monitors = maps:remove(Monitor, State#state.monitors),
@@ -1398,7 +1604,7 @@ conn_transport(Conn, #state{extras = Extras, draining = Draining} = State) ->
     end.
 
 load(Slot, #state{counters = Counters}) ->
-    atomics:get(Counters, ?LOADS + Slot).
+    trevrpc_quic_pool:load(Counters, Slot).
 
 %% Counts N more calls in flight on connection Conn; one that drains closes
 %% after its last.
@@ -1407,7 +1613,7 @@ add_load(Conn, N, #state{loads = Loads, counters = Counters} = State) ->
     _ =
         case slot(Conn, State) of
             undefined -> ok;
-            Slot -> atomics:add(Counters, ?LOADS + Slot, N)
+            Slot -> trevrpc_quic_pool:add_load(Counters, Slot, N)
         end,
     case State#state.draining of
         #{Conn := Extra} when Load =< 0 ->
@@ -1425,26 +1631,42 @@ add_load(Conn, N, #state{loads = Loads, counters = Counters} = State) ->
 
 %% Publishes that the pool changed: callers that remember it ask again.
 bump(#state{version = Version, counters = Counters} = State) ->
-    atomics:put(Counters, ?VERSION, Version + 1),
+    trevrpc_quic_pool:set_version(Counters, Version + 1),
     State#state{version = Version + 1}.
 
 %% A generation starts with its own connection alone, and over native QUIC
-%% dials its extras.
-start_pool(Kind, #state{min_quic = Min, counters = Counters} = State) ->
-    _ = [atomics:put(Counters, ?LOADS + Slot, 0) || Slot <- lists:seq(1, Min)],
-    Bumped = bump(State),
+%% dials the extras of its minimum, and measures its round trip.
+start_pool(Kind, #state{quic_limits = QuicLimits, counters = Counters} = State) ->
+    trevrpc_quic_pool:reset(Counters, trevrpc_quic_pool:max(QuicLimits)),
+    Limits =
+        case Kind of
+            quic -> QuicLimits;
+            qmux -> trevrpc_quic_pool:single()
+        end,
+    Bumped = bump(State#state{
+        limits = Limits,
+        used = #{},
+        idle_check = false,
+        sampled_bytes = #{},
+        sampled_at = undefined
+    }),
     Dialled =
         case Kind of
-            quic -> lists:foldl(fun dial_extra/2, Bumped, lists:seq(2, Min));
-            qmux -> Bumped
+            quic ->
+                Slots = lists:seq(2, trevrpc_quic_pool:min(Limits)),
+                sample_pool(lists:foldl(fun dial_extra/2, Bumped, Slots));
+            qmux ->
+                Bumped
         end,
     settle(Dialled).
 
 %% The channel is ready for wait_until_ready/2 once a new generation dials
-%% no extra: each joined or failed. A failed one does not hold it up, and is
-%% dialled again, though a redial that starts while another extra is still
-%% being dialled is waited for too, a connect timeout at most.
-settle(#state{pool_settling = true, extra_attempts = Attempts} = State) when
+%% no extra (each joined or failed) and measured its round trips, which
+%% crowded streams need (see trevrpc_quic_pool). A failed extra does not
+%% hold it up, and is dialled again, though a redial that starts while
+%% another extra is still being dialled is waited for too, a connect
+%% timeout at most.
+settle(#state{pool_settling = true, extra_attempts = Attempts, sampling = false} = State) when
     map_size(Attempts) =:= 0
 ->
     _ = [gen_server:reply(From, ok) || {From, _Timer} <- State#state.ready_waiters],
@@ -1540,21 +1762,43 @@ join(Ref, #state{extra_attempts = Attempts} = State) ->
     Extra = #{
         transport => Transport, slot => Slot, monitor => monitor(process, Conn), parent => Parent
     },
-    atomics:put(State#state.counters, ?LOADS + Slot, 0),
-    settle(
-        bump(State#state{
-            extra_attempts = Rest,
-            extras = (State#state.extras)#{Conn => Extra},
-            loads = (State#state.loads)#{Conn => 0},
-            extra_delays = maps:remove(Slot, State#state.extra_delays)
-        })
-    ).
+    Counters = State#state.counters,
+    trevrpc_quic_pool:reset_slot(Counters, Slot),
+    %% Its round trip, until measured, is the generation's own connection's:
+    %% the same path to the same server.
+    trevrpc_quic_pool:set_rtt(Counters, Slot, trevrpc_quic_pool:rtt(Counters, 1)),
+    Joined = bump(State#state{
+        extra_attempts = Rest,
+        extras = (State#state.extras)#{Conn => Extra},
+        loads = (State#state.loads)#{Conn => 0},
+        extra_delays = maps:remove(Slot, State#state.extra_delays)
+    }),
+    Grown =
+        case Slot > ?MIN_SLOT(State#state.limits) of
+            %% It counts as used until the second idle check, so it takes
+            %% calls before it can close.
+            true ->
+                arm_idle_check(
+                    growth_ended(Joined#state{used = (Joined#state.used)#{Conn => true}})
+                );
+            false ->
+                Joined
+        end,
+    settle(sample_pool(Grown)).
 
 %% An extra's attempt failed: it is dialled again after a backoff.
 extra_failed(Ref, #state{extra_attempts = Attempts} = State) ->
     {#{slot := Slot, transport := Transport, parent := Parent}, Rest} = maps:take(Ref, Attempts),
     Parent ! stop,
-    settle(redial(Slot, retire(Transport, State#state{extra_attempts = Rest}))).
+    Retired = retire(Transport, State#state{extra_attempts = Rest}),
+    case Slot > ?MIN_SLOT(State#state.limits) of
+        true ->
+            %% The pool grows again after a pause.
+            erlang:start_timer(?GROW_RETRY, self(), {grow_retry, State#state.generation}),
+            settle(open_crowded(Retired));
+        false ->
+            settle(redial(Slot, Retired))
+    end.
 
 %% Dials the extra numbered Slot again after its backoff, which doubles each
 %% time, as the channel's reconnects do.
@@ -1581,11 +1825,15 @@ extra_lost(Conn, #state{extras = Extras, draining = Draining} = State0) ->
         send_waiters = maps:remove(Conn, State2#state.send_waiters),
         loads = maps:remove(Conn, State2#state.loads)
     }),
-    case Current of
+    #{slot := Slot} = Extra,
+    case Current andalso Slot =< ?MIN_SLOT(State3#state.limits) of
         true ->
-            #{slot := Slot} = Extra,
-            atomics:put(State3#state.counters, ?LOADS + Slot, 0),
+            trevrpc_quic_pool:reset_slot(State3#state.counters, Slot),
             redial(Slot, bump(State3));
+        false when Current ->
+            %% One the pool added is not dialled again until the pool grows.
+            trevrpc_quic_pool:reset_slot(State3#state.counters, Slot),
+            bump(State3#state{used = maps:remove(Conn, State3#state.used)});
         false ->
             State3
     end.
@@ -1613,9 +1861,182 @@ stop_extra_attempts(#state{extra_attempts = Attempts} = State) ->
             Parent ! stop,
             retire(Transport, Acc)
         end,
-        State#state{extra_attempts = #{}, held_events = #{}, pool_settling = false},
+        fail_crowded_opens(State#state{
+            extra_attempts = #{}, held_events = #{}, pool_settling = false, used = #{}
+        }),
         Attempts
     ).
+
+%%% Growing the pool
+
+%% Dials another connection, numbered with the lowest number free above the
+%% pool's minimum, unless the pool has all its maximum. The caller marked
+%% the pool growing (trevrpc_quic_pool:claim_growth/1).
+grow_pool(#state{status = ready, transport = {quic, _}, limits = Limits} = State) ->
+    Taken = [S || {S, _} <- pool(State)] ++ [S || _ := #{slot := S} <- State#state.extra_attempts],
+    Free = lists:seq(?MIN_SLOT(Limits) + 1, trevrpc_quic_pool:max(Limits)) -- Taken,
+    case Free of
+        [Slot | _] -> dial_extra(Slot, State);
+        [] -> growth_ended(State)
+    end;
+grow_pool(State) ->
+    growth_ended(State).
+
+%% Whether the pool is dialling a connection to grow.
+growing_attempt(#state{extra_attempts = Attempts, limits = Limits}) ->
+    Min = ?MIN_SLOT(Limits),
+    lists:any(fun(#{slot := Slot}) -> Slot > Min end, maps:values(Attempts)).
+
+growth_ended(#state{counters = Counters} = State) ->
+    trevrpc_quic_pool:end_growth(Counters),
+    open_crowded(State).
+
+%% The pool's dial ended: the opens held for it open now, unless they find
+%% their connection crowded still and the pool dials another, which they
+%% wait for in turn, within what is left of their wait: a burst of streams
+%% may need several.
+open_crowded(#state{crowded_opens = Held} = State) ->
+    lists:foldl(
+        fun({From, Opener, Deadline, Timer}, Acc) ->
+            case open(From, Opener, Deadline, {waited, Timer}, Acc) of
+                {reply, Reply, Next} ->
+                    gen_server:reply(From, Reply),
+                    Next;
+                {noreply, Next} ->
+                    Next
+            end
+        end,
+        State#state{crowded_opens = []},
+        Held
+    ).
+
+%% The generation ended with opens held for its pool's dial: they fail, as
+%% the opens held for stream credit do.
+fail_crowded_opens(#state{crowded_opens = Held} = State) ->
+    _ = [
+        begin
+            _ = erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
+            gen_server:reply(
+                From, {error, trevrpc_status:new(unavailable, <<"connection closed">>)}
+            )
+        end
+     || {From, _Opener, _Deadline, Timer} <- Held
+    ],
+    State#state{crowded_opens = []}.
+
+arm_idle_check(#state{idle_check = false} = State) ->
+    erlang:start_timer(
+        State#state.pool_idle_timeout, self(), {idle_check, State#state.generation}
+    ),
+    State#state{idle_check = true};
+arm_idle_check(State) ->
+    State.
+
+%% Closes each extra the pool added that took no call since the last check
+%% and has none in flight, and checks again while any is left.
+idle_check(#state{extras = Extras, used = Used, limits = Limits} = State0) ->
+    Min = ?MIN_SLOT(Limits),
+    Idle = [
+        {Conn, Extra}
+     || Conn := #{slot := Slot} = Extra <- Extras,
+        Slot > Min,
+        not is_map_key(Conn, Used),
+        maps:get(Conn, State0#state.loads, 0) =:= 0
+    ],
+    State1 = lists:foldl(
+        fun({Conn, Extra}, Acc) ->
+            close_extra(Extra, Acc#state{
+                extras = maps:remove(Conn, Acc#state.extras),
+                loads = maps:remove(Conn, Acc#state.loads),
+                send_waiters = maps:remove(Conn, Acc#state.send_waiters)
+            })
+        end,
+        State0#state{used = #{}},
+        Idle
+    ),
+    State2 =
+        case Idle of
+            [] -> State1;
+            _ -> bump(State1)
+        end,
+    case [S || _ := #{slot := S} <- State2#state.extras, S > Min] of
+        [] -> State2;
+        _ -> arm_idle_check(State2)
+    end.
+
+%% Measures the bytes the pool's connections moved and their round trips,
+%% unless a measure is under way already, or the pool cannot grow, which
+%% needs no measure. erlang_quic answers from each connection's process,
+%% with no timeout, so the measure runs in a process of its own, which the
+%% channel gives up on after ?SAMPLE_TIMEOUT.
+sample_pool(
+    #state{sampling = false, status = ready, transport = {quic, _}, limits = Limits} = State
+) ->
+    case trevrpc_quic_pool:max(Limits) > trevrpc_quic_pool:min(Limits) of
+        true ->
+            Channel = self(),
+            Ref = make_ref(),
+            Generation = State#state.generation,
+            Conns = [trevrpc_transport:pid(T) || {_, T} <- pool(State)],
+            Pid = spawn(fun() ->
+                At = erlang:monotonic_time(millisecond),
+                Channel ! {pool_sample, Ref, Generation, At, [measure(Conn) || Conn <- Conns]}
+            end),
+            Timer = erlang:start_timer(?SAMPLE_TIMEOUT, self(), {sample_timeout, Ref}),
+            State#state{sampling = {Ref, Pid, Timer}};
+        false ->
+            State
+    end;
+sample_pool(State) ->
+    State.
+
+measure(Conn) ->
+    Bytes =
+        try quic:get_stats(Conn) of
+            {ok, #{data_sent := Sent, data_received := Received}} -> Sent + Received;
+            _ -> undefined
+        catch
+            _:_ -> undefined
+        end,
+    %% In microseconds, of whole milliseconds, as erlang_quic measures them.
+    Rtt =
+        try quic:get_path_stats(Conn) of
+            {ok, #{srtt := Srtt}} -> Srtt;
+            _ -> undefined
+        catch
+            _:_ -> undefined
+        end,
+    {Conn, Bytes, Rtt}.
+
+%% Publishes the round trips of the connections still in the pool, and the
+%% bytes per second they moved since the last measure.
+sampled(Generation, At, Samples, #state{generation = Generation, status = ready} = State) ->
+    Counters = State#state.counters,
+    Last = State#state.sampled_bytes,
+    _ = [
+        trevrpc_quic_pool:set_rtt(Counters, Slot, Rtt)
+     || {Conn, _, Rtt} <- Samples, is_integer(Rtt), Slot <- [slot(Conn, State)], Slot =/= undefined
+    ],
+    Bytes = #{Conn => B || {Conn, B, _} <- Samples, is_integer(B)},
+    Moved = lists:sum([
+        max(0, B - map_get(Conn, Last))
+     || Conn := B <- Bytes, is_map_key(Conn, Last)
+    ]),
+    _ =
+        case State#state.sampled_at of
+            undefined ->
+                ok;
+            Before when At > Before ->
+                trevrpc_quic_pool:set_byte_rate(Counters, Moved * 1000 div (At - Before));
+            _ ->
+                ok
+        end,
+    State#state{sampled_bytes = Bytes, sampled_at = At};
+sampled(_Generation, _At, _Samples, #state{sampled_at = undefined} = State) ->
+    %% A measure of an earlier generation held up the current one's first.
+    sample_pool(State);
+sampled(_Generation, _At, _Samples, State) ->
+    State.
 
 close_extra(#{transport := Transport, monitor := Monitor, parent := Parent}, State) ->
     demonitor(Monitor, [flush]),

@@ -34,6 +34,9 @@ pub type Config {
     /// How many QUIC connections the channel keeps open and spreads its
     /// calls over, by default one; QMux over TLS always uses one.
     min_quic_connections: Option(Int),
+    /// How many QUIC connections the channel's pool grows to under load, by
+    /// default the schedulers online, from one to four.
+    max_quic_connections: Option(Int),
   )
 }
 
@@ -51,6 +54,7 @@ pub fn config(host: String, port: Int) -> Config {
     connect_timeout: None,
     idle_timeout: None,
     min_quic_connections: None,
+    max_quic_connections: None,
   )
 }
 

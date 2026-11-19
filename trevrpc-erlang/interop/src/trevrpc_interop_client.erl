@@ -118,14 +118,23 @@ selection(#{}) ->
 
 %% @doc Connects a channel to --addr (and --tcp-addr) over `Transport',
 %% trusting --ca, with the compression settings of --dictionary, and over
-%% native QUIC --min-quic-connections connections (default 1).
+%% native QUIC a pool of --min-quic-connections connections (default 1)
+%% that grows under load to --max-quic-connections (by default the
+%% channel's).
 -spec connect(#{string() => string()}, quic | tcp | auto) ->
     {ok, pid()} | {error, trevrpc_status:status()}.
 connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
     {Host, Port} = host_port(Addr),
     {TcpHost, TcpPort} = host_port(maps:get("tcp-addr", Flags, Addr)),
+    Max =
+        case Flags of
+            #{"max-quic-connections" := Connections} ->
+                #{max_quic_connections => list_to_integer(Connections)};
+            #{} ->
+                #{}
+        end,
     trevrpc_channel:connect(
-        #{
+        Max#{
             host => Host,
             port => Port,
             tcp_host => TcpHost,

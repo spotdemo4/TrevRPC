@@ -210,7 +210,9 @@ ports(Server) ->
     #{port => Port, tcp_port => TcpPort}.
 
 %% A channel to the server over the transport the fixture names: `quic'
-%% (the default) or `tcp' for QMux over TLS.
+%% (the default) or `tcp' for QMux over TLS. It keeps one QUIC connection,
+%% as these tests look at the server's connection; pool_test_/0 tests the
+%% pool.
 connect(Credentials, Server) ->
     Channel = start_channel(Server, Credentials),
     ok = trevrpc_channel:wait_until_ready(Channel, 30000),
@@ -222,7 +224,8 @@ start_channel(Server, Credentials) ->
             host => {127, 0, 0, 1},
             transport => maps:get(transport, Credentials, quic),
             server_name => "localhost",
-            cacerts => maps:get(cacerts, Credentials)
+            cacerts => maps:get(cacerts, Credentials),
+            max_quic_connections => 1
         }
     ),
     Channel.
@@ -581,15 +584,15 @@ stale_stream_test(#{channel := Channel}) ->
     Self = self(),
     Caller = spawn_link(fun() ->
         ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"s">>, #{})),
-        {Generation, Version, Pool, Counters} = get({trevrpc_channel, Channel}),
-        put({trevrpc_channel, Channel}, {Generation - 1, Version, Pool, Counters}),
+        {Generation, Version, Pool, Counters, Limits} = get({trevrpc_channel, Channel}),
+        put({trevrpc_channel, Channel}, {Generation - 1, Version, Pool, Counters, Limits}),
         Self ! {remembered, self()},
         receive
             go -> ok
         end,
         Result = trevrpc_client:unary(Channel, ?UNARY, <<"s">>, #{}),
         Self !
-            {done, self(), Result, {Generation, Version, Pool, Counters},
+            {done, self(), Result, {Generation, Version, Pool, Counters, Limits},
                 get({trevrpc_channel, Channel})}
     end),
     receive
@@ -622,7 +625,7 @@ queued_opens_test(#{channel := Channel}) ->
     Self = self(),
     Caller = spawn_link(fun() ->
         ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"q">>, #{})),
-        {_, _, _, Queued} = get({trevrpc_channel, Channel}),
+        {_, _, _, Queued, _} = get({trevrpc_channel, Channel}),
         Self ! {queued, self(), Queued},
         receive
             go -> ok
@@ -633,7 +636,7 @@ queued_opens_test(#{channel := Channel}) ->
         receive
             {queued, Caller, Q} -> Q
         end,
-    atomics:put(Queued, 1, 1),
+    trevrpc_quic_pool:set_queued(Queued, 1),
     _ = erlang:trace_pattern({trevrpc_transport, open_stream, 1}, true, [local]),
     try
         1 = erlang:trace(Caller, true, [call]),
@@ -644,7 +647,7 @@ queued_opens_test(#{channel := Channel}) ->
         end
     after
         _ = erlang:trace_pattern({trevrpc_transport, open_stream, 1}, false, [local]),
-        atomics:put(Queued, 1, 0)
+        trevrpc_quic_pool:set_queued(Queued, 0)
     end,
     Ref = erlang:trace_delivered(Caller),
     receive
@@ -1640,12 +1643,12 @@ dead_connection_is_forgotten(Credentials) ->
         ok = trevrpc_channel:subscribe(Channel),
         await_state(Channel, {ready, 1}),
         ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"d">>, #{})),
-        {1, _, [{1, Transport}], _} = get({trevrpc_channel, Channel}),
+        {1, _, [{1, Transport}], _, _} = get({trevrpc_channel, Channel}),
         exit(trevrpc_transport:pid(Transport), kill),
         await_state(Channel, connecting),
         await_state(Channel, {ready, 2}),
         ?assertMatch({ok, <<"d">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"d">>, #{})),
-        ?assertMatch({2, _, _, _}, get({trevrpc_channel, Channel}))
+        ?assertMatch({2, _, _, _, _}, get({trevrpc_channel, Channel}))
     after
         trevrpc_channel:close(Channel),
         trevrpc_server:stop(Server)
@@ -1664,7 +1667,7 @@ orphan_stream_is_cancelled(Credentials) ->
     try
         _ = spawn_link(fun() ->
             ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"o">>, #{})),
-            {_, _, [{1, Transport}], _} = get({trevrpc_channel, Channel}),
+            {_, _, [{1, Transport}], _, _} = get({trevrpc_channel, Channel}),
             Self ! {orphan, trevrpc_transport:open_stream(Transport)}
         end),
         Orphan =
@@ -2441,7 +2444,16 @@ pool_test_() ->
                 {timeout, 30, fun() -> extras_events_wait_for_their_attempts(Credentials) end},
                 {timeout, 30, fun() -> draining_extra_fails_its_writers(Credentials) end},
                 {timeout, 30, fun() -> failed_extra_does_not_hold_up_ready(Credentials) end},
-                {timeout, 30, fun() -> lost_generation_stops_its_extras_attempts(Credentials) end}
+                {timeout, 30, fun() -> lost_generation_stops_its_extras_attempts(Credentials) end},
+                {timeout, 30, fun() -> crowded_streams_grow_the_pool(Credentials) end},
+                {timeout, 30, fun() -> lost_added_extra_is_not_dialled_again(Credentials) end},
+                {timeout, 30, fun() -> failed_growth_opens_the_held_calls(Credentials) end},
+                {timeout, 30, fun() -> a_burst_of_streams_waits_for_each_dial(Credentials) end},
+                {timeout, 30, fun() -> held_opens_open_after_the_crowded_dial_wait(Credentials) end},
+                {timeout, 30, fun() -> held_opens_fail_with_their_generation(Credentials) end},
+                {timeout, 30, fun() -> unanswered_measures_are_given_up(Credentials) end},
+                {timeout, 30, fun() -> measured_round_trips_are_published(Credentials) end},
+                {timeout, 30, fun() -> each_call_counts_once(Credentials) end}
             ]
         end}.
 
@@ -2456,7 +2468,8 @@ pool_channel(Credentials, Server, Transport, Opts) ->
                 transport => Transport,
                 server_name => "localhost",
                 cacerts => maps:get(cacerts, Credentials),
-                min_quic_connections => 3
+                min_quic_connections => 3,
+                max_quic_connections => 3
             },
             Opts
         )
@@ -2470,11 +2483,13 @@ pool_channel(Credentials, Server, Transport, Opts) ->
 pool_view(Channel) ->
     ok = trevrpc_channel:wait_until_ready(Channel, 10000),
     ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"p">>, #{})),
-    {_, _, Pool, Counters} = get({trevrpc_channel, Channel}),
+    %% The channel takes this call after the end of the call above.
+    _ = trevrpc_channel:generation(Channel),
+    {_, _, Pool, Counters, _} = get({trevrpc_channel, Channel}),
     {Pool, Counters}.
 
 loads(Pool, Counters) ->
-    [atomics:get(Counters, 2 + Slot) || {Slot, _} <- Pool].
+    [trevrpc_quic_pool:load(Counters, Slot) || {Slot, _} <- Pool].
 
 %% Returns once the traced channel has joined an extra to its pool.
 await_join(Channel) ->
@@ -2486,8 +2501,23 @@ await_join(Channel) ->
 %% A call held open by a process of its own until released: the process
 %% reports once its call is up, then its call's end.
 hold_call(Channel) ->
+    [Pid] = hold_calls(Channel, 1),
+    Pid.
+
+%% N such calls, started together.
+hold_calls(Channel, N) ->
+    Pids = [start_hold(Channel) || _ <- lists:seq(1, N)],
+    [
+        receive
+            {held, Pid} -> Pid
+        after 5000 -> error(not_held)
+        end
+     || Pid <- Pids
+    ].
+
+start_hold(Channel) ->
     Self = self(),
-    Pid = spawn_link(fun() ->
+    spawn_link(fun() ->
         {ok, Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 20000}),
         ok = trevrpc_client:send(Call, <<"h">>),
         {ok, <<"h">>} = trevrpc_client:recv(Call),
@@ -2503,11 +2533,7 @@ hold_call(Channel) ->
         %% The channel takes this call, after the end of the call above.
         _ = trevrpc_channel:generation(Channel),
         Self ! {done, self(), Result}
-    end),
-    receive
-        {held, Pid} -> Pid
-    after 5000 -> error(not_held)
-    end.
+    end).
 
 release_call(Pid) ->
     Pid ! release,
@@ -2697,7 +2723,7 @@ lost_generation_stops_its_extras_attempts(Credentials) ->
     with_settling_attempt(Credentials, fun(Channel, _Ref, Parent) ->
         ok = trevrpc_channel:subscribe(Channel),
         Monitor = monitor(process, Parent),
-        {_, _, [{1, Own}], _} = get({trevrpc_channel, Channel}),
+        {_, _, [{1, Own}], _, _} = get({trevrpc_channel, Channel}),
         exit(trevrpc_transport:pid(Own), kill),
         receive
             {'DOWN', Monitor, process, _, _} -> ok
@@ -2749,6 +2775,269 @@ with_settling_attempt(Credentials, End) ->
         trevrpc_server:stop(Server)
     end.
 
+%% A channel whose pool grows to two connections, only for crowded streams:
+%% its call rate is one no test reaches, and two streaming calls crowd a
+%% connection whose round trip is under 20 ms.
+growth_channel(Credentials, Server, Opts) ->
+    {ok, Channel} = trevrpc_channel:start(
+        maps:merge(
+            (ports(Server))#{
+                host => {127, 0, 0, 1},
+                transport => quic,
+                server_name => "localhost",
+                cacerts => maps:get(cacerts, Credentials),
+                max_quic_connections => 2,
+                quic_connection_call_rate => 100,
+                quic_connection_byte_rate => 1 bsl 40,
+                quic_crowded_dial_wait => 10000
+            },
+            Opts
+        )
+    ),
+    %% Ready once it measured its connection's round trip.
+    ok = trevrpc_channel:wait_until_ready(Channel, 10000),
+    #{counters := CountersField} = channel_fields(),
+    ?assert(trevrpc_quic_pool:rtt(element(CountersField, sys:get_state(Channel)), 1) >= 0),
+    Channel.
+
+%% Holds two streaming calls on the channel's one connection, crowding it,
+%% then a third, which the channel holds until the connection it dials for
+%% it joins the pool, and opens there.
+grow(Channel) ->
+    [First, Second] = [hold_call(Channel) || _ <- lists:seq(1, 2)],
+    Third = hold_call(Channel),
+    {[{1, _}, {2, Extra}] = Pool, Counters} = pool_view(Channel),
+    ?assertEqual([2, 1], loads(Pool, Counters)),
+    {[First, Second], Third, Extra}.
+
+%% Streaming calls that crowd the channel's connection grow its pool; the
+%% connection the pool added closes once it went unused for the idle
+%% timeout.
+crowded_streams_grow_the_pool(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = growth_channel(Credentials, Server, #{quic_connection_idle_timeout => 100}),
+    try
+        {Own, Third, Extra} = grow(Channel),
+        Monitor = monitor(process, trevrpc_transport:pid(Extra)),
+        ?assertEqual({eof, #{}}, release_call(Third)),
+        receive
+            {'DOWN', Monitor, process, _, _} -> ok
+        after 5000 -> error(idle_extra_not_closed)
+        end,
+        ?assertMatch({[{1, _}], _}, pool_view(Channel)),
+        ?assertEqual([{eof, #{}}, {eof, #{}}], [release_call(Pid) || Pid <- Own])
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A connection the pool added that is lost fails its calls, and is not
+%% dialled again until the pool grows again.
+lost_added_extra_is_not_dialled_again(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = growth_channel(Credentials, Server, #{}),
+    try
+        {Own, Third, Extra} = grow(Channel),
+        exit(trevrpc_transport:pid(Extra), kill),
+        ?assertMatch({error, #{code := unavailable}}, release_call(Third)),
+        #{extra_attempts := AttemptsField, extra_delays := DelaysField} = channel_fields(),
+        State = sys:get_state(Channel),
+        ?assertEqual(#{}, element(AttemptsField, State)),
+        ?assertEqual(#{}, element(DelaysField, State)),
+        ?assertMatch({[{1, _}], _}, pool_view(Channel)),
+        ?assertEqual([{eof, #{}}, {eof, #{}}], [release_call(Pid) || Pid <- Own])
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% When the pool's dial fails, the opens held for it open on the
+%% connections there are, long before the crowded dial wait is over, and
+%% the pool does not grow again for a while. The channel dials a socket
+%% that never answers once its own connection is up.
+failed_growth_opens_the_held_calls(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    {ok, Silent} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}]),
+    {ok, SilentPort} = inet:port(Silent),
+    Channel = growth_channel(Credentials, Server, #{connect_timeout => 300}),
+    try
+        #{port := PortField} = channel_fields(),
+        _ = sys:replace_state(Channel, fun(State) -> setelement(PortField, State, SilentPort) end),
+        Held = [hold_call(Channel) || _ <- lists:seq(1, 3)],
+        {Pool, Counters} = pool_view(Channel),
+        ?assertMatch([{1, _}], Pool),
+        ?assertEqual([3], loads(Pool, Counters)),
+        ?assertNot(trevrpc_quic_pool:claim_growth(Counters)),
+        ?assertEqual(lists:duplicate(3, {eof, #{}}), [release_call(Pid) || Pid <- Held])
+    after
+        trevrpc_channel:close(Channel),
+        gen_udp:close(Silent),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A burst of streaming calls that finds the pool's connections crowded
+%% waits for each connection the pool dials until it has its maximum, then
+%% spreads over them: two go to each new connection, which they then
+%% crowd, and the rest wait for the next, then spread. Opened on the
+%% connections there were as each dial ended, they would load two with
+%% four each and leave the last one idle.
+a_burst_of_streams_waits_for_each_dial(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = growth_channel(Credentials, Server, #{max_quic_connections => 3}),
+    try
+        Own = hold_calls(Channel, 2),
+        Burst = hold_calls(Channel, 6),
+        {Pool, Counters} = pool_view(Channel),
+        ?assertMatch([{1, _}, {2, _}, {3, _}], Pool),
+        ?assertEqual([3, 3, 2], loads(Pool, Counters)),
+        ?assertEqual(lists:duplicate(8, {eof, #{}}), [release_call(Pid) || Pid <- Own ++ Burst])
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A channel whose dials, once its own connection is up, go to a socket that
+%% never answers, so they last the connect timeout.
+silent_growth_channel(Credentials, Server, Silent, Opts) ->
+    {ok, SilentPort} = inet:port(Silent),
+    Channel = growth_channel(Credentials, Server, Opts#{connect_timeout => 10000}),
+    #{port := PortField} = channel_fields(),
+    _ = sys:replace_state(Channel, fun(State) -> setelement(PortField, State, SilentPort) end),
+    Channel.
+
+%% An open held for a dial that takes longer than the crowded dial wait
+%% opens on the connections there are once the wait is over.
+held_opens_open_after_the_crowded_dial_wait(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    {ok, Silent} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}]),
+    Channel = silent_growth_channel(Credentials, Server, Silent, #{quic_crowded_dial_wait => 100}),
+    try
+        Held = hold_calls(Channel, 3),
+        {Pool, Counters} = pool_view(Channel),
+        ?assertMatch([{1, _}], Pool),
+        ?assertEqual([3], loads(Pool, Counters)),
+        ?assertEqual(lists:duplicate(3, {eof, #{}}), [release_call(Pid) || Pid <- Held])
+    after
+        trevrpc_channel:close(Channel),
+        gen_udp:close(Silent),
+        trevrpc_server:stop(Server)
+    end.
+
+%% An open held for the pool's dial fails when its generation's own
+%% connection is lost, as calls on that connection do.
+held_opens_fail_with_their_generation(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    {ok, Silent} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}]),
+    Channel = silent_growth_channel(Credentials, Server, Silent, #{}),
+    Self = self(),
+    _ = erlang:trace_pattern({trevrpc_channel, hold_crowded, 5}, true, [local]),
+    try
+        Own = hold_calls(Channel, 2),
+        1 = erlang:trace(Channel, true, [call]),
+        Caller = spawn_link(fun() ->
+            Self ! {opened, self(), trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 20000})}
+        end),
+        receive
+            {trace, Channel, call, {trevrpc_channel, hold_crowded, _}} -> ok
+        after 5000 -> error(open_not_held)
+        end,
+        {[{1, Transport}], _} = pool_view(Channel),
+        exit(trevrpc_transport:pid(Transport), kill),
+        receive
+            {opened, Caller, Opened} ->
+                ?assertMatch({error, #{code := unavailable}}, Opened)
+        after 5000 -> error(held_open_not_failed)
+        end,
+        _ = [release_call(Pid) || Pid <- Own]
+    after
+        _ = erlang:trace(Channel, false, [call]),
+        _ = erlang:trace_pattern({trevrpc_channel, hold_crowded, 5}, false, [local]),
+        trevrpc_channel:close(Channel),
+        gen_udp:close(Silent),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A connection that does not answer its measure, here one whose process is
+%% suspended, does not stop the channel measuring: it gives the measure up
+%% after its timeout.
+unanswered_measures_are_given_up(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = growth_channel(Credentials, Server, #{}),
+    %% No call measures the connection in between: the channel was ready once
+    %% it measured it.
+    #{sampling := SamplingField, transport := TransportField} = channel_fields(),
+    Conn = trevrpc_transport:pid(element(TransportField, sys:get_state(Channel))),
+    try
+        ok = sys:suspend(Conn),
+        gen_server:cast(Channel, sample),
+        {_Ref, Sampler, _Timer} = element(SamplingField, sys:get_state(Channel)),
+        Monitor = monitor(process, Sampler),
+        1 = erlang:trace(Channel, true, ['receive']),
+        receive
+            {trace, Channel, 'receive', {timeout, _, {sample_timeout, _}}} -> ok
+        after 5000 -> error(no_sample_timeout)
+        end,
+        ?assertEqual(false, element(SamplingField, sys:get_state(Channel))),
+        receive
+            {'DOWN', Monitor, process, Sampler, killed} -> ok
+        after 5000 -> error(sampler_not_stopped)
+        end
+    after
+        _ = erlang:trace(Channel, false, ['receive']),
+        sys:resume(Conn),
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% The channel publishes a measured round trip as quic:get_path_stats/1
+%% reports it, in microseconds, here 20 ms: two streams over it make 100
+%% round trips a second, so they crowd the connection at the test's call
+%% rate. The measure is set up by hand, as a loopback round trip measures 0.
+measured_round_trips_are_published(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = growth_channel(Credentials, Server, #{}),
+    try
+        #{sampling := SamplingField, transport := TransportField, counters := CountersField} =
+            channel_fields(),
+        Ref = make_ref(),
+        _ = sys:replace_state(Channel, fun(State) ->
+            setelement(SamplingField, State, {Ref, self(), make_ref()})
+        end),
+        State = sys:get_state(Channel),
+        Conn = trevrpc_transport:pid(element(TransportField, State)),
+        Generation = trevrpc_channel:generation(Channel),
+        At = erlang:monotonic_time(millisecond),
+        Channel ! {pool_sample, Ref, Generation, At, [{Conn, 0, 20000}]},
+        Counters = element(CountersField, sys:get_state(Channel)),
+        ?assertEqual(20000, trevrpc_quic_pool:rtt(Counters, 1)),
+        ?assert(trevrpc_quic_pool:crowded(2, 20000, 100)),
+        ?assertNot(trevrpc_quic_pool:crowded(2, 20001, 100))
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% Each call counts once toward the pool's call rate, also one the channel
+%% held for its dial and picked for again once the dial ended. The test
+%% ends the rate window far in the future, so no call ends the next before
+%% it does, 1 s later: the rate is then the calls in between, and its own.
+each_call_counts_once(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = growth_channel(Credentials, Server, #{}),
+    try
+        #{counters := CountersField} = channel_fields(),
+        Counters = element(CountersField, sys:get_state(Channel)),
+        Future = erlang:monotonic_time(millisecond) + 1000000000,
+        {_, _, true} = trevrpc_quic_pool:record(Counters, Future),
+        %% Three held calls, the third held for the dial, and pool_view/1's.
+        {Own, Third, _Extra} = grow(Channel),
+        ?assertMatch({5, _, true}, trevrpc_quic_pool:record(Counters, Future + 1000)),
+        ?assertEqual(lists:duplicate(3, {eof, #{}}), [release_call(Pid) || Pid <- [Third | Own]])
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
 %% The positions of the fields of trevrpc_channel's state record, read from
 %% its source.
 channel_fields() ->
@@ -2763,7 +3052,7 @@ qmux_keeps_one_connection(Credentials) ->
     Channel = pool_channel(Credentials, Server, tcp),
     try
         ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"q">>, #{})),
-        ?assertMatch({_, _, [{1, {qmux, _, _}}], _}, get({trevrpc_channel, Channel}))
+        ?assertMatch({_, _, [{1, {qmux, _, _}}], _, _}, get({trevrpc_channel, Channel}))
     after
         trevrpc_channel:close(Channel),
         trevrpc_server:stop(Server)

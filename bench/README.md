@@ -289,6 +289,10 @@ for the whole run.
   `ChannelConfig::with_min_quic_connections`, or the Erlang channel's
   `min_quic_connections`: the channel opens that many QUIC connections when it
   connects and spreads every call over them.
+- `--max-quic-connections` (Erlang client) sets the Erlang channel's
+  `max_quic_connections`, the connections its pool grows to under load: by
+  default the schedulers online, from one to four. (The Rust channel's
+  default is half the available parallelism.)
 - `--rate` (default 100) is the number of messages per second each
   `paced` or `unreliable-paced` worker sends. Fractions are allowed. A worker sends on a
   schedule, message `i` at `i / rate` seconds after it starts, as precisely as

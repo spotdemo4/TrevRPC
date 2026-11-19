@@ -26,7 +26,7 @@
 -type channel_config() ::
     {config, binary(), inet:port_number(), option(inet:port_number()), auto | quic | tcp,
         option(binary()), option(binary()), boolean(), option(pos_integer()), option(pos_integer()),
-        option(pos_integer()), option(pos_integer())}.
+        option(pos_integer()), option(pos_integer()), option(pos_integer())}.
 -type kind() :: unary | server_streaming | client_streaming | bidirectional_streaming.
 -type server_config() ::
     {config, inet:port_number(), binary(), binary(), [{binary(), trevrpc_server:route()}],
@@ -38,7 +38,7 @@
 -spec connect(channel_config(), timeout()) -> result(pid()).
 connect(
     {config, Host, Port, TcpPort, Transport, ServerName, CaFile, Verify, MaxFrame, ConnectTimeout,
-        IdleTimeout, MinQuic},
+        IdleTimeout, MinQuic, MaxQuic},
     Timeout
 ) ->
     Opts = options(
@@ -50,7 +50,8 @@ connect(
             {max_frame_size, MaxFrame},
             {connect_timeout, ConnectTimeout},
             {idle_timeout, IdleTimeout},
-            {min_quic_connections, MinQuic}
+            {min_quic_connections, MinQuic},
+            {max_quic_connections, MaxQuic}
         ]
     ),
     result(trevrpc_channel:connect(Opts, Timeout)).

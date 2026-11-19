@@ -199,7 +199,10 @@ start(Channel, Method, Kind, Opts, Request) ->
         {ok, First} ?= first(Codec, Request),
         ok ?= check_unreliable(maps:get(unreliable, Opts, #{})),
         Unreliable = trevrpc_datagram:effective(maps:get(unreliable, Opts, #{}), Kind),
-        {ok, Info} ?= trevrpc_channel:open_stream(Channel, Deadline, datagrams(Unreliable, Kind)),
+        {ok, Info} ?=
+            trevrpc_channel:open_stream(
+                Channel, Deadline, datagrams(Unreliable, Kind), Kind =/= unary
+            ),
         #{ref := Ref, max_frame_size := Max} = Info,
         #{compression := Compression, shared := Shared, generation := Generation} = Info,
         Call = #client_call{
@@ -653,7 +656,7 @@ settle(#client_call{channel = Channel}, #cstate{copy_reserved = Reserved, stream
 %% compression without being optimistic, with the requests it kept and,
 %% with `Fin' or once the caller closed the upload, its end. A call is
 %% replayed at most once, since the replay is not optimistic.
-replay(#client_call{channel = Channel, deadline = Deadline} = Call, State, Fin) ->
+replay(#client_call{channel = Channel, deadline = Deadline, kind = Kind} = Call, State, Fin) ->
     #cstate{stream = Old, kept = Kept, generation = Generation} = State,
     trevrpc_channel:optimism(Channel, Generation, false),
     _ = trevrpc_stream:abort(Old, ?CANCELLED),
@@ -661,7 +664,7 @@ replay(#client_call{channel = Channel, deadline = Deadline} = Call, State, Fin) 
     trevrpc_channel:stream_done(Channel, trevrpc_stream:id(Old), trevrpc_stream:ref(Old)),
     trevrpc_stream:flush_events(trevrpc_stream:ref(Old)),
     Closing = Fin orelse State#cstate.send_closed,
-    case trevrpc_channel:open_stream(Channel, Deadline) of
+    case trevrpc_channel:open_stream(Channel, Deadline, undefined, Kind =/= unary) of
         {ok, Info} ->
             Base = State#cstate{
                 stream = new_stream(Info, Channel),
