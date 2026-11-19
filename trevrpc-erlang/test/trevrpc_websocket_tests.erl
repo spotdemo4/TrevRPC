@@ -79,7 +79,7 @@ session_test(#{port := Port}) ->
     {101, Headers, Received, Socket} = upgrade(Port, <<"/trevrpc">>, []),
     ?assertEqual(<<"qmux-02.trevrpc-1">>, header(<<"sec-websocket-protocol">>, Headers)),
     Parameters = trevrpc_quic:qmux_parameters(1 bsl 22, 4, 0, infinity),
-    {ok, Session} = trevrpc_qmux:start(Socket, client, self(), #{
+    {ok, Session, Queue} = trevrpc_qmux:start(Socket, client, self(), #{
         parameters => Parameters, framing => websocket, received => Received
     }),
     receive
@@ -91,7 +91,7 @@ session_test(#{port := Port}) ->
         trevrpc_frame:encode(request, trevrpc_wire:encode_request(#{method => ?UNARY})),
         trevrpc_frame:encode(message, <<"hello">>)
     ],
-    ok = trevrpc_qmux:send_data(Session, Id, Request, true),
+    ok = trevrpc_qmux:send_data(Session, Queue, Id, Request, true),
     Frames = response(Session, Id, trevrpc_frame:reader(1 bsl 22), []),
     ?assert(lists:member({message, <<"hello">>}, Frames)),
     [Status] = [Payload || {status, Payload} <- Frames],

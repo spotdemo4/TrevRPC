@@ -139,6 +139,8 @@
     %% The current race, its attempts, whether it started with QUIC, and
     %% whether its QMux attempt started.
     round :: reference() | undefined,
+    %% The only map in the state keyed by references whose values have a
+    %% `kind': trevrpc_e2e_tests finds it by that shape.
     attempts = #{} :: #{reference() => attempt()},
     raced = false :: boolean(),
     fallback_started = false :: boolean(),
@@ -525,8 +527,8 @@ handle_cast({optimism, _Generation, _Optimistic}, State) ->
     {noreply, State}.
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
-handle_info({Tag, Pid, Event}, #state{status = ready, transport = {_, Pid}} = State) when
-    Tag =:= quic; Tag =:= trevrpc_qmux
+handle_info({Tag, Pid, Event}, #state{status = ready, transport = Transport} = State) when
+    (Tag =:= quic orelse Tag =:= trevrpc_qmux), element(2, Transport) =:= Pid
 ->
     connection_event(Event, State);
 handle_info({Tag, Pid, _Event}, #state{retired = Retired} = State) when
@@ -731,8 +733,8 @@ tcp_attempt(
                     case ssl:negotiated_protocol(Socket) of
                         {ok, Qmux} ->
                             case trevrpc_qmux:start(Socket, client, Self, QmuxOpts) of
-                                {ok, Session} ->
-                                    {ok, {qmux, Session}};
+                                {ok, Session, Queue} ->
+                                    {ok, {qmux, Session, Queue}};
                                 Error ->
                                     _ = ssl:close(Socket),
                                     Error
@@ -753,7 +755,14 @@ add_attempt(Ref, Attempt, #state{attempts = Attempts} = State) ->
     State#state{attempts = Attempts#{Ref => Attempt}}.
 
 find_attempt(Pid, #state{attempts = Attempts}) ->
-    case [Ref || Ref := #{transport := {_, P}} <- Attempts, P =:= Pid] of
+    case
+        [
+            Ref
+         || Ref := #{transport := Transport} <- Attempts,
+            Transport =/= undefined,
+            trevrpc_transport:pid(Transport) =:= Pid
+        ]
+    of
         [Ref | _] -> {ok, Ref};
         [] -> error
     end.
@@ -769,7 +778,9 @@ adopt(Kind, Pid, {Outcome, _} = Event, #state{attempts = Attempts} = State) when
     case [Ref || Ref := #{kind := K, transport := undefined} <- Attempts, K =:= Kind] of
         [Ref | _] ->
             Adopted = State#state{
-                attempts = Attempts#{Ref := (maps:get(Ref, Attempts))#{transport := {Kind, Pid}}}
+                attempts = Attempts#{
+                    Ref := (maps:get(Ref, Attempts))#{transport := adopted(Kind, Pid, Event)}
+                }
             },
             attempt_event(Ref, Event, Adopted);
         [] ->
@@ -777,6 +788,13 @@ adopt(Kind, Pid, {Outcome, _} = Event, #state{attempts = Attempts} = State) when
     end;
 adopt(_Kind, _Pid, _Event, State) ->
     {noreply, State}.
+
+%% The connection an attempt adopts. A QMux session's writers need its send
+%% queue, which its connected event carries; one that closed first is left
+%% to its helper's result, which retires it.
+adopted(quic, Pid, _Event) -> {quic, Pid};
+adopted(qmux, Pid, {connected, #{send_queue := Queue}}) -> {qmux, Pid, Queue};
+adopted(qmux, _Pid, _Event) -> undefined.
 
 attempt_event(Ref, {connected, Info}, #state{attempts = Attempts} = State) ->
     #{Ref := #{kind := Kind, transport := Transport}} = Attempts,

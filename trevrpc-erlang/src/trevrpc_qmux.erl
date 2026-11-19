@@ -10,7 +10,9 @@
 %% `{trevrpc_qmux, Session, Event}':
 %%
 %% <ul>
-%%   <li>`{connected, #{}}': the peer's transport parameters arrived.</li>
+%%   <li>`{connected, #{send_queue => Queue}}': the peer's transport
+%%       parameters arrived; `Queue' is the session's send queue, as
+%%       {@link start/4} returns it.</li>
 %%   <li>`{stream_opened, Id}', `{stream_data, Id, Bin, Fin}',
 %%       `{stream_reset, Id, Code}', `{stop_sending, Id, Code}'.</li>
 %%   <li>`{streams_available, bidi}': an {@link open_stream/1} refused for
@@ -30,8 +32,9 @@
 
 -export([
     start/4,
-    send_data/4,
-    send_data_async/4,
+    send_data/5,
+    send_data_async/5,
+    queued/1,
     consume/3,
     reset_stream/3,
     stop_sending/3,
@@ -42,14 +45,14 @@
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--export_type([options/0]).
+-export_type([options/0, send_queue/0]).
 
 %% Session options:
 %% <ul>
 %%   <li>`parameters': the transport parameters to advertise.</li>
 %%   <li>`keep_alive': milliseconds without sending after which a QX_PING
 %%       goes out, or `infinity' (the default).</li>
-%%   <li>`send_queue_limit': the buffered bytes past which send_data/4 is
+%%   <li>`send_queue_limit': the buffered bytes past which send_data/5 is
 %%       refused with `send_queue_full' (default 1 MiB).</li>
 %%   <li>`handshake_timeout': milliseconds for the peer's
 %%       QX_TRANSPORT_PARAMETERS to arrive (default 10 s).</li>
@@ -69,6 +72,16 @@
     framing => trevrpc_qmux_record:framing(),
     received => binary()
 }.
+
+%% The session's send queue, as its writers see it: the bytes written and
+%% not sent yet (?QUEUED), whether the session ended (?CLOSED), and the
+%% limit past which writes are refused. Writers add what they write, so
+%% they never wait for the session, and the session takes off what it sends
+%% or drops.
+-opaque send_queue() :: {atomics:atomics_ref(), pos_integer()}.
+
+-define(QUEUED, 1).
+-define(CLOSED, 2).
 
 -record(stream, {
     id :: non_neg_integer(),
@@ -124,8 +137,7 @@
     %% data or a FIN to send, in turn.
     control = [] :: [iodata()],
     ready = queue:new() :: queue:queue(non_neg_integer()),
-    queued = 0 :: non_neg_integer(),
-    queue_limit :: pos_integer(),
+    send_queue :: send_queue(),
     notify_ready = false :: boolean(),
     ping_sent = 0 :: non_neg_integer(),
     ping_received :: non_neg_integer() | undefined,
@@ -137,6 +149,8 @@
     send_timeout :: pos_integer(),
     last_received :: integer(),
     last_sent :: integer(),
+    %% A `flush' message is on its way to this process.
+    flush_pending = false :: boolean(),
     closing = false :: boolean()
 }).
 
@@ -148,16 +162,21 @@
 %%% API
 
 %% @doc Starts a session over `Socket', a TLS connection whose handshake
-%% completed, owned by `Owner'. The caller must be the socket's controlling
-%% process; the session takes it over.
--spec start(ssl:sslsocket(), client | server, pid(), options()) -> {ok, pid()} | {error, term()}.
+%% completed, owned by `Owner', and returns it with the send queue its
+%% writers pass to {@link send_data/5}. The caller must be the socket's
+%% controlling process; the session takes it over.
+-spec start(ssl:sslsocket(), client | server, pid(), options()) ->
+    {ok, pid(), send_queue()} | {error, term()}.
 start(Socket, Role, Owner, Opts) ->
-    case gen_server:start(?MODULE, {Role, Owner, Opts}, []) of
+    Queue = {
+        atomics:new(2, [{signed, true}]), maps:get(send_queue_limit, Opts, ?DEFAULT_QUEUE_LIMIT)
+    },
+    case gen_server:start(?MODULE, {Role, Owner, Queue, Opts}, []) of
         {ok, Pid} ->
             case ssl:controlling_process(Socket, Pid) of
                 ok ->
                     gen_server:cast(Pid, {socket, Socket}),
-                    {ok, Pid};
+                    {ok, Pid, Queue};
                 {error, _} = Error ->
                     exit(Pid, kill),
                     Error
@@ -166,17 +185,54 @@ start(Socket, Role, Owner, Opts) ->
             Error
     end.
 
-%% @doc Writes data to a stream, finishing it with `Fin'. Refused with
-%% `send_queue_full' while the session's send queue is over its limit.
--spec send_data(pid(), non_neg_integer(), iodata(), boolean()) -> ok | {error, term()}.
-send_data(Session, Id, Data, Fin) ->
-    call(Session, {send, Id, Data, Fin, limited}).
+%% @doc Writes data to a stream, finishing it with `Fin', without waiting
+%% for the session. Refused with `send_queue_full' while the session's send
+%% queue is over its limit, and with `closed' once the session ended. Data
+%% written to a stream that is already reset or finished is dropped, as
+%% the peer would never read it.
+-spec send_data(pid(), send_queue(), non_neg_integer(), iodata(), boolean()) ->
+    ok | {error, send_queue_full | closed}.
+send_data(Session, {Ref, Limit}, Id, Data, Fin) ->
+    case atomics:get(Ref, ?CLOSED) of
+        0 ->
+            case reserve(Ref, Limit, iolist_size(Data)) of
+                %% The writer copies its data into one binary, so the
+                %% session does not.
+                ok -> gen_server:cast(Session, {send, Id, iolist_to_binary(Data), Fin});
+                full -> {error, send_queue_full}
+            end;
+        _ ->
+            {error, closed}
+    end.
+
+%% Takes Size bytes into the queue while it is under Limit. A write is
+%% taken only if the queue, with every write taken before it, is under the
+%% limit, so concurrent writers overshoot it by one write at most, as when
+%% the session checked each write itself; and a refused write never shows
+%% in the queue, which the session reads to wake refused writers.
+reserve(Ref, Limit, Size) ->
+    case atomics:get(Ref, ?QUEUED) of
+        Queued when Queued < Limit ->
+            case atomics:compare_exchange(Ref, ?QUEUED, Queued, Queued + Size) of
+                ok -> ok;
+                _ -> reserve(Ref, Limit, Size)
+            end;
+        _ ->
+            full
+    end.
+
+%% @doc The bytes written to the session and not sent yet.
+-spec queued(send_queue()) -> non_neg_integer().
+queued({Ref, _}) ->
+    atomics:get(Ref, ?QUEUED).
 
 %% @doc Writes data to a stream without waiting, whatever the send queue
 %% holds.
--spec send_data_async(pid(), non_neg_integer(), iodata(), boolean()) -> ok.
-send_data_async(Session, Id, Data, Fin) ->
-    gen_server:cast(Session, {send, Id, Data, Fin, unlimited}).
+-spec send_data_async(pid(), send_queue(), non_neg_integer(), iodata(), boolean()) -> ok.
+send_data_async(Session, {Ref, _}, Id, Data, Fin) ->
+    Bin = iolist_to_binary(Data),
+    atomics:add(Ref, ?QUEUED, byte_size(Bin)),
+    gen_server:cast(Session, {send, Id, Bin, Fin}).
 
 %% @doc Returns receive credit for `Bytes' of a stream the owner processed.
 -spec consume(pid(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
@@ -224,8 +280,8 @@ call(Session, Request) ->
 
 %%% gen_server
 
--spec init({client | server, pid(), options()}) -> {ok, #state{}}.
-init({Role, Owner, Opts}) ->
+-spec init({client | server, pid(), send_queue(), options()}) -> {ok, #state{}}.
+init({Role, Owner, Queue, Opts}) ->
     monitor(process, Owner),
     Local = maps:get(parameters, Opts),
     Now = now_ms(),
@@ -241,7 +297,7 @@ init({Role, Owner, Opts}) ->
         max_remote = maps:get(initial_max_streams_bidi, Local, 0),
         conn_recv_max = InitialData,
         conn_recv_window = InitialData,
-        queue_limit = maps:get(send_queue_limit, Opts, ?DEFAULT_QUEUE_LIMIT),
+        send_queue = Queue,
         keep_alive = maps:get(keep_alive, Opts, infinity),
         handshake_timeout = maps:get(handshake_timeout, Opts, 10000),
         send_timeout = maps:get(send_timeout, Opts, 30000),
@@ -254,9 +310,6 @@ init({Role, Owner, Opts}) ->
     {reply, term(), #state{}} | {stop, term(), term(), #state{}}.
 handle_call(_Request, _From, #state{closing = true} = State) ->
     {reply, {error, closed}, State};
-handle_call({send, Id, Data, Fin, Limit}, _From, State) ->
-    {Reply, Next} = write(Id, Data, Fin, Limit, State),
-    reply(Reply, Next);
 handle_call({consume, Id, Bytes}, _From, State) ->
     case State#state.streams of
         #{Id := Stream} -> reply(ok, consumed(Bytes, Stream, State));
@@ -292,10 +345,7 @@ handle_call(peername, _From, #state{socket = Socket} = State) ->
     {reply, ssl:peername(Socket), State}.
 
 reply(Reply, State) ->
-    case flush(State) of
-        {ok, Next} -> {reply, Reply, Next};
-        {error, Reason, Next} -> {stop, normal, Reply, lost(Reason, Next)}
-    end.
+    {reply, Reply, schedule_flush(State)}.
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
 handle_cast({socket, Socket}, #state{handshake_timeout = Handshake, send_timeout = Send} = State) ->
@@ -311,9 +361,8 @@ handle_cast({socket, Socket}, #state{handshake_timeout = Handshake, send_timeout
     end;
 handle_cast(_Request, #state{closing = true} = State) ->
     {noreply, State};
-handle_cast({send, Id, Data, Fin, Limit}, State) ->
-    {_Reply, Next} = write(Id, Data, Fin, Limit, State),
-    noreply(Next);
+handle_cast({send, Id, Bin, Fin}, State) ->
+    noreply(write(Id, Bin, Fin, State));
 handle_cast(notify_send_ready, State) ->
     noreply(maybe_send_ready(State#state{notify_ready = true}));
 handle_cast({close, Code}, State) ->
@@ -331,6 +380,11 @@ handle_info({ssl_closed, Socket}, #state{socket = Socket} = State) ->
     {stop, normal, lost(connection_lost, State)};
 handle_info({ssl_error, Socket, Reason}, #state{socket = Socket} = State) ->
     {stop, normal, lost({connection_lost, Reason}, State)};
+handle_info(flush, State) ->
+    case flush(State#state{flush_pending = false}) of
+        {ok, Next} -> {noreply, Next};
+        {error, Reason, Next} -> {stop, normal, lost(Reason, Next)}
+    end;
 handle_info(tick, #state{closing = false} = State) ->
     tick(State);
 handle_info(close_timeout, State) ->
@@ -347,17 +401,26 @@ handle_info(_Message, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #state{}) -> ok.
-terminate(_Reason, #state{socket = undefined}) ->
-    ok;
-terminate(_Reason, #state{socket = Socket}) ->
+terminate(_Reason, #state{socket = undefined} = State) ->
+    mark_closed(State);
+terminate(_Reason, #state{socket = Socket} = State) ->
+    mark_closed(State),
     _ = ssl:close(Socket),
     ok.
 
 noreply(State) ->
-    case flush(State) of
-        {ok, Next} -> {noreply, Next};
-        {error, Reason, Next} -> {stop, normal, lost(Reason, Next)}
-    end.
+    {noreply, schedule_flush(State)}.
+
+%% Writes are coalesced: whatever a request or a record queues to send goes
+%% out with a `flush' message the session sends itself, which arrives after
+%% every request and record already in its mailbox. Under load, one record,
+%% one TLS record and one write carry the frames of every call queued by
+%% then, instead of one each.
+schedule_flush(#state{flush_pending = true} = State) ->
+    State;
+schedule_flush(State) ->
+    self() ! flush,
+    State#state{flush_pending = true}.
 
 %%% Receiving
 
@@ -443,7 +506,7 @@ connected(Peer, #state{local = Local, owner = Owner} = State) ->
             {Ours, 0} -> Ours;
             {Ours, Theirs} -> min(Ours, Theirs)
         end,
-    Owner ! {trevrpc_qmux, self(), {connected, #{}}},
+    Owner ! {trevrpc_qmux, self(), {connected, #{send_queue => State#state.send_queue}}},
     Next = State#state{
         peer = Peer,
         max_local = maps:get(initial_max_streams_bidi, Peer, 0),
@@ -680,7 +743,8 @@ reset_send(_Code, #stream{reset_sent = true}, State) ->
 reset_send(Code, #stream{id = Id, sent = Sent, send_size = Size} = Stream, State) ->
     Reset = Stream#stream{reset_sent = true, send_buf = queue:new(), send_size = 0},
     Next = queue_control([trevrpc_qmux_frame:reset_stream(Id, Code, Sent)], store(Reset, State)),
-    maybe_send_ready(Next#state{queued = Next#state.queued - Size}).
+    unqueue(Size, Next),
+    maybe_send_ready(Next).
 
 %% Stops reading: what was received and not consumed comes back as credit,
 %% and so will whatever still arrives.
@@ -740,18 +804,12 @@ streams_available(State) ->
 
 %%% Sending
 
-write(_Id, _Data, _Fin, limited, #state{queued = Queued, queue_limit = Limit} = State) when
-    Queued >= Limit
-->
-    {{error, send_queue_full}, State};
-write(Id, Data, Fin, _Limit, #state{streams = Streams} = State) ->
+%% Queues a write, which its writer counted in the send queue already;
+%% one to a stream that is gone, reset or finished is dropped.
+write(Id, Bin, Fin, #state{streams = Streams} = State) ->
     case Streams of
-        #{Id := #stream{reset_sent = true}} ->
-            {{error, stream_closed}, State};
-        #{Id := #stream{fin_requested = true}} ->
-            {{error, stream_closed}, State};
-        #{Id := #stream{send_buf = Buf, send_size = Size} = Stream} ->
-            Bin = iolist_to_binary(Data),
+        #{Id := #stream{reset_sent = false, fin_requested = false} = Stream} ->
+            #stream{send_buf = Buf, send_size = Size} = Stream,
             Updated = Stream#stream{
                 send_buf =
                     case Bin of
@@ -761,13 +819,21 @@ write(Id, Data, Fin, _Limit, #state{streams = Streams} = State) ->
                 send_size = Size + byte_size(Bin),
                 fin_requested = Fin
             },
-            {ok,
-                ready(
-                    Id, store(Updated, State#state{queued = State#state.queued + byte_size(Bin)})
-                )};
+            ready(Id, store(Updated, State));
         #{} ->
-            {{error, unknown_stream}, State}
+            unqueue(byte_size(Bin), State),
+            maybe_send_ready(State)
     end.
+
+%% Takes bytes sent or dropped off the send queue.
+unqueue(0, _State) ->
+    ok;
+unqueue(Bytes, #state{send_queue = {Ref, _}}) ->
+    atomics:sub(Ref, ?QUEUED, Bytes).
+
+%% Tells writers the session ended: their writes are refused from now on.
+mark_closed(#state{send_queue = {Ref, _}}) ->
+    atomics:put(Ref, ?CLOSED, 1).
 
 ready(Id, #state{ready = Ready} = State) ->
     case queue:member(Id, Ready) of
@@ -925,9 +991,8 @@ stream_data([Id | Rest], Size, Limit, Acc, Again, #state{streams = Streams} = St
                         sent = Stream#stream.sent + N,
                         fin_sent = Fin
                     },
-                    State1 = store(Sent, State#state{
-                        conn_sent = State#state.conn_sent + N, queued = State#state.queued - N
-                    }),
+                    unqueue(N, State),
+                    State1 = store(Sent, State#state{conn_sent = State#state.conn_sent + N}),
                     More = Pending - N > 0 orelse (Stream#stream.fin_requested andalso not Fin),
                     Again1 =
                         case More of
@@ -959,12 +1024,15 @@ take(N, Buf, Acc) ->
     end.
 
 maybe_send_ready(
-    #state{notify_ready = true, queued = Queued, queue_limit = Limit, owner = Owner} = State
-) when
-    Queued < Limit div 2
-->
-    Owner ! {trevrpc_qmux, self(), send_ready},
-    State#state{notify_ready = false};
+    #state{notify_ready = true, send_queue = {Ref, Limit}, owner = Owner} = State
+) ->
+    case atomics:get(Ref, ?QUEUED) < Limit div 2 of
+        true ->
+            Owner ! {trevrpc_qmux, self(), send_ready},
+            State#state{notify_ready = false};
+        false ->
+            State
+    end;
 maybe_send_ready(State) ->
     State.
 
@@ -1016,12 +1084,20 @@ fail(Code, FrameType, Reason, State) ->
 
 %% Sends CONNECTION_CLOSE after everything already queued that fits, ends
 %% our sending direction, and waits briefly for the peer to close.
-close_with(Frame, Reason, #state{socket = Socket, owner = Owner} = State) ->
+close_with(Frame, Reason, #state{socket = Socket, owner = Owner} = State0) ->
+    mark_closed(State0),
     Owner ! {trevrpc_qmux, self(), {closed, Reason}},
     case Socket of
         undefined ->
-            {stop, normal, State};
+            {stop, normal, State0};
         _ ->
+            %% What was written before the close, and not flushed yet, goes
+            %% first.
+            State =
+                case flush(State0) of
+                    {ok, Flushed} -> Flushed;
+                    {error, _, Failed} -> Failed
+                end,
             _ = ssl:send(Socket, trevrpc_qmux_record:close(Frame, State#state.framing)),
             _ = ssl:shutdown(Socket, write),
             erlang:send_after(?CLOSE_TIMEOUT, self(), close_timeout),
@@ -1032,12 +1108,14 @@ close_with(Frame, Reason, #state{socket = Socket, owner = Owner} = State) ->
 %% The peer closed, or the idle timeout expired: end without frames, but
 %% with the closing handshake of a WebSocket.
 quiet_close(Reason, #state{socket = Socket, owner = Owner} = State) ->
+    mark_closed(State),
     Owner ! {trevrpc_qmux, self(), {closed, Reason}},
     _ = send_now(trevrpc_qmux_record:close(none, State#state.framing), State),
     _ = ssl:shutdown(Socket, write),
     {stop, normal, State}.
 
 lost(Reason, #state{owner = Owner} = State) ->
+    mark_closed(State),
     Owner ! {trevrpc_qmux, self(), {closed, Reason}},
     State#state{closing = true}.
 

@@ -205,9 +205,9 @@ handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
 handle_cast({qmux, Socket, Opts}, #state{config = Config} = State) ->
     case trevrpc_qmux:start(Socket, server, self(), maps:merge(maps:get(qmux, Config), Opts)) of
-        {ok, Session} ->
+        {ok, Session, Queue} ->
             {noreply, State#state{
-                transport = {qmux, Session}, session_monitor = monitor(process, Session)
+                transport = {qmux, Session, Queue}, session_monitor = monitor(process, Session)
             }};
         {error, _Reason} ->
             {stop, normal, State}

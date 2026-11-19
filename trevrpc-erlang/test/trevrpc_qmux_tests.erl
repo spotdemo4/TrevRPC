@@ -27,6 +27,13 @@ qmux_test_() ->
              || {Name, Test} <- [
                     {"stream data across records", fun data_across_records/1},
                     {"sending waits for the peer's credit", fun send_credit/1},
+                    {"writes queued together share a record", fun coalesced_writes/1},
+                    {"writers see the send queue fill and the session end", fun send_queue/1},
+                    {"concurrent writers overshoot the limit by one write",
+                        fun concurrent_writers/1},
+                    {"a refused write never shows in the send queue", fun refused_write/1},
+                    {"dropped writes leave the send queue", fun dropped_writes/1},
+                    {"data written before a close goes first", fun close_after_write/1},
                     {"a completed peer stream returns its credit", fun stream_credit/1},
                     {"a reset carries the bytes sent as final size", fun reset_final_size/1},
                     {"QX_PING is answered", fun ping/1},
@@ -72,9 +79,16 @@ pair(#{cert := Cert, key := Key}, Parameters, Opts) ->
         after 5000 -> error(not_accepted)
         end,
     ok = ssl:close(Listen),
-    {ok, Session} = trevrpc_qmux:start(Server, server, self(), Opts#{parameters => Parameters}),
+    {ok, Session, Queue} = trevrpc_qmux:start(Server, server, self(), Opts#{
+        parameters => Parameters
+    }),
     erase(Peer),
+    put({send_queue, Session}, Queue),
     {Session, Peer}.
+
+%% Writes to the session's stream as its owner would.
+send_data(Session, Id, Data, Fin) ->
+    trevrpc_qmux:send_data(Session, get({send_queue, Session}), Id, Data, Fin).
 
 %% A pair whose peer sent its parameters, with Peer's overriding the
 %% defaults, and read the session's.
@@ -186,7 +200,7 @@ data_across_records(Credentials) ->
     send(Socket, [trevrpc_qmux_frame:stream(0, 6, [<<"over ">>], false)]),
     send(Socket, [trevrpc_qmux_frame:stream(0, 11, [<<"records">>], true)]),
     ?assertEqual(<<"hello over records">>, received(Session, 0)),
-    ok = trevrpc_qmux:send_data(Session, 0, <<"reply">>, true),
+    ok = send_data(Session, 0, <<"reply">>, true),
     ?assertEqual(<<"reply">>, read_stream(Socket, 0)),
     trevrpc_qmux:close(Session, 0).
 
@@ -198,7 +212,7 @@ send_credit(Credentials) ->
     ?assertEqual({stream_opened, 0}, event(Session)),
     ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
     Data = binary:copy(<<"d">>, 25),
-    ok = trevrpc_qmux:send_data(Session, 0, Data, true),
+    ok = send_data(Session, 0, Data, true),
     ?assertEqual({stream, 0, 0, binary:copy(<<"d">>, 10), false}, await(Socket, fun is_stream/1)),
     send(Socket, [trevrpc_qmux_frame:max_stream_data(0, 25)]),
     ?assertEqual({stream, 0, 10, binary:copy(<<"d">>, 15), true}, await(Socket, fun is_stream/1)),
@@ -206,13 +220,219 @@ send_credit(Credentials) ->
 
 is_stream(Frame) -> element(1, Frame) =:= stream.
 
+%% Writes queued while the session is busy go out together, in one record
+%% and one STREAM frame.
+coalesced_writes(Credentials) ->
+    {Session, Socket} = connected(Credentials, #{}),
+    send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"go">>], false)]),
+    ?assertEqual({stream_opened, 0}, event(Session)),
+    ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
+    ok = sys:suspend(Session),
+    _ = [ok = send_data(Session, 0, <<N>>, N =:= 10) || N <- lists:seq(1, 10)],
+    ok = sys:resume(Session),
+    ?assertEqual([{stream, 0, 0, list_to_binary(lists:seq(1, 10)), true}], next(Socket)),
+    trevrpc_qmux:close(Session, 0).
+
+%% Writers count what they write in the send queue themselves, so a full
+%% queue refuses them before the session handles it, and a session that
+%% ended refuses them too.
+send_queue(Credentials) ->
+    {Session, Socket} = connected(Credentials, ?PARAMETERS, #{}, #{send_queue_limit => 10}),
+    send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"go">>], false)]),
+    ?assertEqual({stream_opened, 0}, event(Session)),
+    ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
+    ok = sys:suspend(Session),
+    ok = send_data(Session, 0, binary:copy(<<"q">>, 10), false),
+    ?assertEqual({error, send_queue_full}, send_data(Session, 0, <<"r">>, false)),
+    ok = sys:resume(Session),
+    ?assertEqual({stream, 0, 0, binary:copy(<<"q">>, 10), false}, await(Socket, fun is_stream/1)),
+    %% What was sent left the queue.
+    ok = send_data(Session, 0, <<"r">>, true),
+    ?assertEqual({stream, 0, 10, <<"r">>, true}, await(Socket, fun is_stream/1)),
+    trevrpc_qmux:close(Session, 0),
+    ?assertMatch({closed, _}, await_closed(Session)),
+    ?assertEqual({error, closed}, send_data(Session, 0, <<"late">>, false)).
+
+%% 200 writers of 10 bytes, released together, against a limit of 100,
+%% while the session handles nothing: exactly ten writes are taken, as each
+%% is taken only while the writes taken before it are under the limit, and
+%% the refused writes never show in the queue, as an observer reading it
+%% throughout sees.
+concurrent_writers(Credentials) ->
+    {Session, Socket} = connected(Credentials, ?PARAMETERS, #{}, #{send_queue_limit => 100}),
+    send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"go">>], false)]),
+    ?assertEqual({stream_opened, 0}, event(Session)),
+    ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
+    Queue = get({send_queue, Session}),
+    Self = self(),
+    ok = sys:suspend(Session),
+    Writers = [
+        spawn(fun() ->
+            receive
+                go -> ok
+            end,
+            Self !
+                {wrote, self(), trevrpc_qmux:send_data(Session, Queue, 0, <<"cccccccccc">>, false)}
+        end)
+     || _ <- lists:seq(1, 200)
+    ],
+    Observer = spawn(fun() -> observe(Queue, 0) end),
+    _ = [Writer ! go || Writer <- Writers],
+    Results = [
+        receive
+            {wrote, Writer, Result} -> Result
+        after 5000 -> error(no_result)
+        end
+     || Writer <- Writers
+    ],
+    ?assertEqual(10, length([ok || ok <- Results])),
+    ?assertEqual(190, length([full || {error, send_queue_full} <- Results])),
+    ?assertEqual(100, trevrpc_qmux:queued(Queue)),
+    Observer ! {stop, self()},
+    receive
+        {highest, Highest} -> ?assertEqual(100, Highest)
+    after 5000 -> error(no_observer)
+    end,
+    ok = sys:resume(Session),
+    ?assertEqual(binary:copy(<<"c">>, 100), read_bytes(Socket, 0, 100)),
+    trevrpc_qmux:close(Session, 0).
+
+%% The most bytes the queue showed until told to stop.
+observe(Queue, Highest) ->
+    receive
+        {stop, From} -> From ! {highest, max(Highest, trevrpc_qmux:queued(Queue))}
+    after 0 -> observe(Queue, max(Highest, trevrpc_qmux:queued(Queue)))
+    end.
+
+%% A write refused for a full queue never touches it: the refused writer,
+%% traced, only reads the queue's atomics, so the session can never see
+%% bytes that are not coming, and, draining the queue, wakes the writer it
+%% refused: the owner that asked for send_ready gets it.
+refused_write(Credentials) ->
+    {Session, Socket} = connected(Credentials, ?PARAMETERS, #{}, #{send_queue_limit => 10}),
+    send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"go">>], false)]),
+    ?assertEqual({stream_opened, 0}, event(Session)),
+    ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
+    Queue = get({send_queue, Session}),
+    ok = sys:suspend(Session),
+    ok = send_data(Session, 0, binary:copy(<<"q">>, 10), false),
+    {Refused, Calls} = traced_atomics(fun() ->
+        trevrpc_qmux:send_data(Session, Queue, 0, binary:copy(<<"r">>, 1000), false)
+    end),
+    ?assertEqual({error, send_queue_full}, Refused),
+    ?assertEqual([get, get], Calls),
+    ?assertEqual(10, trevrpc_qmux:queued(Queue)),
+    ok = trevrpc_qmux:notify_send_ready(Session),
+    ok = sys:resume(Session),
+    ?assertEqual(send_ready, event(Session)),
+    ?assertEqual(0, trevrpc_qmux:queued(Queue)),
+    ?assertEqual({stream, 0, 0, binary:copy(<<"q">>, 10), false}, await(Socket, fun is_stream/1)),
+    trevrpc_qmux:close(Session, 0).
+
+%% What Fun returns in a process of its own, and the atomics functions it
+%% called there, in order.
+traced_atomics(Fun) ->
+    Self = self(),
+    Writer = spawn(fun() ->
+        receive
+            go -> Self ! {done, self(), Fun()}
+        end
+    end),
+    _ = erlang:trace_pattern({atomics, '_', '_'}, true, [global]),
+    1 = erlang:trace(Writer, true, [call]),
+    Writer ! go,
+    Result =
+        receive
+            {done, Writer, R} -> R
+        after 5000 -> error(no_result)
+        end,
+    Ref = erlang:trace_delivered(Writer),
+    receive
+        {trace_delivered, Writer, Ref} -> ok
+    after 5000 -> error(trace_not_delivered)
+    end,
+    _ = erlang:trace_pattern({atomics, '_', '_'}, false, [global]),
+    {Result, traced_calls(Writer, [])}.
+
+traced_calls(Writer, Acc) ->
+    receive
+        {trace, Writer, call, {atomics, Function, _Args}} -> traced_calls(Writer, [Function | Acc])
+    after 0 -> lists:reverse(Acc)
+    end.
+
+%% Size bytes of stream Id's data from the session, from offset 0.
+read_bytes(Socket, Id, Size) ->
+    read_bytes(Socket, Id, Size, <<>>).
+
+read_bytes(_Socket, _Id, Size, Acc) when byte_size(Acc) >= Size ->
+    Acc;
+read_bytes(Socket, Id, Size, Acc) ->
+    Offset = byte_size(Acc),
+    {stream, Id, Offset, Data, _Fin} = await(Socket, fun(Frame) ->
+        element(1, Frame) =:= stream andalso element(2, Frame) =:= Id
+    end),
+    read_bytes(Socket, Id, Size, <<Acc/binary, Data/binary>>).
+
+%% Writes the session drops, to a stream that never opened or that was
+%% reset, and the data a reset drops, are taken off the send queue: with a
+%% limit of 10, each write of 10 bytes is taken only if the queue emptied.
+dropped_writes(Credentials) ->
+    {Session, Socket} = connected(
+        Credentials, ?PARAMETERS, #{initial_max_stream_data_bidi_local => 0}, #{
+            send_queue_limit => 10
+        }
+    ),
+    send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"go">>], false)]),
+    ?assertEqual({stream_opened, 0}, event(Session)),
+    ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
+    Ten = binary:copy(<<"t">>, 10),
+    %% A stream that never opened.
+    ok = send_data(Session, 8, Ten, false),
+    sync(Session),
+    %% Data without credit stays queued, then a reset drops it.
+    ok = send_data(Session, 0, Ten, false),
+    sync(Session),
+    ?assertEqual({error, send_queue_full}, send_data(Session, 0, <<"x">>, false)),
+    ok = trevrpc_qmux:reset_stream(Session, 0, 1),
+    %% A stream that was reset, twice.
+    ok = send_data(Session, 0, Ten, false),
+    sync(Session),
+    ok = send_data(Session, 0, Ten, false),
+    sync(Session),
+    ok = send_data(Session, 0, Ten, false),
+    trevrpc_qmux:close(Session, 0).
+
+%% Returns once the session handled every write sent to it before.
+sync(Session) ->
+    {ok, _} = trevrpc_qmux:peername(Session),
+    ok.
+
+%% A write and then a close, queued while the session is busy: the data
+%% goes out before the CONNECTION_CLOSE.
+close_after_write(Credentials) ->
+    {Session, Socket} = connected(Credentials, #{}),
+    send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"go">>], false)]),
+    ?assertEqual({stream_opened, 0}, event(Session)),
+    ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
+    ok = sys:suspend(Session),
+    ok = send_data(Session, 0, <<"last">>, true),
+    trevrpc_qmux:close(Session, 0),
+    ok = sys:resume(Session),
+    ?assertEqual(
+        {stream, 0, 0, <<"last">>, true},
+        await(Socket, fun(Frame) ->
+            element(1, Frame) =:= stream orelse element(1, Frame) =:= connection_close
+        end)
+    ),
+    ?assertMatch({connection_close, application, 0, _}, close_frame(Socket)).
+
 %% Once both directions of the peer's only stream end, the session allows
 %% another.
 stream_credit(Credentials) ->
     {Session, Socket} = connected(Credentials, #{}),
     send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"one">>], true)]),
     ?assertEqual(<<"one">>, received(Session, 0)),
-    ok = trevrpc_qmux:send_data(Session, 0, <<"done">>, true),
+    ok = send_data(Session, 0, <<"done">>, true),
     ?assertEqual(
         {max_streams, bidi, 2}, await(Socket, fun(Frame) -> element(1, Frame) =:= max_streams end)
     ),
@@ -226,7 +446,7 @@ reset_final_size(Credentials) ->
     {Session, Socket} = connected(Credentials, #{initial_max_stream_data_bidi_local => 4}),
     send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"x">>], false)]),
     ?assertEqual({stream_opened, 0}, event(Session)),
-    ok = trevrpc_qmux:send_data(Session, 0, <<"abcdefgh">>, false),
+    ok = send_data(Session, 0, <<"abcdefgh">>, false),
     ?assertEqual({stream, 0, 0, <<"abcd">>, false}, await(Socket, fun is_stream/1)),
     ok = trevrpc_qmux:reset_stream(Session, 0, 7),
     ?assertEqual(
@@ -315,7 +535,10 @@ stalled_peer(Credentials) ->
     ?assertEqual({stream_opened, 0}, event(Session)),
     ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
     Chunk = binary:copy(<<"z">>, 1 bsl 20),
-    _ = [trevrpc_qmux:send_data_async(Session, 0, Chunk, false) || _ <- lists:seq(1, 64)],
+    _ = [
+        trevrpc_qmux:send_data_async(Session, get({send_queue, Session}), 0, Chunk, false)
+     || _ <- lists:seq(1, 64)
+    ],
     ?assertMatch({closed, _}, await_closed(Session)).
 
 silent_peer(Credentials) ->

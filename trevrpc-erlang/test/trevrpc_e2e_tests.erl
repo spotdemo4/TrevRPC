@@ -2055,6 +2055,7 @@ qmux_failures_test_() ->
                 {timeout, 30, fun() -> handshake_limit(Credentials) end},
                 {timeout, 30, fun() -> client_session_dies(Credentials) end},
                 {timeout, 30, fun() -> server_session_dies(Credentials) end},
+                {timeout, 30, fun() -> adopted_session(Credentials) end},
                 {timeout, 30, fun() -> listener_exit_stops_server(Credentials) end},
                 {timeout, 60, fun() -> reprobe_window(Credentials) end},
                 {timeout, 30, fun() -> refused_connection_fails_at_once(Credentials) end},
@@ -2128,10 +2129,78 @@ client_session_dies(Credentials) ->
 
 %% The channel's current QMux session.
 session(Channel) ->
-    {ok, #{transport := {qmux, Session}, id := Id, ref := Ref}} =
+    {ok, #{transport := {qmux, Session, _}, id := Id, ref := Ref}} =
         trevrpc_channel:open_stream(Channel, infinity),
     trevrpc_channel:stream_done(Channel, Id, Ref),
     Session.
+
+%% A session whose events reach the channel before its attempt's result
+%% does is adopted from them. The channel's own attempts here go to a
+%% listener that never answers TLS, so only sessions started by the test,
+%% owned by the channel, report to it. One that closes first fails the
+%% attempt; one that connects, with its send queue in the connected event,
+%% carries the channel's calls.
+adopted_session(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    #{tcp_port := TcpPort} = ports(Server),
+    {ok, Silent} = gen_tcp:listen(0, [binary, {active, false}, {ip, {127, 0, 0, 1}}]),
+    {ok, SilentPort} = inet:port(Silent),
+    {ok, Channel} = trevrpc_channel:start(
+        (ports(Server))#{
+            tcp_port => SilentPort,
+            host => {127, 0, 0, 1},
+            transport => tcp,
+            server_name => "localhost",
+            cacerts => maps:get(cacerts, Credentials)
+        }
+    ),
+    try
+        [First] = await_attempts(Channel, []),
+        Gone = spawn(fun() -> ok end),
+        Channel ! {trevrpc_qmux, Gone, {closed, connection_lost}},
+        %% The closed event failed the attempt; its retry, after the first
+        %% backoff, goes to the silent listener again.
+        [_Retry] = await_attempts(Channel, [First]),
+        {ok, Socket} = ssl:connect({127, 0, 0, 1}, TcpPort, [
+            binary,
+            {active, false},
+            {verify, verify_none},
+            {alpn_advertised_protocols, [trevrpc:qmux_alpn()]}
+        ]),
+        Parameters = trevrpc_quic:qmux_parameters(trevrpc:default_max_frame_size(), 64, 0, 30000),
+        {ok, Session, _Queue} = trevrpc_qmux:start(Socket, client, Channel, #{
+            parameters => Parameters
+        }),
+        ok = trevrpc_channel:wait_until_ready(Channel, 5000),
+        ?assertEqual(Session, session(Channel)),
+        ?assertMatch({ok, <<"a">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"a">>, #{}))
+    after
+        trevrpc_channel:close(Channel),
+        gen_tcp:close(Silent),
+        trevrpc_server:stop(Server)
+    end.
+
+%% The channel's connection attempts once there are some other than Old:
+%% the references keying the one map in its state whose values name a
+%% kind of connection.
+await_attempts(Channel, Old) ->
+    State = tuple_to_list(sys:get_state(Channel)),
+    Attempts = [
+        maps:keys(Map)
+     || Map <- State,
+        is_map(Map),
+        map_size(Map) > 0,
+        lists:all(fun is_reference/1, maps:keys(Map)),
+        lists:all(fun(Value) -> is_map(Value) andalso is_map_key(kind, Value) end, maps:values(Map))
+    ],
+    New = [Refs || [_ | _] = Refs <- Attempts, Refs -- Old =:= Refs],
+    case New of
+        [Refs] ->
+            Refs;
+        [] ->
+            timer:sleep(10),
+            await_attempts(Channel, Old)
+    end.
 
 %% A server session dying without a closed event ends its connection, which
 %% gives its slot back: with one slot, the client reconnects.

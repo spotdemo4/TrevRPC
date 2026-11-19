@@ -44,8 +44,10 @@
     end
 ).
 
-%% An HTTP/3 connection is the `quic_h3' process and its QUIC connection.
--type t() :: {quic, pid()} | {qmux, pid()} | {h3, pid(), pid()} | {h2, pid()}.
+%% A QMux connection is the session and its send queue; an HTTP/3
+%% connection is the `quic_h3' process and its QUIC connection.
+-type t() ::
+    {quic, pid()} | {qmux, pid(), trevrpc_qmux:send_queue()} | {h3, pid(), pid()} | {h2, pid()}.
 
 -define(H3_NO_ERROR, 16#100).
 -define(H3_REQUEST_CANCELLED, 16#10c).
@@ -59,7 +61,7 @@ kind(Transport) -> element(1, Transport).
 %% @doc The tag of the events the connection sends its owner.
 -spec tag(t()) -> quic | trevrpc_qmux | quic_h3 | h2.
 tag({quic, _}) -> quic;
-tag({qmux, _}) -> trevrpc_qmux;
+tag({qmux, _, _}) -> trevrpc_qmux;
 tag({h3, _, _}) -> quic_h3;
 tag({h2, _}) -> h2.
 
@@ -79,8 +81,8 @@ send_data(Transport, Id, Data, Fin) ->
     ok | {error, term()}.
 send_data({quic, Conn}, Id, Data, Fin, _Timeout) ->
     ?SAFE(quic:send_data(Conn, Id, Data, Fin));
-send_data({qmux, Session}, Id, Data, Fin, _Timeout) ->
-    trevrpc_qmux:send_data(Session, Id, Data, Fin);
+send_data({qmux, Session, Queue}, Id, Data, Fin, _Timeout) ->
+    trevrpc_qmux:send_data(Session, Queue, Id, Data, Fin);
 send_data({h3, H3, _Quic}, Id, Data, Fin, _Timeout) ->
     ?SAFE(quic_h3:send_data(H3, Id, iolist_to_binary(Data), Fin));
 send_data({h2, Conn}, Id, Data, Fin, Timeout) ->
@@ -95,8 +97,8 @@ send_data({h2, Conn}, Id, Data, Fin, Timeout) ->
 send_data_async({quic, Conn}, Id, Data, Fin) ->
     _ = ?SAFE(quic:send_data_async(Conn, Id, Data, Fin)),
     ok;
-send_data_async({qmux, Session}, Id, Data, Fin) ->
-    trevrpc_qmux:send_data_async(Session, Id, Data, Fin);
+send_data_async({qmux, Session, Queue}, Id, Data, Fin) ->
+    trevrpc_qmux:send_data_async(Session, Queue, Id, Data, Fin);
 send_data_async({h3, H3, _Quic}, Id, Data, Fin) ->
     case ?SAFE(quic_h3:send_data(H3, Id, iolist_to_binary(Data), Fin)) of
         {error, send_queue_full} -> {error, send_queue_full};
@@ -109,7 +111,7 @@ send_data_async({h2, Conn}, Id, Data, Fin) ->
 
 -spec consume(t(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 consume({quic, Conn}, Id, Bytes) -> ?SAFE(quic:consume(Conn, Id, Bytes));
-consume({qmux, Session}, Id, Bytes) -> trevrpc_qmux:consume(Session, Id, Bytes);
+consume({qmux, Session, _}, Id, Bytes) -> trevrpc_qmux:consume(Session, Id, Bytes);
 consume({h3, H3, _Quic}, Id, Bytes) -> ?SAFE(quic_h3:consume(H3, Id, Bytes));
 consume({h2, Conn}, Id, Bytes) -> ?SAFE(h2:consume(Conn, Id, Bytes)).
 
@@ -118,7 +120,7 @@ consume({h2, Conn}, Id, Bytes) -> ?SAFE(h2:consume(Conn, Id, Bytes)).
 -spec reset_stream(t(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 reset_stream({quic, Conn}, Id, Code) ->
     ?SAFE(quic:reset_stream(Conn, Id, Code));
-reset_stream({qmux, Session}, Id, Code) ->
+reset_stream({qmux, Session, _}, Id, Code) ->
     trevrpc_qmux:reset_stream(Session, Id, Code);
 reset_stream({h3, H3, _Quic}, Id, _Code) ->
     ?SAFE(quic_h3:cancel(H3, Id, ?H3_REQUEST_CANCELLED));
@@ -130,7 +132,7 @@ reset_stream({h2, Conn}, Id, _Code) ->
 -spec stop_sending(t(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 stop_sending({quic, Conn}, Id, Code) ->
     ?SAFE(quic:stop_sending(Conn, Id, Code));
-stop_sending({qmux, Session}, Id, Code) ->
+stop_sending({qmux, Session, _}, Id, Code) ->
     trevrpc_qmux:stop_sending(Session, Id, Code);
 stop_sending({h3, _H3, Quic}, Id, _Code) ->
     %% quic_h3 has no call that stops reading alone. The client answers
@@ -155,14 +157,14 @@ manual_flow_control(_Transport, _Id) ->
 notify_send_ready({quic, Conn}) ->
     _ = ?SAFE(quic_connection:notify_send_ready(Conn)),
     ok;
-notify_send_ready({qmux, Session}) ->
+notify_send_ready({qmux, Session, _}) ->
     trevrpc_qmux:notify_send_ready(Session);
 notify_send_ready(_Transport) ->
     ok.
 
 -spec open_stream(t()) -> {ok, non_neg_integer()} | {error, term()}.
 open_stream({quic, Conn}) -> ?SAFE(quic:open_stream(Conn));
-open_stream({qmux, Session}) -> trevrpc_qmux:open_stream(Session);
+open_stream({qmux, Session, _}) -> trevrpc_qmux:open_stream(Session);
 open_stream(_Transport) -> {error, unsupported}.
 
 %% @doc Sends a datagram. Only native QUIC carries them here; erlang_quic
@@ -202,7 +204,7 @@ goaway(_Transport) ->
 close({quic, Conn}, Code) ->
     _ = ?SAFE(quic:close(Conn, Code)),
     ok;
-close({qmux, Session}, Code) ->
+close({qmux, Session, _}, Code) ->
     trevrpc_qmux:close(Session, Code);
 close({h3, H3, _Quic}, _Code) ->
     _ = ?SAFE(quic_h3:close(H3, ?H3_NO_ERROR)),
