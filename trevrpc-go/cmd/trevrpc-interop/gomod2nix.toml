@@ -99,12 +99,12 @@ cachePackages = [
     hash = 'sha256-cGvYVbSb48YRnEnmciuAjeu8MiFam9eztwPbOi+aXn8='
 
   [mod.'buf.build/go/protovalidate']
-    version = 'v1.4.0'
-    hash = 'sha256-pTln8e58LYfFnG9lGVODJb4dAetKDtAVdmYPEEzGgnM='
+    version = 'v1.4.1'
+    hash = 'sha256-HejuAT1YukZyM6EFk+mXyQWqSBHLZXE7tJjvZf6x+uI='
 
   [mod.'cel.dev/cel-go']
-    version = 'v0.32.0'
-    hash = 'sha256-V8qevQLL6dFtCsQaFGqoCmWkMTbLoYZjeYNKKkh6URM='
+    version = 'v0.33.2'
+    hash = 'sha256-IBIKURmoS1nslzlQFgQaQKjzEYUhjTPTywIvwPqiDqU='
 
   [mod.'cel.dev/expr']
     version = 'v0.25.3'

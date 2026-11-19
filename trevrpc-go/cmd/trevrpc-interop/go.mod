@@ -11,8 +11,8 @@ require (
 )
 
 require (
-	buf.build/go/protovalidate v1.4.0 // indirect
-	cel.dev/cel-go v0.32.0 // indirect
+	buf.build/go/protovalidate v1.4.1 // indirect
+	cel.dev/cel-go v0.33.2 // indirect
 	cel.dev/expr v0.25.3 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
