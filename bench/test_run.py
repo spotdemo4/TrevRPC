@@ -250,6 +250,57 @@ class BrowserTest(unittest.TestCase):
             _ = run.parse_args(["--browser", "chromium"])
 
 
+class ReportedPorts:
+    """The ports a server reported, as run.browser_lanes reads them."""
+
+    def __init__(self, ports: dict[str, int]) -> None:
+        self.ports = ports
+
+    def port(self, name: str) -> int:
+        return self.ports[name]
+
+    def missing(self, *names: str) -> list[str]:
+        return [name for name in names if name not in self.ports]
+
+
+class BrowserLanesTest(unittest.TestCase):
+    def lanes(self, ports: dict[str, int]) -> dict[str, list[str]]:
+        return run.browser_lanes(cast(run.Server, ReportedPorts(ports)), "ab")
+
+    def test_both_lanes_point_at_the_servers_ports(self) -> None:
+        flags = [
+            "--url", "https://127.0.0.1:4433/trevrpc",
+            "--ws-url", "wss://127.0.0.1:4434/trevrpc",
+            "--cert-hash", "ab",
+        ]  # fmt: skip
+
+        self.assertEqual(
+            {"webtransport": flags, "websocket": flags},
+            self.lanes({"webtransport": 4433, "websocket": 4434}),
+        )
+
+    def test_a_server_without_webtransport_runs_the_websocket_lane_only(self) -> None:
+        self.assertEqual(
+            {
+                "websocket": [
+                    "--url", "https://127.0.0.1:4434/trevrpc",
+                    "--ws-url", "wss://127.0.0.1:4434/trevrpc",
+                    "--cert-hash", "ab",
+                ]
+            },
+            self.lanes({"native": 4433, "websocket": 4434}),
+        )  # fmt: skip
+
+    def test_a_server_without_websocket_runs_the_webtransport_lane_only(self) -> None:
+        self.assertEqual(
+            {"webtransport": ["--url", "https://127.0.0.1:4433/trevrpc", "--cert-hash", "ab"]},
+            self.lanes({"native": 4433, "webtransport": 4433}),
+        )
+
+    def test_a_server_without_either_runs_no_lane(self) -> None:
+        self.assertEqual({}, self.lanes({"native": 4433}))
+
+
 class CompressionTest(unittest.TestCase):
     def test_modes_run_only_where_they_mean_something(self) -> None:
         self.assertTrue(run.runs("none", "quic", "server-stream"))

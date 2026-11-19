@@ -263,6 +263,7 @@ e2e(Transport) ->
                 {"server stream headers", fun server_stream_headers_test/1},
                 {"bidi", fun bidi_test/1},
                 {"bidi error", fun bidi_error_test/1},
+                {"recv with a timeout", fun recv_timeout_test/1},
                 {"unknown method", fun unknown_method_test/1},
                 {"deadline", fun deadline_test/1},
                 {"cancel", fun cancel_test/1},
@@ -386,6 +387,24 @@ bidi_error_test(#{channel := Channel}) ->
         {error, Status} -> ?assertEqual(Abort, Status)
     end,
     ?assertEqual({error, Abort}, trevrpc_client:recv(Call)).
+
+%% recv/2 gives up waiting without ending the call, which goes on until its
+%% own deadline.
+recv_timeout_test(#{channel := Channel}) ->
+    {ok, Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 5000}),
+    ?assertEqual(timeout, trevrpc_client:recv(Call, 0)),
+    ?assertEqual(timeout, trevrpc_client:recv(Call, 50)),
+    ok = trevrpc_client:send(Call, <<"1">>),
+    ?assertEqual({ok, <<"1">>}, trevrpc_client:recv(Call, 5000)),
+    ok = trevrpc_client:send(Call, <<"2">>),
+    ?assertEqual({ok, <<"2">>}, trevrpc_client:recv(Call, infinity)),
+    ok = trevrpc_client:close_send(Call),
+    ?assertEqual({eof, #{}}, trevrpc_client:recv(Call, 5000)),
+    {ok, Short} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 300}),
+    ?assertEqual(
+        {error, #{code => deadline_exceeded, message => <<"deadline exceeded">>}},
+        trevrpc_client:recv(Short, 5000)
+    ).
 
 unknown_method_test(#{channel := Channel}) ->
     ?assertEqual(

@@ -620,6 +620,21 @@ class Runner:
             self.failures.append(failure)
 
 
+def browser_lanes(server: Server, cert_hash: str) -> dict[str, list[str]]:
+    """The flags that point each of a browser's TrevRPC lanes at the server, for the lanes whose
+    transport it serves; the others are skipped. --url is the WebTransport URL, which the browser
+    bench requires even for the WebSocket lane, so a server without WebTransport gets an https
+    URL on its TCP port in its place. --ws-url goes only to a server that serves WebSocket."""
+    served = [lane for lane in TREVRPC_BROWSER_TRANSPORTS if not server.missing(lane)]
+    if not served:
+        return {}
+    flags = ["--url", f"https://127.0.0.1:{server.port(served[0])}/trevrpc"]
+    if "websocket" in served:
+        flags += ["--ws-url", f"wss://127.0.0.1:{server.port('websocket')}/trevrpc"]
+    flags += ["--cert-hash", cert_hash]
+    return {lane: flags for lane in served}
+
+
 def summary(results: list[Result]) -> str:
     """One table per netem profile, in the order they ran, with one row per run, grouped by
     scenario so transports and runtimes line up."""
@@ -874,11 +889,6 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
                 "quic": ["--addr", native, *tls],
                 "tcp": ["--addr", native, "--tcp-addr", qmux, *tls],
             }
-            lanes = [
-                "--url", f"https://127.0.0.1:{server.port('webtransport')}/trevrpc",
-                "--ws-url", f"wss://127.0.0.1:{server.port('websocket')}/trevrpc",
-                "--cert-hash", cert_hash,
-            ]  # fmt: skip
             for profile in profiles:
                 apply(profile)
                 for client in clients:
@@ -886,14 +896,23 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
                         runner.run_matrix(
                             client.name, spec.name, client.command, transport, flags, profile
                         )
+                lanes = browser_lanes(server, cert_hash)
                 for browser in browsers:
                     for transport in TREVRPC_BROWSER_TRANSPORTS:
+                        if transport not in lanes:
+                            print(
+                                f"skipping {browser} over {transport} against {spec.name}: "
+                                f"the server does not serve {transport}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
                         runner.run_matrix(
                             browser,
                             spec.name,
                             BROWSER_COMMAND,
                             transport,
-                            ["--browser", browser, *lanes],
+                            ["--browser", browser, *lanes[transport]],
                             profile,
                         )
         finally:

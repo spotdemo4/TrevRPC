@@ -90,6 +90,15 @@ pub fn close_send(call: Call(request, response)) -> Result(Nil, Status)
 @external(erlang, "trevrpc_gleam_ffi", "recv")
 pub fn recv(call: Call(request, response)) -> Result(Received(response), Status)
 
+/// Reads the next response, or the end of the call, as `recv` does, but
+/// waits for it at most `within` milliseconds: `Ok(None)` means none arrived
+/// in time, and the call goes on. The call's timeout still ends it.
+@external(erlang, "trevrpc_gleam_ffi", "recv_within")
+pub fn recv_within(
+  call: Call(request, response),
+  within milliseconds: Int,
+) -> Result(Option(Received(response)), Status)
+
 /// Ends the requests of a client-streaming call and reads its response.
 @external(erlang, "trevrpc_gleam_ffi", "close_and_recv")
 pub fn close_and_recv(call: Call(request, response)) -> Result(response, Status)

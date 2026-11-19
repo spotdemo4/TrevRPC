@@ -3,7 +3,7 @@
 %% `skip <name>: <reason>' for each.
 -module(trevrpc_interop_client).
 
--export([run/1]).
+-export([run/1, connect/2]).
 
 -define(ECHO, trevrpc_interop_v1_echo).
 -define(COMPRESSED_ECHO, trevrpc_interop_v1_compressed_echo).
@@ -116,6 +116,10 @@ selection(#{"scenarios" := List}) ->
 selection(#{}) ->
     all.
 
+%% @doc Connects a channel to --addr (and --tcp-addr) over `Transport',
+%% trusting --ca, with the compression settings of --dictionary.
+-spec connect(#{string() => string()}, quic | tcp | auto) ->
+    {ok, pid()} | {error, trevrpc_status:status()}.
 connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
     {Host, Port} = host_port(Addr),
     {TcpHost, TcpPort} = host_port(maps:get("tcp-addr", Flags, Addr)),

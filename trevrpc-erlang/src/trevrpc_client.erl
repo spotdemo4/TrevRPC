@@ -20,7 +20,8 @@
 %% A call is read and written by the process that started it, which owns
 %% its stream; if that process exits first, the channel cancels the call. A
 %% call is finished once {@link recv/1} returns `{eof, Trailers}' or
-%% `{error, Status}', or after {@link cancel/1}.
+%% `{error, Status}', or after {@link cancel/1}. {@link recv/2} waits for a
+%% response only so long, so that the process can also send on a schedule.
 %%
 %% Options: `timeout' (milliseconds) or `deadline' (in
 %% `erlang:monotonic_time(millisecond)' units), sent to the server and
@@ -58,6 +59,7 @@
     close_send/1,
     close_and_recv/1,
     recv/1,
+    recv/2,
     headers/1,
     cancel/1
 ]).
@@ -135,7 +137,11 @@
     flow :: pos_integer() | undefined,
     datagram_sender :: trevrpc_datagram:sender() | undefined,
     early = [] :: [binary()],
-    early_bytes = 0 :: non_neg_integer()
+    early_bytes = 0 :: non_neg_integer(),
+    %% While recv/2 waits: when it stops waiting, in
+    %% erlang:monotonic_time(millisecond) units, if that is before the
+    %% call's deadline.
+    wait = infinity :: trevrpc_stream:deadline()
 }).
 
 -type terminal() :: {eof, trevrpc_metadata:metadata()} | {error, trevrpc_status:status()}.
@@ -759,6 +765,14 @@ ended_upload(Call, State) ->
 %% trailing metadata; `{error, Status}' ends it with any other.
 -spec recv(call()) -> {ok, term()} | terminal().
 recv(Call) ->
+    case next_message(Call) of
+        timeout -> erlang:error(unreachable);
+        Result -> Result
+    end.
+
+%% The next response message, or `timeout' once recv/2 stops waiting.
+-spec next_message(call()) -> {ok, term()} | terminal() | timeout.
+next_message(Call) ->
     case state(Call) of
         #cstate{pending = [Message | Rest]} = State ->
             put_state(Call, State#cstate{pending = Rest}),
@@ -770,10 +784,10 @@ recv(Call) ->
                     received(Call, Message);
                 {headers, Next} ->
                     put_state(Call, Next),
-                    recv(Call);
+                    next_message(Call);
                 {queued, Next} ->
                     put_state(Call, Next),
-                    recv(Call);
+                    next_message(Call);
                 {terminal, Terminal, #cstate{pending = []} = Next} ->
                     done(Call, Next),
                     Terminal;
@@ -781,12 +795,31 @@ recv(Call) ->
                     %% Datagram messages that arrived before the end go
                     %% first.
                     put_state(Call, Next),
-                    recv(Call)
+                    next_message(Call);
+                {waited, Next} ->
+                    put_state(Call, Next),
+                    timeout
             end;
         #cstate{terminal = Terminal} = State ->
             done(Call, State),
             Terminal
     end.
+
+%% @doc Reads the next response message as {@link recv/1} does, waiting
+%% for it at most `Timeout' milliseconds: `timeout' means none arrived in
+%% time, and the call goes on. The call's deadline still ends it.
+-spec recv(call(), timeout()) -> {ok, term()} | terminal() | timeout.
+recv(Call, infinity) ->
+    recv(Call);
+recv(#client_call{ref = Ref} = Call, Timeout) when is_integer(Timeout), Timeout >= 0 ->
+    State = state(Call),
+    put_state(Call, State#cstate{wait = erlang:monotonic_time(millisecond) + Timeout}),
+    Result = next_message(Call),
+    case get({trevrpc_client, Ref}) of
+        undefined -> ok;
+        Next -> put_state(Call, Next#cstate{wait = infinity})
+    end,
+    Result.
 
 %% A response message, decoded with the call's codec. One it cannot decode
 %% abandons the call, as a response that breaks the protocol does.
@@ -871,9 +904,14 @@ single_response(Call) ->
 %% Reads response frames up to the next message, the headers, or the call's
 %% end, checking the grammar: [ANSWER] [HEADERS] MESSAGE* [DATAGRAM_COUNT]
 %% STATUS. Datagram messages read on the way are queued (`queued'), once
-%% the headers are known.
-read_event(Call, #cstate{stream = Stream} = State) ->
-    case trevrpc_stream:next_frame(Stream, Call#client_call.deadline) of
+%% the headers are known. While recv/2 waits, running out of time before
+%% the call's deadline returns `waited' and leaves the call as it was.
+read_event(Call, #cstate{stream = Stream, wait = Wait} = State) ->
+    %% Numbers sort before atoms, so min/2 and < treat infinity as later
+    %% than any deadline.
+    case trevrpc_stream:next_frame(Stream, min(Call#client_call.deadline, Wait)) of
+        {error, timeout, Next} when Wait < Call#client_call.deadline ->
+            {waited, State#cstate{stream = Next}};
         {ok, Frame, Next} ->
             with_early(frame(Call, Frame, State#cstate{stream = Next}));
         {datagram, Messages, Next} ->
@@ -917,7 +955,8 @@ keep_early(Messages, #cstate{early = Early, early_bytes = Bytes} = State) ->
 with_early({message, Message, State}) -> {message, Message, flush_early(State)};
 with_early({headers, State}) -> {headers, flush_early(State)};
 with_early({queued, State}) -> {queued, flush_early(State)};
-with_early({terminal, Terminal, State}) -> {terminal, Terminal, flush_early(State)}.
+with_early({terminal, Terminal, State}) -> {terminal, Terminal, flush_early(State)};
+with_early({waited, State}) -> {waited, State}.
 
 flush_early(#cstate{early = []} = State) ->
     State;

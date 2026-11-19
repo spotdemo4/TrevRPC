@@ -359,6 +359,20 @@ pub fn bidi_test() {
   let assert Ok(client.End(_)) = client.recv(call)
 }
 
+/// `recv_within` stops waiting without ending the call.
+pub fn recv_within_test() {
+  use _, ch <- both()
+  let assert Ok(call) = greeter_trevrpc.chat(ch, client.options())
+  client.recv_within(call, within: 0) |> should.equal(Ok(None))
+  client.recv_within(call, within: 50) |> should.equal(Ok(None))
+  let assert Ok(Nil) = client.send(call, hello("1"))
+  let assert Ok(Some(client.Message(reply))) =
+    client.recv_within(call, within: 5000)
+  reply.message |> should.equal("1")
+  let assert Ok(Nil) = client.close_send(call)
+  let assert Ok(Some(client.End(_))) = client.recv_within(call, within: 5000)
+}
+
 /// The call's timeout ends a call that takes longer.
 pub fn timeout_test() {
   use _, ch <- both()

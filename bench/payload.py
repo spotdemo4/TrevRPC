@@ -1,6 +1,6 @@
 """The `records` payload of the load benchmarks: realistic, compressible message text in which
-every message differs; see README.md. The Go, Rust and baseline clients implement the same
-generator byte for byte, and check it against GOLDEN_SHA256.
+every message differs; see README.md. The Go, Rust, Erlang and baseline clients implement the
+same generator byte for byte, and check it against GOLDEN_SHA256.
 
 A generator is an xorshift64 state. Each message is log records, one JSON object per line,
 appended until the message reaches its size and then cut to exactly that size; the rest of the

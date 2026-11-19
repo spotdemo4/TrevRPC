@@ -5,7 +5,7 @@
 
 -export([connect/2, close/1]).
 -export([unary/4, server_stream/4, client_stream/3, bidi/3]).
--export([send/2, close_send/1, recv/1, close_and_recv/1, headers/1, cancel/1]).
+-export([send/2, close_send/1, recv/1, recv_within/2, close_and_recv/1, headers/1, cancel/1]).
 -export([route/3, start/1, port/1, tcp_port/1, stop/1]).
 -export([handler_recv/1, handler_send/2, send_headers/2, set_trailers/2]).
 
@@ -96,6 +96,18 @@ recv(Call) ->
         case trevrpc_client:recv(Call) of
             {ok, Response} -> {ok, {message, Response}};
             {eof, Trailers} -> {ok, {'end', Trailers}};
+            {error, Status} -> {error, status(Status)}
+        end
+    end).
+
+-spec recv_within(trevrpc_client:call(), integer()) ->
+    result(option({message, term()} | {'end', trevrpc_metadata:metadata()})).
+recv_within(Call, Milliseconds) ->
+    usable(fun() ->
+        case trevrpc_client:recv(Call, max(0, Milliseconds)) of
+            timeout -> {ok, none};
+            {ok, Response} -> {ok, {some, {message, Response}}};
+            {eof, Trailers} -> {ok, {some, {'end', Trailers}}};
             {error, Status} -> {error, status(Status)}
         end
     end).

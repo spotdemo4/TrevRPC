@@ -7,7 +7,16 @@
 %%                               [--transport quic|tcp|auto] [--tcp-addr <host:port>]
 %%                               [--expect-transport quic|qmux] [--dictionary <file>]
 %%                               [--scenarios <name,...>]
+%% trevrpc-interop-erlang bench  --addr <host:port> --ca <pem> [--server-name localhost]
+%%                               --transport quic|tcp [--tcp-addr <host:port>] --scenario <name>
+%%                               [--size N] [--concurrency N] [--connections N] [--duration S]
+%%                               [--warmup S] [--messages N] [--rate N] [--metadata-size N]
+%%                               [--metadata-scope call] [--payload repeat|records]
+%%                               [--compression MODE] [--dictionary <file>] [--validation none]
 %% '''
+%%
+%% The `bench' subcommand is the load client of bench/README.md (see
+%% {@link trevrpc_interop_bench}).
 %%
 %% The runtime serves native QUIC, QMux over TLS, QMux over WebSocket and the
 %% HTTP mapping over HTTP/3 and HTTP/2, and calls native QUIC and QMux over
@@ -18,7 +27,7 @@
 %% the browser app lanes, load their page through the HTTP fallback.
 -module(trevrpc_interop).
 
--export([main/0, server_scenarios/0, compression/1]).
+-export([main/0, server_scenarios/0, compression/1, start_server/1]).
 
 -define(STREAM_RECEIVED, <<"interop-stream-compressed-received">>).
 
@@ -81,8 +90,32 @@ run(["client" | Args]) ->
             "scenarios"
         ])
     );
+run(["bench" | Args]) ->
+    trevrpc_interop_bench:run(
+        flags(Args, [
+            "addr",
+            "ca",
+            "server-name",
+            "transport",
+            "tcp-addr",
+            "scenario",
+            "size",
+            "concurrency",
+            "connections",
+            "duration",
+            "warmup",
+            "messages",
+            "rate",
+            "metadata-size",
+            "metadata-scope",
+            "payload",
+            "compression",
+            "dictionary",
+            "validation"
+        ])
+    );
 run(_) ->
-    throw({usage, "usage: trevrpc-interop-erlang (server|client) [--flag value]..."}).
+    throw({usage, "usage: trevrpc-interop-erlang (server|client|bench) [--flag value]..."}).
 
 flags(Args, Allowed) ->
     flags(Args, Allowed, #{}).
@@ -99,23 +132,8 @@ flags([Arg | _], _Allowed, _Flags) ->
 
 %%% Server
 
-server(#{"cert" := Cert, "key" := Key} = Flags) ->
-    {ok, Host} = inet:parse_address(maps:get("host", Flags, "127.0.0.1")),
-    %% With no HTTP fallback, --web-root is accepted and unused. The browser
-    %% runner's page comes from an origin of its own, so every origin is
-    %% admitted. HTTP is served, so that the WebSocket lanes run while the
-    %% TCP listener offers h2 as well.
-    {ok, Server} = trevrpc_server:start(#{
-        ip => Host,
-        port => list_to_integer(maps:get("port", Flags, "0")),
-        certfile => Cert,
-        keyfile => Key,
-        routes => routes(),
-        compression => compression(Flags),
-        http => true,
-        webtransport => true,
-        webtransport_admission => fun(_Request) -> true end
-    }),
+server(#{"cert" := _, "key" := _} = Flags) ->
+    {ok, Server} = start_server(Flags),
     {ok, Port} = trevrpc_server:port(Server),
     {ok, TcpPort} = trevrpc_server:tcp_port(Server),
     Ready = #{
@@ -129,6 +147,27 @@ server(#{"cert" := Cert, "key" := Key} = Flags) ->
     0;
 server(_Flags) ->
     throw({usage, "server: --cert and --key are required"}).
+
+%% @doc Starts the server of the `server' subcommand's flags, serving the
+%% services of interop/proto.
+-spec start_server(#{string() => string()}) -> {ok, pid()} | ignore | {error, term()}.
+start_server(#{"cert" := Cert, "key" := Key} = Flags) ->
+    {ok, Host} = inet:parse_address(maps:get("host", Flags, "127.0.0.1")),
+    %% With no HTTP fallback, --web-root is accepted and unused. The browser
+    %% runner's page comes from an origin of its own, so every origin is
+    %% admitted. HTTP is served, so that the WebSocket lanes run while the
+    %% TCP listener offers h2 as well.
+    trevrpc_server:start(#{
+        ip => Host,
+        port => list_to_integer(maps:get("port", Flags, "0")),
+        certfile => Cert,
+        keyfile => Key,
+        routes => routes(),
+        compression => compression(Flags),
+        http => true,
+        webtransport => true,
+        webtransport_admission => fun(_Request) -> true end
+    }).
 
 wait_stdin() ->
     case io:get_line("") of

@@ -17,11 +17,13 @@ let
       fileset = lib.fileset.unions [
         ./rebar.config
         ./src
+        ./test
       ];
     };
     beamDeps = [ trevrpc-erlang ];
 
-    # xref, and dialyzer, which checks the generated bindings' specs against the runtime's types.
+    # xref, dialyzer, which checks the generated bindings' specs against the runtime's types, and
+    # the tests, which check the bench client's records payload against bench/payload.py.
     # rebar3 takes the runtime and its dependencies from _checkouts instead of fetching them.
     doCheck = true;
     checkPhase = ''
@@ -32,6 +34,7 @@ let
       chmod -R u+w _checkouts
       rebar3 xref
       rebar3 dialyzer
+      rebar3 eunit
       runHook postCheck
     '';
   };
