@@ -44,7 +44,11 @@ qmux_test_() ->
                     {"data out of order is refused", fun out_of_order/1},
                     {"the peer's close ends the session", fun peer_close/1},
                     {"a peer that stops reading is lost", fun stalled_peer/1},
-                    {"a peer that sends no parameters is closed", fun silent_peer/1}
+                    {"a peer that sends no parameters is closed", fun silent_peer/1},
+                    {"a Ping flood from a peer that reads nothing is bounded", fun ping_flood/1},
+                    {"a WebSocket session drains its Close", fun ws_close/1},
+                    {"a writer blocked at the close holds it until the send timeout",
+                        fun blocked_close/1}
                 ]
             ]
         end}.
@@ -540,6 +544,161 @@ stalled_peer(Credentials) ->
      || _ <- lists:seq(1, 64)
     ],
     ?assertMatch({closed, _}, await_closed(Session)).
+
+%% A WebSocket peer that sends Pings and reads nothing. The writer, held
+%% still, takes its window of a stream's data and no more; then 1000 Pings
+%% add nothing to it, and once it runs again exactly one Pong, to the
+%% latest Ping, reaches the peer with the data.
+ping_flood(Credentials) ->
+    {Session, Socket} = pair(Credentials, maps:put(initial_max_streams_bidi, 3, ?PARAMETERS), #{
+        framing => websocket
+    }),
+    Large = 1 bsl 30,
+    Parameters = trevrpc_qmux_frame:transport_parameters(
+        maps:merge(?PARAMETERS, #{
+            initial_max_data => Large,
+            initial_max_stream_data_bidi_local => Large,
+            initial_max_stream_data_bidi_remote => Large
+        })
+    ),
+    ok = ssl:send(Socket, ws_record([Parameters])),
+    ?assertMatch({connected, _}, event(Session)),
+    ok = ssl:send(Socket, ws_record([trevrpc_qmux_frame:stream(0, 0, [<<"go">>], false)])),
+    ?assertEqual({stream_opened, 0}, event(Session)),
+    ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
+    Writer = writer(Session),
+    erlang:suspend_process(Writer),
+    Size = 1 bsl 20,
+    ok = trevrpc_qmux:send_data_async(
+        Session, get({send_queue, Session}), 0, binary:copy(<<"d">>, Size), false
+    ),
+    %% A stream the peer opens is a marker: its event follows every Ping
+    %% sent before it.
+    Marker = fun(Id) ->
+        ok = ssl:send(Socket, ws_record([trevrpc_qmux_frame:stream(Id, 0, [<<"m">>], false)])),
+        ?assertEqual({stream_opened, Id}, event(Session)),
+        ?assertMatch({stream_data, Id, <<"m">>, false}, event(Session))
+    end,
+    Marker(4),
+    {message_queue_len, Filled} = process_info(Writer, message_queue_len),
+    Ping = ws_frame:encode({ping, binary:copy(<<"p">>, 125)}, client),
+    _ = [ok = ssl:send(Socket, Ping) || _ <- lists:seq(1, 1000)],
+    Marker(8),
+    ?assertEqual({message_queue_len, Filled}, process_info(Writer, message_queue_len)),
+    erlang:resume_process(Writer),
+    ?assertEqual(1, ws_pongs(Socket, Size)),
+    trevrpc_qmux:close(Session, 0).
+
+%% The session's writer, once it started: the process the session
+%% monitors that runs the writer's loop.
+writer(Session) ->
+    {monitors, Monitors} = process_info(Session, monitors),
+    Writers = [
+        Pid
+     || {process, Pid} <- Monitors,
+        {current_function, {trevrpc_qmux, Function, _}} <- [process_info(Pid, current_function)],
+        lists:member(Function, [writer_loop, write_batch, write_out])
+    ],
+    case Writers of
+        [Writer] ->
+            Writer;
+        [] ->
+            timer:sleep(1),
+            writer(Session)
+    end.
+
+ws_record(Frames) ->
+    ws_frame:encode({binary, iolist_to_binary(Frames)}, client).
+
+%% The Pongs the peer reads with Size bytes of stream 0's data.
+ws_pongs(Socket, Size) ->
+    ws_pongs(Socket, Size, ws_frame:init_parser(#{role => client}), 0).
+
+ws_pongs(_Socket, Size, _Parser, Pongs) when Size =< 0 ->
+    Pongs;
+ws_pongs(Socket, Size, Parser, Pongs) ->
+    {ok, Data} = ssl:recv(Socket, 0, 5000),
+    {ok, Messages, Next} = ws_frame:parse(Parser, Data),
+    Read = lists:sum([
+        byte_size(Bytes)
+     || {binary, Record} <- Messages,
+        {stream, 0, _, Bytes, _} <- element(2, trevrpc_qmux_frame:decode_frames(Record))
+    ]),
+    ws_pongs(Socket, Size - Read, Next, Pongs + length([pong || {pong, _} <- Messages])).
+
+%% A WebSocket session that ends on its own, here as the peer sent no
+%% parameters, still sends its Close: the session waits for its writer,
+%% held still until then, to drain it before the socket closes.
+ws_close(Credentials) ->
+    {Session, Socket} = pair(Credentials, ?PARAMETERS, #{
+        framing => websocket, handshake_timeout => 200
+    }),
+    Writer = writer(Session),
+    erlang:suspend_process(Writer),
+    ?assertEqual({closed, handshake_timeout}, event(Session)),
+    ok = until_ended(Session),
+    erlang:resume_process(Writer),
+    Messages = ws_messages(Socket, ws_frame:init_parser(#{role => client})),
+    ?assertMatch([_], [Close || Close <- Messages, is_close(Close)]).
+
+%% Returns once the session waits for its writer as it ends, or ended.
+until_ended(Session) ->
+    case process_info(Session, current_function) of
+        {current_function, {trevrpc_qmux, stop_writer, 1}} ->
+            ok;
+        undefined ->
+            ok;
+        _ ->
+            timer:sleep(1),
+            until_ended(Session)
+    end.
+
+ws_messages(Socket, Parser) ->
+    ws_messages(Socket, Parser, []).
+
+%% The messages the peer reads until a Close, or until the socket closes.
+ws_messages(Socket, Parser, Acc) ->
+    case ssl:recv(Socket, 0, 5000) of
+        {ok, Data} ->
+            {ok, Messages, Next} = ws_frame:parse(Parser, Data),
+            All = Acc ++ Messages,
+            case [Close || Close <- Messages, is_close(Close)] of
+                [] -> ws_messages(Socket, Next, All);
+                _ -> All
+            end;
+        {error, _} ->
+            Acc
+    end.
+
+is_close(close) -> true;
+is_close(Message) -> element(1, Message) =:= close.
+
+%% A peer that reads nothing, with credit for all it is sent: the writer
+%% blocks. A close then ends the session once the blocked write times out,
+%% after the close timeout and the moment the writer gets to drain, instead
+%% of waiting on the writer, or on a flush, for good.
+blocked_close(Credentials) ->
+    Large = 1 bsl 30,
+    Peer = #{
+        initial_max_data => Large,
+        initial_max_stream_data_bidi_local => Large,
+        initial_max_stream_data_bidi_remote => Large
+    },
+    {Session, Socket} = connected(Credentials, ?PARAMETERS, Peer, #{send_timeout => 1500}),
+    send(Socket, [trevrpc_qmux_frame:stream(0, 0, [<<"go">>], false)]),
+    ?assertEqual({stream_opened, 0}, event(Session)),
+    ?assertMatch({stream_data, 0, <<"go">>, false}, event(Session)),
+    Chunk = binary:copy(<<"z">>, 1 bsl 20),
+    _ = [
+        trevrpc_qmux:send_data_async(Session, get({send_queue, Session}), 0, Chunk, false)
+     || _ <- lists:seq(1, 64)
+    ],
+    Monitor = monitor(process, Session),
+    trevrpc_qmux:close(Session, 0),
+    receive
+        {'DOWN', Monitor, process, Session, _} -> ok
+    after 8000 -> error({session_held, process_info(Session, current_stacktrace)})
+    end.
 
 silent_peer(Credentials) ->
     {Session, _Socket} = pair(Credentials, ?PARAMETERS, #{handshake_timeout => 200}),

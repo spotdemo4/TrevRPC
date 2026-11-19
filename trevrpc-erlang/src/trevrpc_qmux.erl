@@ -22,6 +22,13 @@
 %%   <li>`{closed, Reason}': the session ended.</li>
 %% </ul>
 %%
+%% The session never blocks on a write: a writer process of its own writes
+%% the records to the socket, so the session reads on while a write waits
+%% for the peer to read. Two sessions that both send more than the
+%% sockets' buffers hold, each blocked in a write the other no longer read,
+%% would otherwise deadlock. At most ?WRITE_WINDOW bytes wait in the
+%% writer; the rest stays in the streams until it wrote them.
+%%
 %% Streams are always in manual flow control: the peer may send one window
 %% past the bytes returned with {@link consume/3}. Data, and a FIN, go out in
 %% order: a FIN travels with a stream's last data, so a reset's final size,
@@ -109,6 +116,14 @@
 
 -record(state, {
     socket :: ssl:sslsocket() | undefined,
+    %% The process that writes to the socket, its monitor, and the bytes
+    %% handed to it and not written yet.
+    writer :: pid() | undefined,
+    writer_monitor :: reference() | undefined,
+    unwritten = 0 :: non_neg_integer(),
+    %% The WebSocket Pong owed to the peer's latest Ping, waiting for room
+    %% in the writer.
+    pong = [] :: iodata(),
     role :: client | server,
     owner :: pid(),
     local :: trevrpc_qmux_frame:parameters(),
@@ -155,6 +170,7 @@
 }).
 
 -define(MAX_SEND_RECORD, 65536).
+-define(WRITE_WINDOW, (4 * ?MAX_SEND_RECORD)).
 -define(QUANTUM, 16384).
 -define(CLOSE_TIMEOUT, 1000).
 -define(DEFAULT_QUEUE_LIMIT, 1048576).
@@ -355,7 +371,11 @@ handle_cast({socket, Socket}, #state{handshake_timeout = Handshake, send_timeout
     case ssl:setopts(Socket, [{send_timeout, Send}, {send_timeout_close, true}]) of
         ok ->
             erlang:send_after(Handshake, self(), handshake_timeout),
-            received(State#state.received, State#state{socket = Socket, received = <<>>});
+            Session = self(),
+            {Writer, Monitor} = spawn_opt(fun() -> writer(Session, Socket) end, [monitor]),
+            received(State#state.received, State#state{
+                socket = Socket, received = <<>>, writer = Writer, writer_monitor = Monitor
+            });
         {error, Reason} ->
             {stop, normal, lost({connection_lost, Reason}, State#state{socket = Socket})}
     end;
@@ -381,10 +401,22 @@ handle_info({ssl_closed, Socket}, #state{socket = Socket} = State) ->
 handle_info({ssl_error, Socket, Reason}, #state{socket = Socket} = State) ->
     {stop, normal, lost({connection_lost, Reason}, State)};
 handle_info(flush, State) ->
-    case flush(State#state{flush_pending = false}) of
-        {ok, Next} -> {noreply, Next};
-        {error, Reason, Next} -> {stop, normal, lost(Reason, Next)}
-    end;
+    {noreply, flush(State#state{flush_pending = false})};
+handle_info({written, Writer, Bytes}, #state{writer = Writer, unwritten = Unwritten} = State) ->
+    %% Room in the writer: what waited for it goes now.
+    noreply(State#state{unwritten = Unwritten - Bytes});
+handle_info(
+    {'DOWN', Monitor, process, _Writer, _Reason},
+    #state{writer_monitor = Monitor, closing = true} = State
+) ->
+    {noreply, State#state{writer = undefined, writer_monitor = undefined}};
+handle_info({'DOWN', Monitor, process, _Writer, Reason}, #state{writer_monitor = Monitor} = State) ->
+    Lost =
+        case Reason of
+            {write_failed, Error} -> {connection_lost, Error};
+            _ -> {connection_lost, Reason}
+        end,
+    {stop, normal, lost(Lost, State#state{writer = undefined, writer_monitor = undefined})};
 handle_info(tick, #state{closing = false} = State) ->
     tick(State);
 handle_info(close_timeout, State) ->
@@ -405,8 +437,59 @@ terminate(_Reason, #state{socket = undefined} = State) ->
     mark_closed(State);
 terminate(_Reason, #state{socket = Socket} = State) ->
     mark_closed(State),
+    %% What the writer holds, such as a WebSocket close, goes out first,
+    %% for a moment at most. A write that still blocks then holds the
+    %% close, as ssl closes behind its sender, until the send timeout.
+    stop_writer(State),
     _ = ssl:close(Socket),
     ok.
+
+stop_writer(#state{writer = undefined}) ->
+    ok;
+stop_writer(#state{writer = Writer, writer_monitor = Monitor}) ->
+    Writer ! stop,
+    receive
+        {'DOWN', Monitor, process, Writer, _} -> ok
+    after ?CLOSE_TIMEOUT -> ok
+    end.
+
+%% The writer: writes what the session hands it, in order, what piled up
+%% meanwhile in one write, and tells the session how much it wrote. A write
+%% that fails, or blocks past the send timeout, which closes the socket,
+%% ends it, and the session learns of it from its exit. `shutdown' ends the
+%% sending direction and `stop' the writer, after what was handed before.
+writer(Session, Socket) ->
+    writer_loop(Session, Socket, monitor(process, Session)).
+
+writer_loop(Session, Socket, Monitor) ->
+    receive
+        {write, Data, Size} ->
+            write_batch(Session, Socket, Monitor, [Data], Size);
+        shutdown ->
+            _ = ssl:shutdown(Socket, write),
+            writer_loop(Session, Socket, Monitor);
+        stop ->
+            ok;
+        {'DOWN', Monitor, process, Session, _} ->
+            ok
+    end.
+
+write_batch(Session, Socket, Monitor, Batch, Size) when Size < ?WRITE_WINDOW ->
+    receive
+        {write, Data, More} -> write_batch(Session, Socket, Monitor, [Data | Batch], Size + More)
+    after 0 -> write_out(Session, Socket, Monitor, Batch, Size)
+    end;
+write_batch(Session, Socket, Monitor, Batch, Size) ->
+    write_out(Session, Socket, Monitor, Batch, Size).
+
+write_out(Session, Socket, Monitor, Batch, Size) ->
+    case ssl:send(Socket, lists:reverse(Batch)) of
+        ok ->
+            Session ! {written, self(), Size},
+            writer_loop(Session, Socket, Monitor);
+        {error, Reason} ->
+            exit({write_failed, Reason})
+    end.
 
 noreply(State) ->
     {noreply, schedule_flush(State)}.
@@ -429,7 +512,7 @@ received(Data, State) ->
     {Records, Replies, Then, Framing} =
         case trevrpc_qmux_record:decode(Data, State#state.framing) of
             {ok, R, P, F} -> {R, P, read_on, F};
-            {closed, Reason, R, P, F} -> {R, P, {closed, Reason}, F};
+            {closed, Why, R, P, F} -> {R, P, {closed, Why}, F};
             {error, Error, R, P, F} -> {R, P, {error, Error}, F}
         end,
     Result = records(Records, State#state{framing = Framing}),
@@ -438,35 +521,43 @@ received(Data, State) ->
             {ok, S} -> S;
             {_, _, S} -> S
         end,
-    case send_now(Replies, After) of
-        {error, Reason1, Next} ->
-            {stop, normal, lost({connection_lost, Reason1}, Next)};
-        {ok, Next} ->
-            case {Result, Then} of
-                {{error, {Code, FrameType, Reason2}, _}, _} ->
-                    fail(Code, FrameType, Reason2, Next);
-                {{closed, Reason2, _}, _} ->
-                    quiet_close(Reason2, Next);
-                {{ok, _}, {error, {Code, FrameType, Reason2}}} ->
-                    fail(Code, FrameType, Reason2, Next);
-                {{ok, _}, {closed, Reason2}} ->
-                    quiet_close(Reason2, Next);
-                {{ok, _}, read_on} ->
-                    case ssl:setopts(Next#state.socket, [{active, once}]) of
-                        ok -> noreply(Next);
-                        {error, Reason2} -> {stop, normal, lost({connection_lost, Reason2}, Next)}
-                    end
+    Next =
+        case Then of
+            read_on -> owe_pong(Replies, After);
+            _ -> send_now(Replies, After)
+        end,
+    case {Result, Then} of
+        {{error, {Code, FrameType, Reason}, _}, _} ->
+            fail(Code, FrameType, Reason, Next);
+        {{closed, Reason, _}, _} ->
+            quiet_close(Reason, Next);
+        {{ok, _}, {error, {Code, FrameType, Reason}}} ->
+            fail(Code, FrameType, Reason, Next);
+        {{ok, _}, {closed, Reason}} ->
+            quiet_close(Reason, Next);
+        {{ok, _}, read_on} ->
+            case ssl:setopts(Next#state.socket, [{active, once}]) of
+                ok -> noreply(Next);
+                {error, Reason} -> {stop, normal, lost({connection_lost, Reason}, Next)}
             end
     end.
 
-%% Sends what the framing answers the peer with, such as pongs, at once.
+%% Sends what the framing answers the peer with as the session ends, at
+%% once, whatever the writer holds.
 send_now([], State) ->
-    {ok, State};
-send_now(Bytes, #state{socket = Socket} = State) ->
-    case ssl:send(Socket, Bytes) of
-        ok -> {ok, State#state{last_sent = now_ms()}};
-        {error, Reason} -> {error, Reason, State}
-    end.
+    State;
+send_now(Bytes, State) ->
+    hand(Bytes, iolist_size(Bytes), State).
+
+%% The Pongs that answer the peer's Pings go with the next flush that finds
+%% room in the writer. Only the latest is owed (RFC 6455 Section 5.5.3), so
+%% a peer that sends Pings and reads nothing, once the writer holds its
+%% ?WRITE_WINDOW, adds one owed Pong, not a queue of them, while the
+%% session reads on.
+owe_pong([], State) ->
+    State;
+owe_pong(Pongs, State) ->
+    State#state{pong = lists:last(Pongs)}.
 
 records([], State) ->
     {ok, State};
@@ -846,40 +937,42 @@ queue_control([], State) ->
 queue_control(Frames, #state{control = Control} = State) ->
     State#state{control = Control ++ Frames}.
 
-%% Sends everything that can go: control frames, flow control updates and
-%% stream data as credit allows, in records the peer accepts.
-flush(#state{socket = undefined} = State) ->
-    {ok, State};
+%% Hands the writer everything that can go: control frames, flow control
+%% updates and stream data as credit allows, in records the peer accepts,
+%% until the writer holds ?WRITE_WINDOW bytes. The rest goes once it wrote
+%% some.
+flush(#state{writer = undefined} = State) ->
+    State;
 flush(#state{closing = true} = State) ->
-    {ok, State};
-flush(State) ->
-    flush(State, []).
+    State;
+flush(#state{unwritten = Unwritten} = State) when Unwritten >= ?WRITE_WINDOW ->
+    State;
+flush(#state{pong = []} = State) ->
+    flush(State, [], 0);
+flush(#state{pong = Pong} = State) ->
+    flush(State#state{pong = []}, [Pong], iolist_size(Pong)).
 
-flush(State, Records) ->
-    {Frames, Next} = build(State),
-    case Frames of
-        [] ->
-            send_records(lists:reverse(Records), Next);
-        _ ->
-            Batch = [trevrpc_qmux_record:encode(Frames, Next#state.framing) | Records],
-            case iolist_size(Batch) >= 4 * ?MAX_SEND_RECORD of
-                true ->
-                    case send_records(lists:reverse(Batch), Next) of
-                        {ok, Sent} -> flush(Sent, []);
-                        Error -> Error
-                    end;
-                false ->
-                    flush(Next, Batch)
-            end
+flush(#state{unwritten = Unwritten} = State, Records, Size) when
+    Unwritten + Size >= ?WRITE_WINDOW
+->
+    hand(lists:reverse(Records), Size, State);
+flush(State, Records, Size) ->
+    case build(State) of
+        {[], Next} ->
+            hand(lists:reverse(Records), Size, Next);
+        {Frames, Next} ->
+            Record = trevrpc_qmux_record:encode(Frames, Next#state.framing),
+            flush(Next, [Record | Records], Size + iolist_size(Record))
     end.
 
-send_records([], State) ->
-    {ok, maybe_send_ready(State)};
-send_records(Records, #state{socket = Socket} = State) ->
-    case ssl:send(Socket, Records) of
-        ok -> {ok, maybe_send_ready(State#state{last_sent = now_ms()})};
-        {error, Reason} -> {error, Reason, State}
-    end.
+hand(_Records, 0, State) ->
+    maybe_send_ready(State);
+hand(_Records, _Size, #state{writer = undefined} = State) ->
+    %% The writer is gone, and with it the connection.
+    State;
+hand(Records, Size, #state{writer = Writer, unwritten = Unwritten} = State) ->
+    Writer ! {write, Records, Size},
+    maybe_send_ready(State#state{unwritten = Unwritten + Size, last_sent = now_ms()}).
 
 %% The size of the records to send, once the peer's parameters arrived.
 limit(#state{peer = Peer}) ->
@@ -1087,32 +1180,43 @@ fail(Code, FrameType, Reason, State) ->
 close_with(Frame, Reason, #state{socket = Socket, owner = Owner} = State0) ->
     mark_closed(State0),
     Owner ! {trevrpc_qmux, self(), {closed, Reason}},
-    case Socket of
+    case State0#state.writer of
         undefined ->
             {stop, normal, State0};
-        _ ->
+        Writer ->
             %% What was written before the close, and not flushed yet, goes
-            %% first.
-            State =
-                case flush(State0) of
-                    {ok, Flushed} -> Flushed;
-                    {error, _, Failed} -> Failed
-                end,
-            _ = ssl:send(Socket, trevrpc_qmux_record:close(Frame, State#state.framing)),
-            _ = ssl:shutdown(Socket, write),
+            %% first, whatever the writer holds.
+            State = flush_all(State0),
+            Closed = send_now(trevrpc_qmux_record:close(Frame, State#state.framing), State),
+            Writer ! shutdown,
             erlang:send_after(?CLOSE_TIMEOUT, self(), close_timeout),
             _ = ssl:setopts(Socket, [{active, true}]),
-            {noreply, State#state{closing = true}}
+            {noreply, Closed#state{closing = true}}
+    end.
+
+%% Hands the writer everything that can go, past its window.
+flush_all(State) ->
+    case build(State) of
+        {[], Next} ->
+            Next;
+        {Frames, Next} ->
+            Record = trevrpc_qmux_record:encode(Frames, Next#state.framing),
+            flush_all(hand(Record, iolist_size(Record), Next))
     end.
 
 %% The peer closed, or the idle timeout expired: end without frames, but
 %% with the closing handshake of a WebSocket.
-quiet_close(Reason, #state{socket = Socket, owner = Owner} = State) ->
+quiet_close(Reason, #state{owner = Owner} = State) ->
     mark_closed(State),
     Owner ! {trevrpc_qmux, self(), {closed, Reason}},
-    _ = send_now(trevrpc_qmux_record:close(none, State#state.framing), State),
-    _ = ssl:shutdown(Socket, write),
-    {stop, normal, State}.
+    Closed = send_now(trevrpc_qmux_record:close(none, State#state.framing), State),
+    _ =
+        case Closed#state.writer of
+            %% It failed during a close the peer now answers.
+            undefined -> ok;
+            Writer -> Writer ! shutdown
+        end,
+    {stop, normal, Closed}.
 
 lost(Reason, #state{owner = Owner} = State) ->
     mark_closed(State),

@@ -275,7 +275,8 @@ e2e(Transport) ->
                 {"optimistic stream compression is refused", fun optimistic_test/1},
                 {"connection metadata", fun connection_metadata_test/1},
                 {"compression without a dictionary", fun plain_test/1},
-                {"many concurrent calls", fun concurrent_test/1}
+                {"many concurrent calls", fun concurrent_test/1},
+                {"bulk streams in both directions", fun bulk_test/1}
             ]
         ]
     end}.
@@ -514,6 +515,33 @@ concurrent_test(#{channel := Channel}) ->
         [{ok, integer_to_binary(N)} || N <- lists:seq(1, 50)],
         [{ok, Message} || {ok, Message, _} <- Results]
     ).
+
+%% 64 calls at once, each sending 100 messages of 4 KiB before it reads the
+%% 100 the server echoes: about 25 MiB each way at once, more than the
+%% sockets' buffers hold, so both ends write and read at the same time.
+%% Nothing may stall.
+bulk_test(#{channel := Channel}) ->
+    Message = binary:copy(<<"b">>, 4096),
+    Self = self(),
+    Pids = [
+        spawn_link(fun() ->
+            {ok, Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 50000}),
+            Sent = [trevrpc_client:send(Call, Message) || _ <- lists:seq(1, 100)],
+            ok = trevrpc_client:close_send(Call),
+            Received = [trevrpc_client:recv(Call) || _ <- lists:seq(1, 101)],
+            Self ! {self(), lists:usort(Sent), lists:usort(Received)}
+        end)
+     || _ <- lists:seq(1, 64)
+    ],
+    [
+        receive
+            {Pid, Sent, Received} ->
+                ?assertEqual([ok], Sent),
+                ?assertEqual([{eof, #{}}, {ok, Message}], Received)
+        after 55000 -> error(stalled)
+        end
+     || Pid <- Pids
+    ].
 
 %%% Raw requests, for what the client never sends
 
@@ -2210,14 +2238,15 @@ server_session_dies(Credentials) ->
     try
         ok = trevrpc_channel:subscribe(Channel),
         await_state(Channel, {ready, 1}),
-        %% #state{connections = #{Monitor => Pid}} of the server, and
-        %% #state{role, owner} of a session.
+        %% #state{connections = #{Monitor => Pid}} of the server; a session
+        %% monitors its owner.
         Connections = maps:values(element(5, sys:get_state(Server))),
         [Session] = [
             Pid
          || Pid <- processes(),
             proc_lib:translate_initial_call(Pid) =:= {trevrpc_qmux, init, 1},
-            lists:member(element(4, sys:get_state(Pid)), Connections)
+            {monitors, Monitors} <- [process_info(Pid, monitors)],
+            lists:any(fun(Owner) -> lists:member({process, Owner}, Monitors) end, Connections)
         ],
         exit(Session, kill),
         await_state(Channel, connecting),
