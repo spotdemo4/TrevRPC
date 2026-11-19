@@ -25,7 +25,10 @@
 %%
 %% The channel process owns the connection and routes each stream's events
 %% to the process that made the call, which reads and writes the stream
-%% itself; see {@link trevrpc_client}.
+%% itself; see {@link trevrpc_client}. A calling process opens its streams
+%% on the connection itself too, once it knows the connection, and only
+%% registers them with the channel, so the channel, which every call goes
+%% through, never waits on the connection for them.
 -module(trevrpc_channel).
 
 -behaviour(gen_server).
@@ -90,7 +93,10 @@
     optimistic := boolean(),
     %% The stream's datagram flow and its credit, when the calling process
     %% asked for one and the connection carries datagrams.
-    flow := {pos_integer(), trevrpc_datagram_flows:credit()} | undefined
+    flow := {pos_integer(), trevrpc_datagram_flows:credit()} | undefined,
+    %% How many opens the channel holds for stream credit, which callers
+    %% opening their own streams do not pass.
+    queued_opens := atomics:atomics_ref()
 }.
 
 %% Whether a call asks for a datagram flow, and whether it reads a stream of
@@ -160,6 +166,8 @@
     %% Opens refused for lack of stream credit, waiting for more, with the
     %% calling process and whether it asked for a datagram flow.
     pending_opens = [] :: [{gen_server:from(), {pid(), datagrams()}, reference()}],
+    %% Their number, for callers that open their own streams.
+    queued_opens = atomics:new(1, []) :: atomics:atomics_ref(),
     %% The datagram flows of the connection's calls, the flow of each
     %% stream that has one, and whether the connection carries datagrams,
     %% once a call asked.
@@ -259,13 +267,68 @@ open_stream(Channel, Deadline) ->
 %% datagram flow if `Datagrams' asks for one (`true' when the call reads a
 %% stream of responses, `false' when it reads one response) and the
 %% connection carries datagrams.
+%%
+%% The calling process remembers the channel's connection and its
+%% generation from its last stream, opens the stream on it itself, and
+%% registers it with the channel before it writes to it, so no event of the
+%% stream can reach the channel first. The channel opens it instead when
+%% the process knows no connection yet, the server's stream limit is
+%% reached (the channel waits for credit), or the connection is gone or
+%% was replaced.
 -spec open_stream(pid(), trevrpc_stream:deadline(), datagrams()) ->
     {ok, stream_info()} | {error, trevrpc_status:status()}.
 open_stream(Channel, Deadline, Datagrams) ->
-    try
-        gen_server:call(Channel, {open_stream, {self(), Datagrams}, Deadline}, infinity)
+    case get({?MODULE, Channel}) of
+        {Generation, Transport, Queued} ->
+            case atomics:get(Queued, 1) of
+                0 -> own_open(Channel, Generation, Transport, Deadline, Datagrams);
+                %% Opens wait for stream credit: this one waits behind them.
+                _ -> channel_open(Channel, Deadline, Datagrams)
+            end;
+        undefined ->
+            channel_open(Channel, Deadline, Datagrams)
+    end.
+
+%% Opens the stream on the remembered connection and registers it. A
+%% caller killed in between leaves a stream nobody registered. A QMux
+%% server, which opens the streams below the next one it hears of, ends it
+%% once its REQUEST does not come, and the channel cancels it, as any
+%% stream it gets data for and does not know. A QUIC server never hears of
+%% it, so it keeps one stream credit until the connection closes.
+own_open(Channel, Generation, Transport, Deadline, Datagrams) ->
+    case trevrpc_transport:open_stream(Transport) of
+        {ok, Id} ->
+            ok = trevrpc_transport:manual_flow_control(Transport, Id),
+            case register_stream(Channel, Generation, Id, Datagrams) of
+                {ok, Info} ->
+                    {ok, Info};
+                stale ->
+                    cancel_stream(Transport, Id),
+                    channel_open(Channel, Deadline, Datagrams)
+            end;
+        {error, _} ->
+            channel_open(Channel, Deadline, Datagrams)
+    end.
+
+%% Has the channel open the stream, and remembers its connection. A
+%% channel that is gone is forgotten.
+channel_open(Channel, Deadline, Datagrams) ->
+    _ = erase({?MODULE, Channel}),
+    try gen_server:call(Channel, {open_stream, {self(), Datagrams}, Deadline}, infinity) of
+        {ok, #{generation := Generation, transport := Transport, queued_opens := Queued}} = Opened ->
+            put({?MODULE, Channel}, {Generation, Transport, Queued}),
+            Opened;
+        Error ->
+            Error
     catch
         exit:_ -> {error, closed_status()}
+    end.
+
+register_stream(Channel, Generation, Id, Datagrams) ->
+    try
+        gen_server:call(Channel, {register_stream, Generation, Id, {self(), Datagrams}}, infinity)
+    catch
+        exit:_ -> stale
     end.
 
 %% @private A call on generation `Generation' learned the dictionaries the
@@ -481,6 +544,16 @@ handle_call({open_stream, _Owner, _Deadline}, _From, #state{status = connecting}
     {reply, {error, trevrpc_status:new(unavailable, <<"channel is reconnecting">>)}, State};
 handle_call({open_stream, Owner, Deadline}, From, State) ->
     open(From, Owner, Deadline, State);
+handle_call(
+    {register_stream, Generation, Id, Opener},
+    _From,
+    #state{status = ready, generation = Generation} = State
+) ->
+    {Info, Registered} = opened(Id, Opener, State),
+    {reply, {ok, Info}, Registered};
+handle_call({register_stream, _Generation, _Id, _Opener}, _From, State) ->
+    %% The connection the stream is on is no longer the channel's.
+    {reply, stale, State};
 handle_call({reserve, Id, Ref, Cost}, _From, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := {_Pid, Ref, _Monitor}} ->
@@ -595,7 +668,7 @@ handle_info({timeout, _Timer, {open_timeout, From}}, #state{pending_opens = Pend
             gen_server:reply(
                 From, {error, trevrpc_status:new(deadline_exceeded, <<"deadline exceeded">>)}
             ),
-            {noreply, State#state{pending_opens = Rest}};
+            {noreply, pending(Rest, State)};
         false ->
             {noreply, State}
     end;
@@ -626,8 +699,7 @@ handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{monitors = Monitor
     %% The calling process exited without finishing its call: cancel it.
     case maps:find(Monitor, Monitors) of
         {ok, Id} ->
-            _ = trevrpc_transport:reset_stream(State#state.transport, Id, ?CANCELLED),
-            _ = trevrpc_transport:stop_sending(State#state.transport, Id, ?CANCELLED),
+            cancel_stream(State#state.transport, Id),
             {noreply, forget(Id, Monitor, State)};
         error ->
             {noreply, State}
@@ -930,11 +1002,10 @@ lost(State) ->
         trevrpc_zstd_stream:release(Connecting#state.stream_budget, Held)
      || _Id := Held <- Connecting#state.reserved
     ],
-    retry(Connecting#state{
+    retry((pending([], Connecting))#state{
         streams = #{},
         monitors = #{},
         reserved = #{},
-        pending_opens = [],
         send_waiters = [],
         flows = trevrpc_datagram_flows:new(client, 0),
         stream_flows = #{}
@@ -971,52 +1042,77 @@ fail_streams(#state{streams = Streams, send_waiters = Waiters}) ->
 
 route(Id, Event, #state{streams = Streams} = State) ->
     _ =
-        case Streams of
-            #{Id := {Pid, Ref, _Monitor}} -> Pid ! {trevrpc_stream, Ref, Event};
-            _ -> ok
+        case {Streams, Event} of
+            {#{Id := {Pid, Ref, _Monitor}}, _} ->
+                Pid ! {trevrpc_stream, Ref, Event};
+            {#{}, {data, _, _}} ->
+                %% A stream no call reads: one whose caller is done, or
+                %% exited before it registered the stream it opened.
+                cancel_stream(State#state.transport, Id);
+            _ ->
+                ok
         end,
     {noreply, State}.
 
+%% Cancels both sides of a stream nobody uses.
+cancel_stream(Transport, Id) ->
+    _ = trevrpc_transport:reset_stream(Transport, Id, ?CANCELLED),
+    _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
+    ok.
+
 %%% Streams
 
-open(From, {Owner, Datagrams} = Opener, Deadline, #state{transport = Transport} = State0) ->
+open(From, Opener, Deadline, #state{pending_opens = [_ | _]} = State) ->
+    %% Opens wait for stream credit: this one waits behind them, even if
+    %% credit came back and the channel has not heard of it yet.
+    queue_open(From, Opener, Deadline, State);
+open(From, Opener, Deadline, #state{transport = Transport} = State0) ->
     case trevrpc_transport:open_stream(Transport) of
         {ok, Id} ->
             ok = trevrpc_transport:manual_flow_control(Transport, Id),
-            Ref = make_ref(),
-            Monitor = monitor(process, Owner),
-            {Flow, State} = flow(Id, Owner, Ref, Datagrams, State0),
-            Info = #{
-                flow => Flow,
-                transport => Transport,
-                id => Id,
-                ref => Ref,
-                generation => State#state.generation,
-                max_frame_size => State#state.max_frame_size,
-                compression => State#state.compression,
-                shared => State#state.shared,
-                stream_budget => State#state.stream_budget,
-                optimistic => State#state.optimistic
-            },
-            {reply, {ok, Info}, State#state{
-                streams = (State#state.streams)#{Id => {Owner, Ref, Monitor}},
-                monitors = (State#state.monitors)#{Monitor => Id}
-            }};
+            {Info, State} = opened(Id, Opener, State0),
+            {reply, {ok, Info}, State};
         {error, stream_limit} ->
-            Timer =
-                case Deadline of
-                    infinity ->
-                        make_ref();
-                    _ ->
-                        Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
-                        erlang:start_timer(Timeout, self(), {open_timeout, From})
-                end,
-            {noreply, State0#state{
-                pending_opens = State0#state.pending_opens ++ [{From, Opener, Timer}]
-            }};
+            queue_open(From, Opener, Deadline, State0);
         _ ->
             {reply, {error, trevrpc_status:new(unavailable, <<"could not open a stream">>)}, State0}
     end.
+
+%% Routes the events of stream `Id', open on the current connection, to the
+%% process that opened it, and what that process needs to use it.
+opened(Id, {Owner, Datagrams}, #state{transport = Transport} = State0) ->
+    Ref = make_ref(),
+    Monitor = monitor(process, Owner),
+    {Flow, State} = flow(Id, Owner, Ref, Datagrams, State0),
+    Info = #{
+        flow => Flow,
+        transport => Transport,
+        id => Id,
+        ref => Ref,
+        generation => State#state.generation,
+        max_frame_size => State#state.max_frame_size,
+        compression => State#state.compression,
+        shared => State#state.shared,
+        stream_budget => State#state.stream_budget,
+        optimistic => State#state.optimistic,
+        queued_opens => State#state.queued_opens
+    },
+    {Info, State#state{
+        streams = (State#state.streams)#{Id => {Owner, Ref, Monitor}},
+        monitors = (State#state.monitors)#{Monitor => Id}
+    }}.
+
+%% Holds an open until stream credit comes back, or its deadline passes.
+queue_open(From, Opener, Deadline, State) ->
+    Timer =
+        case Deadline of
+            infinity ->
+                make_ref();
+            _ ->
+                Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
+                erlang:start_timer(Timeout, self(), {open_timeout, From})
+        end,
+    {noreply, pending(State#state.pending_opens ++ [{From, Opener, Timer}], State)}.
 
 %% A datagram flow for stream `Id', if its call asked for one and the
 %% connection carries datagrams: native QUIC whose server takes them, which
@@ -1042,10 +1138,16 @@ retry_opens(#state{pending_opens = [{From, Owner, Timer} | Rest]} = State) ->
         {reply, Reply, Opened} ->
             _ = erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
             gen_server:reply(From, Reply),
-            retry_opens(Opened#state{pending_opens = Rest});
+            retry_opens(pending(Rest, Opened));
         {noreply, _StillFull} ->
-            {noreply, State}
+            %% The open, refused, did not join the queue it came from.
+            {noreply, pending(State#state.pending_opens, State)}
     end.
+
+%% Sets the opens waiting for stream credit, and publishes their number.
+pending(Pending, #state{queued_opens = Queued} = State) ->
+    atomics:put(Queued, 1, length(Pending)),
+    State#state{pending_opens = Pending}.
 
 %% Forgets stream `Id', giving back what it held of the stream compression
 %% budget, and its datagram flow.

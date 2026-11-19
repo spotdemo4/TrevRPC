@@ -277,6 +277,10 @@ e2e(Transport) ->
                 {"compression without a dictionary", fun plain_test/1},
                 {"many concurrent calls", fun concurrent_test/1},
                 {"the connection process calls no transport for calls", fun conn_calls_test/1},
+                {"callers open their own streams", fun channel_calls_test/1},
+                {"a stream opened on a replaced connection is opened again",
+                    fun stale_stream_test/1},
+                {"callers wait behind queued opens", fun queued_opens_test/1},
                 {"bulk streams in both directions", fun bulk_test/1}
             ]
         ]
@@ -546,6 +550,106 @@ conn_calls_test(#{channel := Channel, server := Server}) ->
         {trace_delivered, Conn, Ref} -> ok
     end,
     ?assertEqual([], traced_calls(Conn, [])).
+
+%% A process that knows the channel's connection from its first stream
+%% opens its next ones on it itself: the channel, which every call goes
+%% through, makes no call into the transport for them.
+channel_calls_test(#{channel := Channel}) ->
+    ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"c">>, #{})),
+    Modules = [trevrpc_transport, trevrpc_qmux, quic, quic_connection],
+    _ = [erlang:trace_pattern({Module, '_', '_'}, true, [local]) || Module <- Modules],
+    1 = erlang:trace(Channel, true, [call]),
+    try
+        _ = [
+            ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"c">>, #{}))
+         || _ <- lists:seq(1, 10)
+        ]
+    after
+        _ = erlang:trace(Channel, false, [call]),
+        _ = [erlang:trace_pattern({Module, '_', '_'}, false, [local]) || Module <- Modules]
+    end,
+    Ref = erlang:trace_delivered(Channel),
+    receive
+        {trace_delivered, Channel, Ref} -> ok
+    end,
+    ?assertEqual([], traced_calls(Channel, [])).
+
+%% A process that remembers a connection of an earlier generation opens
+%% its stream there, which the channel refuses to register: the stream is
+%% reset, the channel opens one on its connection, and the call goes on.
+stale_stream_test(#{channel := Channel}) ->
+    Self = self(),
+    Caller = spawn_link(fun() ->
+        ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"s">>, #{})),
+        {Generation, Transport, Queued} = get({trevrpc_channel, Channel}),
+        put({trevrpc_channel, Channel}, {Generation - 1, Transport, Queued}),
+        Self ! {remembered, self()},
+        receive
+            go -> ok
+        end,
+        Result = trevrpc_client:unary(Channel, ?UNARY, <<"s">>, #{}),
+        Self !
+            {done, self(), Result, {Generation, Transport, Queued}, get({trevrpc_channel, Channel})}
+    end),
+    receive
+        {remembered, Caller} -> ok
+    end,
+    _ = erlang:trace_pattern({trevrpc_transport, reset_stream, 3}, true, [local]),
+    try
+        1 = erlang:trace(Caller, true, [call]),
+        Caller ! go,
+        receive
+            {done, Caller, Result, Current, Remembered} ->
+                ?assertMatch({ok, <<"s">>, _}, Result),
+                ?assertEqual(Current, Remembered)
+        after 5000 -> error(no_result)
+        end
+    after
+        _ = erlang:trace_pattern({trevrpc_transport, reset_stream, 3}, false, [local])
+    end,
+    Ref = erlang:trace_delivered(Caller),
+    receive
+        {trace_delivered, Caller, Ref} -> ok
+    end,
+    ?assertEqual([{trevrpc_transport, reset_stream, 3}], traced_calls(Caller, [])).
+
+%% While the channel holds opens for stream credit, callers that open
+%% their own streams have it open theirs too, behind them, instead of
+%% taking the credit first: one that knows the connection makes no open of
+%% its own while the channel's count of queued opens is raised.
+queued_opens_test(#{channel := Channel}) ->
+    Self = self(),
+    Caller = spawn_link(fun() ->
+        ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"q">>, #{})),
+        {_, _, Queued} = get({trevrpc_channel, Channel}),
+        Self ! {queued, self(), Queued},
+        receive
+            go -> ok
+        end,
+        Self ! {done, self(), trevrpc_client:unary(Channel, ?UNARY, <<"q">>, #{})}
+    end),
+    Queued =
+        receive
+            {queued, Caller, Q} -> Q
+        end,
+    atomics:put(Queued, 1, 1),
+    _ = erlang:trace_pattern({trevrpc_transport, open_stream, 1}, true, [local]),
+    try
+        1 = erlang:trace(Caller, true, [call]),
+        Caller ! go,
+        receive
+            {done, Caller, Result} -> ?assertMatch({ok, <<"q">>, _}, Result)
+        after 5000 -> error(no_result)
+        end
+    after
+        _ = erlang:trace_pattern({trevrpc_transport, open_stream, 1}, false, [local]),
+        atomics:put(Queued, 1, 0)
+    end,
+    Ref = erlang:trace_delivered(Caller),
+    receive
+        {trace_delivered, Caller, Ref} -> ok
+    end,
+    ?assertEqual([], traced_calls(Caller, [])).
 
 traced_calls(Pid, Acc) ->
     receive
@@ -1505,14 +1609,74 @@ limits(Transport) ->
                 {timeout, 60, fun() -> closed_connection_releases_slots(Credentials) end},
                 {timeout, 60, fun() -> shutdown_waits_for_finishing_call(Credentials) end},
                 {timeout, 120, fun() -> unread_uploads_keep_the_connection_window(Credentials) end},
-                {timeout, 60, fun() -> unread_streams_share_the_connection_window(Credentials) end}
+                {timeout, 60, fun() -> unread_streams_share_the_connection_window(Credentials) end},
+                {timeout, 30, fun() -> dead_connection_is_forgotten(Credentials) end}
             ] ++
+                [
+                    {timeout, 30, fun() -> orphan_stream_is_cancelled(Credentials) end}
+                 || maps:get(transport, Credentials) =:= tcp
+                ] ++
                 [
                     {timeout, 60, fun() -> subscriptions(Credentials) end},
                     {timeout, 60, fun() -> stopped_handler_returns_credit(Credentials) end},
                     {timeout, 30, fun() -> untrusted_server(Credentials) end}
                 ]
         end}.
+
+%% A caller that remembers a connection that died opens no stream on it:
+%% the channel opens one on its next connection, which the caller then
+%% remembers.
+dead_connection_is_forgotten(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = connect(Credentials, Server),
+    try
+        ok = trevrpc_channel:subscribe(Channel),
+        await_state(Channel, {ready, 1}),
+        ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"d">>, #{})),
+        {1, Transport, _} = get({trevrpc_channel, Channel}),
+        exit(trevrpc_transport:pid(Transport), kill),
+        await_state(Channel, connecting),
+        await_state(Channel, {ready, 2}),
+        ?assertMatch({ok, <<"d">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"d">>, #{})),
+        ?assertMatch({2, _, _}, get({trevrpc_channel, Channel}))
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A caller that exits between opening its stream and registering it
+%% leaves the stream to the channel: the server, which hears of it from a
+%% later stream, ends it once its REQUEST does not come, and the channel,
+%% which knows no call for it, cancels it. Over QMux, whose server opens
+%% the streams below the one it hears of; erlang_quic does not report
+%% those, so a QUIC server holds nothing for the stream.
+orphan_stream_is_cancelled(Credentials) ->
+    Server = start_server(Credentials, #{initial_request_timeout => 200}),
+    Channel = connect(Credentials, Server),
+    Self = self(),
+    try
+        _ = spawn_link(fun() ->
+            ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"o">>, #{})),
+            {_, Transport, _} = get({trevrpc_channel, Channel}),
+            Self ! {orphan, trevrpc_transport:open_stream(Transport)}
+        end),
+        Orphan =
+            receive
+                {orphan, {ok, Id}} -> Id
+            after 5000 -> error(no_orphan)
+            end,
+        _ = erlang:trace_pattern({trevrpc_transport, reset_stream, 3}, true, [local]),
+        1 = erlang:trace(Channel, true, [call]),
+        ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"o">>, #{})),
+        receive
+            {trace, Channel, call, {trevrpc_transport, reset_stream, [_, Orphan, _]}} -> ok
+        after 5000 -> error(not_cancelled)
+        end
+    after
+        _ = erlang:trace_pattern({trevrpc_transport, reset_stream, 3}, false, [local]),
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
 
 stream_limit(Credentials) ->
     Server = start_server(Credentials, #{max_streams_per_connection => 2}),
