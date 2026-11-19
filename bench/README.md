@@ -35,9 +35,9 @@ The Erlang interop executable (the `trevrpc-erlang-interop` package's
 `trevrpc-interop-erlang`) is not packaged in, so name it, as in
 `--server erlang=trevrpc-interop-erlang --client erlang=trevrpc-interop-erlang`. Its
 client runs every scenario and compression mode but the validation scenarios and
-connection metadata, which it refuses, and reports no `wire_B/msg`; its server serves
-no `ValidationBench` and no WebTransport. A browser lane is skipped against a server
-that does not serve its transport.
+connection metadata, which it refuses and `--table` leaves out, and reports no
+`wire_B/msg`; its server serves no `ValidationBench`. A browser lane is skipped against
+a server that does not serve its transport.
 `run.py` starts each server once, then runs every client over every transport
 for every combination of scenario, size, metadata size and scope, and concurrency, and
 runs `paced` and `unreliable-paced` once per rate in `--rates` (default 1000), and the

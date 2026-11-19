@@ -487,6 +487,27 @@ class TableTest(unittest.TestCase):
             self.cells("metadata"),
         )  # fmt: skip
 
+    def test_tables_leave_out_the_cells_the_erlang_client_refuses(self) -> None:
+        def cells(table: str) -> dict[str, int]:
+            args = run.parse_args(
+                ["--table", table, "--server", "erlang=erlang", "--client", "erlang=erlang",
+                 "--baseline", "baseline"]
+            )  # fmt: skip
+            matrix = run.build_matrix(args)
+            return {
+                transport: sum(
+                    len(matrix.cells("erlang", "erlang", transport, profile))
+                    for profile in args.netem or [None]
+                )
+                for transport in run.NATIVE_TRANSPORTS
+            }
+
+        # It runs the tables of its own server like the other runtimes, without validation and
+        # with call metadata only.
+        self.assertEqual({"quic": 12, "tcp": 12}, cells("comparison"))
+        self.assertEqual({"quic": 0, "tcp": 0}, cells("validation"))
+        self.assertEqual({"quic": 8, "tcp": 8}, cells("metadata"))
+
     def test_explicit_flags_override_the_table(self) -> None:
         args = run.parse_args(
             ["--table", "lossy", "--netem", "delay 1ms", "--sizes", "64", "--baseline", "b"]

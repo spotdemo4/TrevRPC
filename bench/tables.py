@@ -4,7 +4,8 @@ A table names its options, which become the defaults of the command line (explic
 win), and a filter over the cells those options span. Tables refer to the packaged servers and
 clients by name: `go` and `rust` run against their own server only, and the baseline's clients are
 `grpc` and `connect`. Browsers are clients named after themselves, such as `chromium`, whose
-TrevRPC lanes run against every TrevRPC server and whose fetch lanes run against `connect`.
+TrevRPC lanes run against every TrevRPC server and whose fetch lanes run against `connect`. The
+Erlang runtime, which the packaged runner leaves out, is `erlang` when named on the command line.
 """
 
 from __future__ import annotations
@@ -42,6 +43,18 @@ class Table:
     # argparse destinations and their values, applied as the command line's defaults.
     options: dict[str, object] = field(default_factory=lambda: dict[str, object]())
     keep: Callable[[Cell], bool] = lambda _cell: True
+
+    def runs(self, cell: Cell) -> bool:
+        """Whether the table runs a cell: it reads the cell, and the cell's client runs it."""
+        return self.keep(cell) and not refused(cell)
+
+
+def refused(cell: Cell) -> bool:
+    """The cells a client refuses, which no table runs: the Erlang client has no validation
+    scenarios and no connection metadata yet (see README.md)."""
+    return cell.client == "erlang" and (
+        cell.validation is not None or cell.metadata_scope == "connection"
+    )
 
 
 def own_server(cell: Cell) -> bool:
