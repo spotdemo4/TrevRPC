@@ -1,0 +1,66 @@
+name: safari
+
+# Runs the browser interop suite in Safari itself, driven through safaridriver. Playwright's WebKit
+# is not used: its builds decide on their own whether to expose WebTransport. Every lane must pass
+# against both servers.
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  # A new push to a pull request cancels its previous run; pushes to main all run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# yaml-language-server-disable is not allowed
+enable-openid-connect: true
+
+jobs:
+  interop:
+    # zizmor: ignore[excessive-permissions]
+    name: safari-to-${{ matrix.server }}
+    runs-on: macos-27
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [go, rust]
+    env:
+      SERVER: ${{ matrix.server }}
+      CELL: safari-to-${{ matrix.server }}
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@058efbda6393adccb321793a01b3fe4ea0533885 # v1.80.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          shell: safari
+
+      # WebTransport depends on the Safari version, which differs between runner images.
+      - name: Print Safari version
+        run: |
+          sw_vers
+          defaults read /Applications/Safari.app/Contents/Info CFBundleShortVersionString
+          safaridriver --version
+
+      # Every browser lane: WebTransport, WebSocket, the fallback to WebSocket and the app lanes.
+      - name: Run Safari interop
+        env:
+          OUTPUT: ${{ runner.temp }}/${{ env.CELL }}
+        run: |
+          trevrpc-interop \
+            --out "$OUTPUT" \
+            --server "$SERVER=trevrpc-interop-$SERVER" \
+            --browser safari
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: https://data.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: ${{ env.CELL }}
+          path: ${{ runner.temp }}/${{ env.CELL }}
+          if-no-files-found: ignore

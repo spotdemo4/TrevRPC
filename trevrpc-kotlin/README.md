@@ -169,9 +169,11 @@ nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go-interop --command \
   --output out/interop --work-dir /var/tmp/interop
 ```
 
-`--transport http3` (the default) runs the scenarios over HTTP/3. `--transport http2` runs them with Cronet's QUIC disabled, as on a network that blocks UDP, to exercise the HTTP/2 mapping on the server's TCP listener. The GitHub `android` workflow runs both for each server.
+`--transport http3` (the default) runs the scenarios over HTTP/3. `--transport http2` runs them with Cronet's QUIC disabled, as on a network that blocks UDP, to exercise the HTTP/2 mapping on the server's TCP listener. The `android` workflow runs both for each server.
 
 The runner generates a certificate for `10.0.2.2` (the emulator's alias for the host), trusts it in the emulator's system store, and runs the server command with `server --cert <pem> --key <pem> --host 0.0.0.0 --dictionary <file>`. It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if every scenario passed and the server exited 0 once its stdin closed.
+
+Several runs can share a host. Each run starts its own adb server on a free port, which does not scan for emulators and so knows only the emulator that registers with it, and the emulator picks a free console port itself.
 
 ## Development
 

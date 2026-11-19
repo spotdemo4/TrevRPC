@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -38,8 +39,13 @@ from harness import (
 )
 
 EMULATOR_HOST = "10.0.2.2"
-EMULATOR_PORT = 5554
-SERIAL = f"emulator-{EMULATOR_PORT}"
+# Each run talks to its emulator through its own adb server, and runs may share a host (CI runners
+# with host networking run several jobs at once). adb normally scans console ports 5554-5585 and
+# attaches to every emulator it finds, taking over other runs' emulators, so the run's server scans
+# nothing below this port and knows only the emulator that registers with it. The emulator picks a
+# free console port itself.
+ADB_SCAN_MAX_PORT = "5553"
+ADB_SERVER_START_TIMEOUT = 10
 TEST_PACKAGE = "zip.trev.trevrpc.interop.android.test"
 TEST_RUNNER = "androidx.test.runner.AndroidJUnitRunner"
 DEFAULT_SYSTEM_IMAGE = "system-images;android-33;google_apis;x86_64"
@@ -54,10 +60,12 @@ DICTIONARY_VECTORS = "zstd-golden-vectors.txt"
 # --- processes -------------------------------------------------------------------------------
 
 
-def probe(command: list[str]) -> str | None:
+def probe(command: list[str], env: dict[str, str] | None = None) -> str | None:
     """Returns stdout of a quick command, or None if it failed or timed out."""
     try:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=5, check=False)
+        result = subprocess.run(
+            command, text=True, capture_output=True, timeout=5, env=env, check=False
+        )
     except OSError, subprocess.TimeoutExpired:
         return None
     return result.stdout.strip() if result.returncode == 0 else None
@@ -190,26 +198,49 @@ def start_server(
 # --- emulator --------------------------------------------------------------------------------
 
 
-def adb(*arguments: str, timeout: int = 60) -> str:
-    """Runs an adb command against the emulator and returns its stdout."""
-    return run_checked(["adb", "-s", SERIAL, *arguments], timeout=timeout)
+def free_port() -> int:
+    """Returns a TCP port on localhost that was free a moment ago."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return cast(int, listener.getsockname()[1])
 
 
-def adb_probe(*arguments: str) -> str | None:
-    return probe(["adb", "-s", SERIAL, *arguments])
+def emulator_serials(devices: str) -> list[str]:
+    """Returns the emulator serials in `adb devices` output, in any state."""
+    return [
+        line.split("\t", 1)[0]
+        for line in devices.splitlines()
+        if line.startswith("emulator-") and "\t" in line
+    ]
 
 
 class Emulator:
-    """A headless emulator with a writable system partition."""
+    """A headless emulator with a writable system partition, reached through its own adb server."""
 
+    name: str
+    env: dict[str, str]
+    serial: str | None
     log_path: Path
+    adb_server: subprocess.Popen[bytes]
     process: subprocess.Popen[bytes]
 
     def __init__(self, work_dir: Path, output: Path, system_image: str) -> None:
         avd_home = work_dir / "avd"
         avd_home.mkdir(exist_ok=True)
-        name = f"trevrpc-interop-{os.getpid()}"
-        env = {**os.environ, "ANDROID_AVD_HOME": str(avd_home)}
+        # Emulators on a host share one netsim daemon, found through a file in the temporary
+        # directory, and it goes down with the first emulator that stops, crashing the others. A
+        # temporary directory of its own gives the run a daemon of its own.
+        temporary = work_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+        self.name = f"trevrpc-interop-{os.getpid()}"
+        self.serial = None
+        self.env = {
+            **os.environ,
+            "TMPDIR": str(temporary),
+            "ANDROID_AVD_HOME": str(avd_home),
+            "ANDROID_ADB_SERVER_PORT": str(free_port()),
+            "ADB_LOCAL_TRANSPORT_MAX_PORT": ADB_SCAN_MAX_PORT,
+        }
         _ = run_checked(
             [
                 "avdmanager",
@@ -217,30 +248,82 @@ class Emulator:
                 "avd",
                 "--force",
                 "--name",
-                name,
+                self.name,
                 "--package",
                 system_image,
                 "--device",
                 "pixel_2",
             ],
             input_text="no\n",
-            env=env,
+            env=self.env,
         )
-        self.log_path = output / "emulator.log"
-        command = [
-            "emulator", "-avd", name, "-port", str(EMULATOR_PORT),
-            "-no-window", "-no-audio", "-no-boot-anim", "-no-snapshot", "-wipe-data",
-            "-writable-system", "-partition-size", "4096",
-            "-gpu", "swiftshader_indirect", "-no-metrics",
-        ]  # fmt: skip
-        with self.log_path.open("wb") as log:
-            self.process = subprocess.Popen(
+        # The server runs in the foreground, so it fails rather than joins a server already on
+        # the port, and it starts before the emulator, which registers with it on boot.
+        self.adb_server = self._spawn(["adb", "nodaemon", "server"], output / "adb-server.log")
+        try:
+            self._wait_for_adb_server(output / "adb-server.log")
+            self.log_path = output / "emulator.log"
+            command = [
+                "emulator", "-avd", self.name,
+                "-no-window", "-no-audio", "-no-boot-anim", "-no-snapshot", "-wipe-data",
+                "-writable-system", "-partition-size", "4096",
+                "-gpu", "swiftshader_indirect", "-no-metrics",
+            ]  # fmt: skip
+            self.process = self._spawn(command, self.log_path)
+        except BaseException:
+            stop_group(self.adb_server)
+            raise
+
+    def _spawn(self, command: list[str], log_path: Path) -> subprocess.Popen[bytes]:
+        with log_path.open("wb") as log:
+            return subprocess.Popen(
                 command,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                env=env,
+                env=self.env,
                 start_new_session=True,
             )
+
+    def _wait_for_adb_server(self, log_path: Path) -> None:
+        port = int(self.env["ANDROID_ADB_SERVER_PORT"])
+        deadline = time.monotonic() + ADB_SERVER_START_TIMEOUT
+        while time.monotonic() < deadline:
+            if self.adb_server.poll() is not None:
+                log = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                raise RunnerError(
+                    f"adb server exited with {self.adb_server.returncode} on port {port}:\n{log}"
+                )
+            try:
+                with socket.create_connection(("localhost", port), timeout=1):
+                    return
+            except OSError:
+                time.sleep(0.1)
+        raise RunnerError(
+            f"adb server did not listen on port {port} within {ADB_SERVER_START_TIMEOUT}s"
+        )
+
+    def adb_command(self, *arguments: str) -> list[str]:
+        if self.serial is None:
+            raise RunnerError("the emulator has not registered with adb")
+        return ["adb", "-s", self.serial, *arguments]
+
+    def adb(self, *arguments: str, timeout: int = 60) -> str:
+        """Runs an adb command against the emulator and returns its stdout."""
+        return run_checked(self.adb_command(*arguments), timeout=timeout, env=self.env)
+
+    def adb_probe(self, *arguments: str) -> str | None:
+        if self.serial is None:
+            return None
+        return probe(self.adb_command(*arguments), self.env)
+
+    def _find_serial(self) -> str | None:
+        """Returns the serial of this run's emulator once it has registered with the adb server.
+        The AVD name tells it apart from any other emulator the server might know."""
+        for serial in emulator_serials(probe(["adb", "devices"], self.env) or ""):
+            name = probe(["adb", "-s", serial, "emu", "avd", "name"], self.env)
+            if name and name.splitlines()[0].strip() == self.name:
+                return serial
+        return None
 
     def wait_until(self, condition: Callable[[], bool], description: str, timeout: int) -> None:
         deadline = time.monotonic() + timeout
@@ -253,6 +336,8 @@ class Emulator:
         raise RunnerError(f"emulator did not {description} within {timeout}s")
 
     def _require_running(self) -> None:
+        if self.adb_server.poll() is not None:
+            raise RunnerError(f"adb server exited with {self.adb_server.returncode}")
         if self.process.poll() is None:
             return
         lines = self.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -265,10 +350,12 @@ class Emulator:
         """Waits for a completed boot; a changed boot ID proves a reboot happened."""
 
         def booted() -> bool:
-            boot_id = adb_probe("shell", "cat", "/proc/sys/kernel/random/boot_id")
+            if self.serial is None:
+                self.serial = self._find_serial()
+            boot_id = self.adb_probe("shell", "cat", "/proc/sys/kernel/random/boot_id")
             return (
-                adb_probe("get-state") == "device"
-                and adb_probe("shell", "getprop", "sys.boot_completed") == "1"
+                self.adb_probe("get-state") == "device"
+                and self.adb_probe("shell", "getprop", "sys.boot_completed") == "1"
                 and bool(boot_id)
                 and boot_id != previous_boot_id
             )
@@ -276,19 +363,19 @@ class Emulator:
         self.wait_until(booted, "boot", BOOT_TIMEOUT)
 
     def reboot(self) -> None:
-        previous = adb_probe("shell", "cat", "/proc/sys/kernel/random/boot_id")
+        previous = self.adb_probe("shell", "cat", "/proc/sys/kernel/random/boot_id")
         if not previous:
             raise RunnerError("could not read the emulator boot ID before rebooting")
-        _ = adb("reboot")
+        _ = self.adb("reboot")
         self.wait_for_boot(previous)
 
     def root(self) -> None:
         # Right after a boot adbd may not take the request yet, and `adb root` then fails (CI saw
         # it exit 1), so it is retried until adbd runs as root.
         def rooted() -> bool:
-            if adb_probe("shell", "id", "-u") == "0":
+            if self.adb_probe("shell", "id", "-u") == "0":
                 return True
-            _ = adb_probe("root")
+            _ = self.adb_probe("root")
             return False
 
         self.wait_until(rooted, "restart adbd as root", 60)
@@ -306,24 +393,25 @@ class Emulator:
         _ = shutil.copyfile(ca, android_ca)
         destination = f"{CA_DIRECTORY}/{android_ca.name}"
         self.root()
-        _ = adb("disable-verity")
+        _ = self.adb("disable-verity")
         self.reboot()
         self.root()
-        _ = adb("remount", timeout=90)
-        _ = adb("push", str(android_ca), destination)
-        _ = adb("shell", "chmod", "644", destination)
-        _ = adb("shell", "chown", "0:0", destination)
-        _ = adb("shell", "restorecon", destination)
+        _ = self.adb("remount", timeout=90)
+        _ = self.adb("push", str(android_ca), destination)
+        _ = self.adb("shell", "chmod", "644", destination)
+        _ = self.adb("shell", "chown", "0:0", destination)
+        _ = self.adb("shell", "restorecon", destination)
         self.reboot()
-        digest = adb("shell", "sha256sum", destination).split()
+        digest = self.adb("shell", "sha256sum", destination).split()
         expected = hashlib.sha256(android_ca.read_bytes()).hexdigest()
         if not digest or digest[0] != expected:
             raise RunnerError(f"installed CA digest is {digest[:1]}, expected {expected}")
 
     def shutdown(self) -> None:
         if self.process.poll() is None:
-            _ = adb_probe("emu", "kill")
+            _ = self.adb_probe("emu", "kill")
         stop_group(self.process, grace=30)
+        stop_group(self.adb_server)
 
 
 # --- instrumentation -------------------------------------------------------------------------
@@ -412,18 +500,19 @@ def _finish_block(outcomes: Outcomes, block: dict[str, str], code: int) -> None:
         )
 
 
-def run_instrumentation(port: int, transport: str, output: Path) -> Outcomes:
-    command = [
-        "adb", "-s", SERIAL, "shell", "am", "instrument", "-w", "-r",
+def run_instrumentation(emulator: Emulator, port: int, transport: str, output: Path) -> Outcomes:
+    command = emulator.adb_command(
+        "shell", "am", "instrument", "-w", "-r",
         "-e", "host", EMULATOR_HOST, "-e", "port", str(port), "-e", "transport", transport,
         f"{TEST_PACKAGE}/{TEST_RUNNER}",
-    ]  # fmt: skip
+    )  # fmt: skip
     try:
         result = subprocess.run(
             command,
             text=True,
             capture_output=True,
             timeout=INSTRUMENTATION_TIMEOUT,
+            env=emulator.env,
             check=False,
         )
         text = result.stdout + result.stderr
@@ -441,9 +530,9 @@ def _decode(value: str | bytes | None) -> str:
     return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
 
 
-def collect_logcat(output: Path) -> None:
+def collect_logcat(emulator: Emulator, output: Path) -> None:
     try:
-        text = adb("logcat", "-d", "-v", "threadtime", timeout=30)
+        text = emulator.adb("logcat", "-d", "-v", "threadtime", timeout=30)
     except RunnerError as error:
         text = f"logcat unavailable: {error}\n"
     _ = (output / "logcat.log").write_text(text, encoding="utf-8")
@@ -539,11 +628,13 @@ def execute(args: Options) -> Outcomes:
             "transition_animation_scale",
             "animator_duration_scale",
         ):
-            _ = adb("shell", "settings", "put", "global", setting, "0")
-        _ = adb("install", "-r", str(args.app_apk), timeout=90)
-        _ = adb("install", "-r", str(args.test_apk), timeout=90)
-        _ = adb("logcat", "-c")
-        outcomes = run_instrumentation(server.port(args.transport), args.transport, args.output)
+            _ = emulator.adb("shell", "settings", "put", "global", setting, "0")
+        _ = emulator.adb("install", "-r", str(args.app_apk), timeout=90)
+        _ = emulator.adb("install", "-r", str(args.test_apk), timeout=90)
+        _ = emulator.adb("logcat", "-c")
+        outcomes = run_instrumentation(
+            emulator, server.port(args.transport), args.transport, args.output
+        )
         if (problem := server.stop()) is not None:
             outcomes.problems.append(problem)
         return outcomes
@@ -552,7 +643,7 @@ def execute(args: Options) -> Outcomes:
             _ = server.stop()
         if emulator is not None:
             if emulator.process.poll() is None:
-                collect_logcat(args.output)
+                collect_logcat(emulator, args.output)
             emulator.shutdown()
 
 

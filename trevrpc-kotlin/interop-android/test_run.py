@@ -1,13 +1,17 @@
 """Unit tests for the interop runner's host-side logic. Run with `python3 -I -m unittest`."""
 
 import json
+import os
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 import zipfile
 from pathlib import Path
+from typing import cast
+from unittest import mock
 
 import run
 
@@ -138,6 +142,136 @@ class StartServerTest(unittest.TestCase):
 
             with self.assertRaisesRegex(run.RunnerError, "'http2'"):
                 _ = run.start_server(command, certificates, "0.0.0.0", root / "interop.dict", root)
+
+
+class EmulatorSerialsTest(unittest.TestCase):
+    def test_lists_emulators_in_any_state_and_skips_other_lines(self) -> None:
+        devices = (
+            "List of devices attached\n"
+            "emulator-5556\tdevice\n"
+            "192.168.1.2:5555\tdevice\n"
+            "emulator-5558\toffline\n"
+            "\n"
+        )
+
+        self.assertEqual(["emulator-5556", "emulator-5558"], run.emulator_serials(devices))
+
+
+def write_executable(path: Path, lines: list[str]) -> None:
+    _ = path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def fake_android_tools(root: Path, *, adb_server_fails: bool = False) -> Path:
+    """Writes avdmanager, emulator and adb stand-ins to ROOT/bin and returns that directory.
+
+    The adb server listens on ANDROID_ADB_SERVER_PORT, or exits at once with `adb_server_fails`.
+    It knows two emulators: emulator-5554 belongs to another run, and emulator-5556 answers to
+    the AVD name the fake emulator was started with.
+    """
+    tools = root / "bin"
+    tools.mkdir()
+    write_executable(tools / "avdmanager", ["#!/bin/sh", "cat >/dev/null"])
+    write_executable(
+        tools / "emulator",
+        [
+            f"#!{sys.executable}",
+            "import json, sys, time",
+            "from pathlib import Path",
+            f"root = Path({str(root)!r})",
+            "import os",
+            "_ = (root / 'emulator-args.json').write_text(json.dumps(sys.argv[1:]))",
+            "_ = (root / 'emulator-tmpdir').write_text(os.environ['TMPDIR'])",
+            "_ = (root / 'avd-name').write_text(sys.argv[sys.argv.index('-avd') + 1])",
+            "time.sleep(600)",
+        ],
+    )
+    write_executable(
+        tools / "adb",
+        [
+            f"#!{sys.executable}",
+            "import json, os, socket, sys, time",
+            "from pathlib import Path",
+            f"root = Path({str(root)!r})",
+            "arguments = sys.argv[1:]",
+            "if arguments == ['nodaemon', 'server']:",
+            "    if " + repr(adb_server_fails) + ":",
+            "        sys.exit('could not install *smartsocket* listener: Address already in use')",
+            "    environment = {name: os.environ.get(name) for name in",
+            "                   ('ANDROID_ADB_SERVER_PORT', 'ADB_LOCAL_TRANSPORT_MAX_PORT')}",
+            "    _ = (root / 'adb-server-env.json').write_text(json.dumps(environment))",
+            "    listener = socket.create_server(",
+            "        ('localhost', int(os.environ['ANDROID_ADB_SERVER_PORT'])))",
+            "    time.sleep(600)",
+            "elif arguments == ['devices']:",
+            "    print('List of devices attached')",
+            "    print('emulator-5554\\tdevice')",
+            "    print('emulator-5556\\tdevice')",
+            "elif arguments[:1] == ['-s']:",
+            "    serial, command = arguments[1], arguments[2:]",
+            "    if command == ['emu', 'avd', 'name']:",
+            "        mine = serial == 'emulator-5556'",
+            "        print((root / 'avd-name').read_text() if mine else 'other')",
+            "        print('OK')",
+            "    elif command == ['get-state']:",
+            "        print('device')",
+            "    elif command[:3] == ['shell', 'getprop', 'sys.boot_completed']:",
+            "        print('1')",
+            "    elif command[:2] == ['shell', 'cat']:",
+            "        print('boot-1')",
+        ],
+    )
+    return tools
+
+
+class EmulatorTest(unittest.TestCase):
+    def test_runs_its_own_adb_server_and_finds_its_emulator_by_avd_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = fake_android_tools(root)
+            path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                emulator = run.Emulator(root, root, run.DEFAULT_SYSTEM_IMAGE)
+                try:
+                    emulator.wait_for_boot()
+                finally:
+                    emulator.shutdown()
+
+            self.assertEqual("emulator-5556", emulator.serial)
+            server_env = cast(
+                dict[str, str],
+                json.loads((root / "adb-server-env.json").read_text(encoding="utf-8")),
+            )
+            self.assertEqual(
+                {
+                    "ANDROID_ADB_SERVER_PORT": emulator.env["ANDROID_ADB_SERVER_PORT"],
+                    "ADB_LOCAL_TRANSPORT_MAX_PORT": run.ADB_SCAN_MAX_PORT,
+                },
+                server_env,
+            )
+            emulator_args = cast(
+                list[str],
+                json.loads((root / "emulator-args.json").read_text(encoding="utf-8")),
+            )
+            self.assertNotIn("-port", emulator_args)
+            self.assertEqual(
+                str(root / "tmp"), (root / "emulator-tmpdir").read_text(encoding="utf-8")
+            )
+            self.assertIsNotNone(emulator.adb_server.poll())
+            self.assertIsNotNone(emulator.process.poll())
+
+    def test_fails_without_starting_the_emulator_when_the_adb_server_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = fake_android_tools(root, adb_server_fails=True)
+            path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
+            with (
+                mock.patch.dict(os.environ, {"PATH": path}),
+                self.assertRaisesRegex(run.RunnerError, "Address already in use"),
+            ):
+                _ = run.Emulator(root, root, run.DEFAULT_SYSTEM_IMAGE)
+
+            self.assertFalse((root / "avd-name").exists())
 
 
 class ExtractDictionaryTest(unittest.TestCase):
