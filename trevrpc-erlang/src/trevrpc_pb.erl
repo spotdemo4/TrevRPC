@@ -101,12 +101,12 @@ decode_value(Number, 5, <<Value:4/binary, Rest/binary>>) ->
 decode_value(_, _, _) ->
     error.
 
-%% @doc Whether `Bin' is valid UTF-8, as protobuf strings must be.
+%% @doc Whether `Bin' is valid UTF-8, as protobuf strings must be: no
+%% overlong encodings, surrogates or truncated sequences. The conversion
+%% runs in C, which is faster than matching code points one at a time.
 -spec valid_utf8(binary()) -> boolean().
-valid_utf8(<<C, Rest/binary>>) when C < 16#80 -> valid_utf8(Rest);
-valid_utf8(<<_/utf8, Rest/binary>>) -> valid_utf8(Rest);
-valid_utf8(<<>>) -> true;
-valid_utf8(<<_/binary>>) -> false.
+valid_utf8(Bin) ->
+    is_binary(unicode:characters_to_binary(Bin, utf8, utf8)).
 
 %% @doc The low 32 bits of a decoded varint, as a `uint32' field holds.
 -spec to_uint32(non_neg_integer()) -> non_neg_integer().

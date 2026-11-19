@@ -243,7 +243,17 @@ pb_utf8_test() ->
     ?assertNot(trevrpc_pb:valid_utf8(<<16#FF>>)),
     %% A UTF-16 surrogate and an overlong encoding.
     ?assertNot(trevrpc_pb:valid_utf8(<<16#ED, 16#A0, 16#80>>)),
-    ?assertNot(trevrpc_pb:valid_utf8(<<16#C0, 16#80>>)).
+    ?assertNot(trevrpc_pb:valid_utf8(<<16#C0, 16#80>>)),
+    %% Truncated, after ASCII and at the start, and past U+10FFFF.
+    ?assertNot(trevrpc_pb:valid_utf8(<<"abcdefgh", 16#E2, 16#98>>)),
+    ?assertNot(trevrpc_pb:valid_utf8(<<16#E2, 16#98, "abc">>)),
+    ?assertNot(trevrpc_pb:valid_utf8(<<16#F4, 16#90, 16#80, 16#80>>)),
+    ?assert(trevrpc_pb:valid_utf8(<<>>)),
+    ?assert(trevrpc_pb:valid_utf8(<<0, "nul">>)),
+    %% Noncharacters are valid UTF-8, as the other runtimes accept them.
+    ?assert(trevrpc_pb:valid_utf8(<<16#EF, 16#BF, 16#BE>>)),
+    ?assert(trevrpc_pb:valid_utf8(<<16#EF, 16#BF, 16#BF>>)),
+    ?assert(trevrpc_pb:valid_utf8(<<16#F4, 16#8F, 16#BF, 16#BF>>)).
 
 %%% Control messages
 
