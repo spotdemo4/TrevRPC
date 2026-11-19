@@ -5,6 +5,7 @@ actions:
       - any-glob-to-any-file:
           - .github/workflows/**
           - .forgejo/workflows/**
+          - .forgejo/actions/**
 
 erlang:
   - changed-files:

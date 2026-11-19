@@ -14,26 +14,66 @@ concurrency:
 # yaml-language-server-disable is not allowed
 enable-openid-connect: true
 
-# Each server's run is a call to android-interop.yaml. The rust run starts after the go run, pass or
-# fail, so the runner holds one emulator at a time: two on a shared runner slowed boots and calls
-# past their timeouts.
+# The harness steps are in .forgejo/actions/android-interop, which each job runs for its server.
 jobs:
-  go:
+  android-to-go:
     # zizmor: ignore[excessive-permissions]
-    # Forgejo takes a local path here, not GitHub's `$/` syntax.
-    uses: ./.forgejo/workflows/android-interop.yaml # zizmor: ignore[self-repository]
-    with:
-      server: go
-    secrets:
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    env:
+      CELL: android-to-go
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@058efbda6393adccb321793a01b3fe4ea0533885 # v1.80.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          shell: android
 
-  rust:
+      - name: Run Android interop
+        # Forgejo takes a local path here, not GitHub's `$/` syntax.
+        uses: ./.forgejo/actions/android-interop # zizmor: ignore[self-repository]
+        with:
+          server: go
+          output: ${{ runner.temp }}/${{ env.CELL }}
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: https://data.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: ${{ env.CELL }}
+          path: ${{ runner.temp }}/${{ env.CELL }}
+          if-no-files-found: ignore
+
+  android-to-rust:
     # zizmor: ignore[excessive-permissions]
-    needs: go
+    # Runs after the go job, pass or fail, so the runner holds one emulator at a time: two on a
+    # shared runner slowed boots and calls past their timeouts.
+    needs: android-to-go
     if: ${{ !cancelled() }}
-    # Forgejo takes a local path here, not GitHub's `$/` syntax.
-    uses: ./.forgejo/workflows/android-interop.yaml # zizmor: ignore[self-repository]
-    with:
-      server: rust
-    secrets:
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    env:
+      CELL: android-to-rust
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@058efbda6393adccb321793a01b3fe4ea0533885 # v1.80.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          shell: android
+
+      - name: Run Android interop
+        # Forgejo takes a local path here, not GitHub's `$/` syntax.
+        uses: ./.forgejo/actions/android-interop # zizmor: ignore[self-repository]
+        with:
+          server: rust
+          output: ${{ runner.temp }}/${{ env.CELL }}
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: https://data.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: ${{ env.CELL }}
+          path: ${{ runner.temp }}/${{ env.CELL }}
+          if-no-files-found: ignore

@@ -1,0 +1,32 @@
+name: android-interop
+description: Runs the Android interop scenarios against one server, over HTTP/3 and then HTTP/2.
+
+inputs:
+  server:
+    description: The interop server to run the scenarios against (go or rust)
+    required: true
+  output:
+    description: The directory for logs and diagnostics, with one subdirectory per transport
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # One step runs both transports, so the HTTP/2 run (with QUIC disabled, as on a network that
+    # blocks UDP) happens even if the HTTP/3 run failed, and the step fails if either did.
+    - name: Run Android interop over HTTP/3 and HTTP/2
+      shell: bash
+      env:
+        SERVER: ${{ inputs.server }}
+        OUTPUT: ${{ inputs.output }}
+        WORK_DIR: ${{ runner.temp }}/android-work
+      run: |
+        status=0
+        for transport in http3 http2; do
+          trevrpc-interop-android \
+            --server-command "trevrpc-interop-$SERVER" \
+            --transport "$transport" \
+            --output "$OUTPUT/$transport" \
+            --work-dir "$WORK_DIR/$transport" || status=1
+        done
+        exit "$status"

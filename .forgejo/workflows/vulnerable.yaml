@@ -21,7 +21,7 @@ jobs:
           shell: vulnerable
 
       - name: Run zizmor
-        run: zizmor $(find .forgejo/workflows -name "*.yaml")
+        run: zizmor $(find .forgejo/workflows .forgejo/actions -name "*.yaml")
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
 

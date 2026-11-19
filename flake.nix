@@ -532,6 +532,19 @@
               '';
             };
 
+            actions-fj-composite = {
+              root = ./.forgejo/actions;
+              filter = file: file.name == "action.yaml";
+              packages = with pkgs; [
+                forgejo-runner
+                zizmor
+              ];
+              script = ''
+                forgejo-runner validate --action --path "$file"
+                zizmor --offline "$file"
+              '';
+            };
+
             renovate-fj = {
               root = ./.forgejo;
               files = ./.forgejo/renovate.jsonc;
