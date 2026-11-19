@@ -48,7 +48,8 @@
     open_stream/1,
     notify_send_ready/1,
     close/2,
-    peername/1
+    peername/1,
+    flow/1
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -287,6 +288,14 @@ close(Session, Code) ->
 peername(Session) ->
     call(Session, peername).
 
+%% @doc The connection's receive flow control: the limit granted to the
+%% peer, and the bytes received and returned as credit, for diagnostics.
+-spec flow(pid()) ->
+    #{recv_max := non_neg_integer(), received := non_neg_integer(), consumed := non_neg_integer()}
+    | {error, closed}.
+flow(Session) ->
+    call(Session, flow).
+
 call(Session, Request) ->
     try
         gen_server:call(Session, Request, infinity)
@@ -298,6 +307,10 @@ call(Session, Request) ->
 
 -spec init({client | server, pid(), send_queue(), options()}) -> {ok, #state{}}.
 init({Role, Owner, Queue, Opts}) ->
+    %% Every write of every stream queues here; under load the queue runs
+    %% thousands deep, and kept off the heap it is not copied by each
+    %% garbage collection.
+    process_flag(message_queue_data, off_heap),
     monitor(process, Owner),
     Local = maps:get(parameters, Opts),
     Now = now_ms(),
@@ -357,6 +370,14 @@ handle_call(open_stream, _From, #state{opened_local = Opened, max_local = Max} =
     }};
 handle_call(open_stream, _From, State) ->
     {reply, {error, stream_limit}, State#state{want_streams = true}};
+handle_call(flow, _From, State) ->
+    {reply,
+        #{
+            recv_max => State#state.conn_recv_max,
+            received => State#state.conn_received,
+            consumed => State#state.conn_consumed
+        },
+        State};
 handle_call(peername, _From, #state{socket = Socket} = State) ->
     {reply, ssl:peername(Socket), State}.
 

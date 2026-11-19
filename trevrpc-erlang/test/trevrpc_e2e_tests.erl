@@ -276,6 +276,7 @@ e2e(Transport) ->
                 {"connection metadata", fun connection_metadata_test/1},
                 {"compression without a dictionary", fun plain_test/1},
                 {"many concurrent calls", fun concurrent_test/1},
+                {"the connection process calls no transport for calls", fun conn_calls_test/1},
                 {"bulk streams in both directions", fun bulk_test/1}
             ]
         ]
@@ -515,6 +516,43 @@ concurrent_test(#{channel := Channel}) ->
         [{ok, integer_to_binary(N)} || N <- lists:seq(1, 50)],
         [{ok, Message} || {ok, Message, _} <- Results]
     ).
+
+%% The server's connection process, which every call's events go
+%% through, makes no call into the transport for calls that succeed: each
+%% call process reads its own REQUEST, returns its own credit and writes
+%% its own frames.
+conn_calls_test(#{channel := Channel, server := Server}) ->
+    %% #state{connections = #{Monitor => Pid}} of the server.
+    [Conn] = maps:values(element(5, sys:get_state(Server))),
+    Modules = [trevrpc_transport, trevrpc_qmux, quic, quic_connection],
+    _ = [erlang:trace_pattern({Module, '_', '_'}, true, [local]) || Module <- Modules],
+    1 = erlang:trace(Conn, true, [call]),
+    try
+        _ = [
+            ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"c">>, #{}))
+         || _ <- lists:seq(1, 10)
+        ],
+        {ok, Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 5000}),
+        ok = trevrpc_client:send(Call, binary:copy(<<"b">>, 100000)),
+        ?assertMatch({ok, _}, trevrpc_client:recv(Call)),
+        ok = trevrpc_client:close_send(Call),
+        ?assertEqual({eof, #{}}, trevrpc_client:recv(Call))
+    after
+        _ = erlang:trace(Conn, false, [call]),
+        _ = [erlang:trace_pattern({Module, '_', '_'}, false, [local]) || Module <- Modules]
+    end,
+    Ref = erlang:trace_delivered(Conn),
+    receive
+        {trace_delivered, Conn, Ref} -> ok
+    end,
+    ?assertEqual([], traced_calls(Conn, [])).
+
+traced_calls(Pid, Acc) ->
+    receive
+        {trace, Pid, call, {Module, Function, Args}} ->
+            traced_calls(Pid, [{Module, Function, length(Args)} | Acc])
+    after 0 -> lists:usort(Acc)
+    end.
 
 %% 64 calls at once, each sending 100 messages of 4 KiB before it reads the
 %% 100 the server echoes: about 25 MiB each way at once, more than the
@@ -1467,10 +1505,13 @@ limits(Transport) ->
                 {timeout, 60, fun() -> closed_connection_releases_slots(Credentials) end},
                 {timeout, 60, fun() -> shutdown_waits_for_finishing_call(Credentials) end},
                 {timeout, 120, fun() -> unread_uploads_keep_the_connection_window(Credentials) end},
-                {timeout, 60, fun() -> subscriptions(Credentials) end},
-                {timeout, 60, fun() -> stopped_handler_returns_credit(Credentials) end},
-                {timeout, 30, fun() -> untrusted_server(Credentials) end}
-            ]
+                {timeout, 60, fun() -> unread_streams_share_the_connection_window(Credentials) end}
+            ] ++
+                [
+                    {timeout, 60, fun() -> subscriptions(Credentials) end},
+                    {timeout, 60, fun() -> stopped_handler_returns_credit(Credentials) end},
+                    {timeout, 30, fun() -> untrusted_server(Credentials) end}
+                ]
         end}.
 
 stream_limit(Credentials) ->
@@ -1683,6 +1724,149 @@ unread_uploads_keep_the_connection_window(Credentials) ->
         trevrpc_channel:close(Channel),
         trevrpc_server:stop(Server)
     end.
+
+%% Requests that handlers leave unread count against the connection's
+%% window, not only their streams': eight calls whose handlers hold them,
+%% each sent 6 MiB, more than its 4 MiB stream window, get no more than
+%% the 16 MiB connection window between them instead of all 48 MiB. A
+%% native QUIC server holds its streams until their calls track them
+%% (trevrpc_transport:hold_streams/1); a QMux session counts every stream
+%% against the window from the start.
+unread_streams_share_the_connection_window(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = connect(Credentials, Server),
+    register(trevrpc_e2e_parked, self()),
+    Chunk = binary:copy(<<"w">>, 1 bsl 20),
+    %% Every call starts before any sends much, so none waits for the
+    %% connection window to send its REQUEST.
+    Senders = [
+        spawn(fun() ->
+            {ok, Call} = trevrpc_client:bidi(Channel, ?HOLD, #{}),
+            ok = trevrpc_client:send(Call, <<"first">>),
+            receive
+                go -> ok
+            end,
+            _ = [trevrpc_client:send(Call, Chunk) || _ <- lists:seq(1, 6)],
+            timer:sleep(infinity)
+        end)
+     || _ <- lists:seq(1, 8)
+    ],
+    try
+        _ = [
+            receive
+                {held, _Handler} -> ok
+            after 5000 -> error(not_held)
+            end
+         || _ <- Senders
+        ],
+        %% #state{connections = #{Monitor => Pid}} of the server, and
+        %% #state{transport} of the connection's owner.
+        [Owner] = maps:values(element(5, sys:get_state(Server))),
+        {Flow, Target} = flow_reader(element(2, sys:get_state(Owner))),
+        _ = [Sender ! go || Sender <- Senders],
+        Granted = window_held(Flow, Target, erlang:monotonic_time(millisecond) + 30000),
+        ?assert(Granted > 4 bsl 20)
+    after
+        _ = [exit(Sender, kill) || Sender <- Senders],
+        unregister(trevrpc_e2e_parked),
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% The connection credit the server granted once it received Target
+%% bytes, more than one stream's window. Every read asserts the grant stays
+%% within the connection window, and what the flow reader checks besides.
+window_held(Flow, Target, Deadline) ->
+    #{granted := Granted, received := Received} = Flow(),
+    ?assert(Granted =< 17 bsl 20),
+    case Received >= Target of
+        true ->
+            Granted;
+        false ->
+            erlang:monotonic_time(millisecond) < Deadline orelse
+                error({not_received, Received, Target}),
+            timer:sleep(5),
+            window_held(Flow, Target, Deadline)
+    end.
+
+%% Reads a server connection's receive flow control, and how many bytes
+%% must arrive before the grant shows whether unread bytes earned credit.
+%%
+%% erlang_quic keeps it in its connection state, and grants a window past
+%% what it received, less what tracked streams did not consume, once less
+%% than half the window is left: had it granted credit for the unread
+%% bytes, its grant would be past the window once 8.5 MiB arrived.
+%%
+%% A QMux session tells it, and grants credit only for what its readers
+%% consume. Its client holds back the other streams once one used its
+%% window and filled its send queue, so the bytes consumed, which must stay
+%% those of the calls' first messages, show it once more than one stream's
+%% window arrived.
+flow_reader({qmux, Session, _Queue}) ->
+    {
+        fun() ->
+            #{recv_max := Max, received := Received, consumed := Consumed} =
+                trevrpc_qmux:flow(Session),
+            ?assert(Consumed < 1 bsl 20),
+            #{granted => Max, received => Received}
+        end,
+        (4 bsl 20) + 1024
+    };
+flow_reader({quic, Conn}) ->
+    #{max_data_local := Granted, data_received := Received} = quic_state_fields(
+        [max_data_local, data_received]
+    ),
+    {
+        fun() ->
+            case sys:get_state(Conn) of
+                {_StateName, State} when is_tuple(State), element(1, State) =:= state ->
+                    #{granted => element(Granted, State), received => element(Received, State)};
+                {_StateName, State} when is_tuple(State) ->
+                    error({unexpected_quic_state, element(1, State)});
+                Other ->
+                    error({unexpected_quic_state, Other})
+            end
+        end,
+        17 bsl 19
+    }.
+
+%% The positions of fields of erlang_quic's connection state record, read
+%% from the header that defines it, which needs quic.hrl's macros.
+quic_state_fields(Fields) ->
+    Dir = filename:join(
+        os:getenv("TMPDIR", "/tmp"), "trevrpc-quic-state-" ++ os:getpid()
+    ),
+    ok = filelib:ensure_path(Dir),
+    Wrapper = filename:join(Dir, "state.erl"),
+    ok = file:write_file(Wrapper, [
+        "-module(state).\n",
+        "-include_lib(\"quic/include/quic.hrl\").\n",
+        "-include_lib(\"quic/src/quic_connection_state.hrl\").\n"
+    ]),
+    Parsed = epp:parse_file(Wrapper, []),
+    ok = file:del_dir_r(Dir),
+    Forms =
+        case Parsed of
+            {ok, Parsed1} -> Parsed1;
+            {error, Reason} -> error({quic_state_header, Reason})
+        end,
+    Names =
+        case [Record || {attribute, _, record, {state, Record}} <- Forms] of
+            [Record] -> [field_name(F) || F <- Record];
+            [] -> error({quic_state_header, [Error || {error, Error} <- Forms]})
+        end,
+    Positions = maps:from_list(lists:zip(Names, lists:seq(2, length(Names) + 1))),
+    maps:from_list([
+        case Positions of
+            #{Field := Position} -> {Field, Position};
+            #{} -> error({missing_quic_field, Field})
+        end
+     || Field <- Fields
+    ]).
+
+field_name({typed_record_field, Field, _Type}) -> field_name(Field);
+field_name({record_field, _, {atom, _, Name}}) -> Name;
+field_name({record_field, _, {atom, _, Name}, _Default}) -> Name.
 
 %% A handler that ends its call with requests routed to it unread gives
 %% their credit back: its process consumes every byte of a 1 MiB request it

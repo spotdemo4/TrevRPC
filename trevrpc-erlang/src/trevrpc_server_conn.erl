@@ -1,44 +1,49 @@
 %% @private The owner of one server-side connection: native QUIC, QMux, or
 %% the HTTP mapping over HTTP/3 or HTTP/2.
 %%
-%% It receives every event of the connection. For each stream it reads the
-%% REQUEST frame, checks it, and either answers with a lone STATUS or starts
-%% a call process (`trevrpc_server_call') to run the handler, then routes
-%% the stream's events to that process. An HTTP request first passes the
-%% HTTP mapping's checks ({@link trevrpc_http}): a request they refuse gets
-%% an HTTP error, and an accepted one a `200', after which its bodies are
-%% the stream as on the other transports.
+%% It receives every event of the connection. For each stream it starts a
+%% call process (`trevrpc_server_call') at once and routes the stream's
+%% events to it; the call reads and checks the REQUEST itself, and asks to
+%% be admitted ({@link admit/4}) before its handler runs, so the work of
+%% each call, and its blocking calls into the transport, stay out of this
+%% process. An HTTP request first passes the HTTP mapping's checks
+%% ({@link trevrpc_http}): a request they refuse gets an HTTP error, and an
+%% accepted one a `200', after which its bodies are the stream as on the
+%% other transports.
 %%
-%% It also owns each call's lifecycle: the initial request timeout, the
-%% call's deadline, the peer's cancellation, and shutdown all end a call by
-%% stopping its process, whether or not the handler cooperates. A call
-%% process asks for permission ({@link finish/3}) before it writes its
-%% terminal STATUS, which settles the race between a handler that finishes
-%% and a deadline or cancellation that ends it: exactly one of them writes
-%% the call's end.
+%% It also owns each call's lifecycle and the resources it holds: its slots
+%% in the per-connection and server-wide limits, its datagram flow, its
+%% stream compression memory. The call's deadline, the peer's cancellation,
+%% and shutdown all end a call by stopping its process, whether or not the
+%% handler cooperates. A call process asks for permission
+%% ({@link finish/3}) before it writes its terminal STATUS, which settles
+%% the race between a call that finishes and a deadline or cancellation
+%% that ends it: exactly one of them writes the call's end.
 -module(trevrpc_server_conn).
 
 -behaviour(gen_server).
 
--export([start/2, start_qmux/3, start_h2/2, serve_h3/3, shutdown/1, finish/3, reserve/4]).
+-export([start/2, start_qmux/3, start_h2/2, serve_h3/3, shutdown/1, admit/4, finish/3, reserve/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(entry, {
-    %% reading: waiting for the REQUEST frame; running: the call process
-    %% runs; finishing: it is writing its terminal STATUS; expiring: it was
-    %% stopped at its deadline; cancelling: the peer abandoned the call;
-    %% shutdown: the server is shutting down.
-    state = reading :: reading | running | finishing | expiring | cancelling | shutdown,
-    ref = make_ref() :: reference(),
-    reader :: trevrpc_frame:reader(),
+    %% starting: the call process reads and checks the REQUEST; running: it
+    %% was admitted and runs its handler; finishing: it is writing its
+    %% terminal STATUS; expiring: it was stopped at its deadline;
+    %% cancelling: the peer abandoned the call; shutdown: the server is
+    %% shutting down.
+    state = starting :: starting | running | finishing | expiring | cancelling | shutdown,
+    ref :: reference(),
     %% The peer finished the request side.
     fin = false :: boolean(),
-    %% The initial request timer while reading, the deadline timer after.
+    %% The deadline timer, once admitted.
     timer :: reference() | undefined,
-    pid :: pid() | undefined,
-    monitor :: reference() | undefined,
-    %% Whether the stream still holds its concurrency slots.
+    pid :: pid(),
+    monitor :: reference(),
+    %% Whether the stream still holds its concurrency slots, and whether
+    %% one of them is in the server's request limit.
     counted = true :: boolean(),
+    admitted = false :: boolean(),
     %% Stream compression memory the call holds, given back when it ends.
     reserved = 0 :: non_neg_integer(),
     %% The call's datagram flow, registered until the stream is forgotten.
@@ -54,8 +59,8 @@
     config :: trevrpc_server:config(),
     streams = #{} :: #{non_neg_integer() => #entry{}},
     monitors = #{} :: #{reference() => non_neg_integer()},
-    %% Streams counted against the per-connection limit: reading or with a
-    %% call that has not released its slots.
+    %% Streams counted against the per-connection limit: those whose call
+    %% has not released its slots.
     active = 0 :: non_neg_integer(),
     %% Processes waiting for the send queue to drain.
     send_waiters = [] :: [{pid(), reference()}],
@@ -144,6 +149,30 @@ serve_h3(Pid, H3, Quic) ->
 shutdown(Pid) ->
     gen_server:cast(Pid, shutdown).
 
+%% @doc Admits the call `Ref' on stream `Id', whose REQUEST passed its
+%% checks: takes its slot in the server's request limit and its datagram
+%% flow, reserves the memory to decode stream-compressed requests if the
+%% call may, and starts its deadline. `{refuse, Status}' ends the call with
+%% that STATUS, which the call writes; `cancelled' means it was ended
+%% already.
+%%
+%% `Admission' holds the datagram flow the call asks for (0 for none), its
+%% kind and stream compression offer, how its route compresses requests,
+%% and its timeout.
+-spec admit(pid(), non_neg_integer(), reference(), map()) ->
+    {ok, #{
+        flow := {pos_integer(), trevrpc_datagram_flows:credit()} | undefined,
+        stream_requests := boolean()
+    }}
+    | {refuse, trevrpc_status:status()}
+    | cancelled.
+admit(Pid, Id, Ref, Admission) ->
+    try
+        gen_server:call(Pid, {admit, Id, Ref, Admission}, infinity)
+    catch
+        exit:_ -> cancelled
+    end.
+
 %% @doc Reserves `Cost' bytes of stream compression memory for call `Ref'
 %% on stream `Id', until the call ends.
 -spec reserve(pid(), non_neg_integer(), reference(), non_neg_integer()) -> boolean().
@@ -172,6 +201,9 @@ init({Transport, Config}) ->
     %% Call processes are linked, so they die with this process however it
     %% exits; their own exits arrive as messages, and as the monitors' DOWN.
     process_flag(trap_exit, true),
+    %% Every event of the connection queues here; a deep queue kept off
+    %% the heap is not copied by each garbage collection.
+    process_flag(message_queue_data, off_heap),
     %% Exits with the server.
     monitor(process, maps:get(server, Config)),
     Flows = trevrpc_datagram_flows:new(server, 2 * maps:get(max_streams_per_connection, Config)),
@@ -180,9 +212,23 @@ init({Transport, Config}) ->
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
 handle_call({h3, H3, Quic}, _From, #state{transport = {quic, Quic}} = State) ->
     {reply, ok, State#state{transport = {h3, H3, Quic}}};
+handle_call({admit, Id, Ref, Admission}, {Pid, _}, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Id := #entry{state = starting, ref = Ref, pid = Pid} = Entry} ->
+            case admission(Admission, State) of
+                {ok, Flow, Decode} ->
+                    admitted(Id, Entry, Admission, Flow, Decode, State);
+                {error, Status} ->
+                    %% The call writes the refusal.
+                    Refused = release(Id, Entry#entry{state = finishing}, State),
+                    {reply, {refuse, Status}, Refused}
+            end;
+        _ ->
+            {reply, cancelled, State}
+    end;
 handle_call({reserve, Id, Ref, Cost}, _From, #state{streams = Streams, config = Config} = State) ->
     case Streams of
-        #{Id := #entry{ref = Ref, pid = Pid, reserved = Reserved} = Entry} when is_pid(Pid) ->
+        #{Id := #entry{state = running, ref = Ref, reserved = Reserved} = Entry} ->
             case trevrpc_zstd_stream:reserve(maps:get(stream_budget, Config), Cost) of
                 true ->
                     Reserving = Entry#entry{reserved = Reserved + Cost},
@@ -195,7 +241,9 @@ handle_call({reserve, Id, Ref, Cost}, _From, #state{streams = Streams, config = 
     end;
 handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
     case Streams of
-        #{Id := #entry{state = running, ref = Ref} = Entry} ->
+        #{Id := #entry{state = Running, ref = Ref} = Entry} when
+            Running =:= starting; Running =:= running
+        ->
             cancel_timer(Entry),
             {reply, ok, release(Id, Entry#entry{state = finishing, timer = undefined}, State)};
         _ ->
@@ -264,14 +312,6 @@ handle_info(
         _ -> ok
     end,
     {noreply, State#state{send_waiters = [{Pid, Ref} | Waiters]}};
-handle_info({timeout, Timer, {initial, Id}}, #state{streams = Streams} = State) ->
-    case Streams of
-        #{Id := #entry{state = reading, timer = Timer} = Entry} ->
-            Status = trevrpc_status:new(deadline_exceeded, <<"initial request frame timeout">>),
-            {noreply, refuse(Id, Entry, Status, State)};
-        _ ->
-            {noreply, State}
-    end;
 handle_info({timeout, Timer, {deadline, Id}}, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #entry{state = running, timer = Timer, pid = Pid} = Entry} ->
@@ -288,7 +328,7 @@ handle_info({'DOWN', Monitor, process, _Pid, Reason}, #state{monitors = Monitors
         error -> server_down(Monitor, State)
     end;
 handle_info(kill_calls, #state{streams = Streams} = State) ->
-    _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams), is_pid(Pid)],
+    _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams)],
     %% A STATUS that a client which stopped reading still has not taken
     %% holds the connection no longer.
     maybe_close(State#state{pending = #{}});
@@ -300,7 +340,7 @@ terminate(_Reason, #state{streams = Streams} = State) ->
     %% Calls still in flight, as when the connection closes under them,
     %% give their slots in the server's request limit back.
     _ = maps:fold(fun release/3, State, Streams),
-    _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams), is_pid(Pid)],
+    _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams)],
     Budget = maps:get(stream_budget, State#state.config),
     _ = [
         trevrpc_zstd_stream:release(Budget, Reserved)
@@ -362,25 +402,27 @@ stream_opened(Id, State) ->
                 Id, false, trevrpc_status:new(unavailable, <<"too many concurrent RPCs">>), State
             );
         false ->
-            ok = trevrpc_transport:manual_flow_control(State#state.transport, Id),
+            %% Over native QUIC the stream is held in manual flow control
+            %% already; QMux streams always are, and HTTP request streams
+            %% from their acceptance.
             open_stream(Id, State)
     end.
 
 full(#state{active = Active, config = #{max_streams_per_connection := Max}}) ->
     Active >= Max.
 
-%% Reads the REQUEST of the stream that opened.
+%% Starts the call of the stream that opened, which reads its REQUEST.
 open_stream(Id, #state{active = Active, config = Config} = State) ->
-    #{
-        max_frame_size := MaxFrame,
-        max_stream_body_size := MaxBody,
-        initial_request_timeout := Initial
-    } = Config,
-    Entry = #entry{
-        reader = trevrpc_frame:reader(MaxFrame, #{max_bytes => MaxBody}),
-        timer = start_timer(Initial, {initial, Id})
-    },
-    State#state{streams = (State#state.streams)#{Id => Entry}, active = Active + 1}.
+    Ref = make_ref(),
+    {Pid, Monitor} = trevrpc_server_call:start(#{
+        transport => State#state.transport, id => Id, ref => Ref, router => self(), config => Config
+    }),
+    Entry = #entry{ref = Ref, pid = Pid, monitor = Monitor},
+    State#state{
+        streams = (State#state.streams)#{Id => Entry},
+        monitors = (State#state.monitors)#{Monitor => Id},
+        active = Active + 1
+    }.
 
 %%% HTTP requests
 
@@ -532,9 +574,9 @@ transfer(Socket, Conn) ->
 
 stream_data(Id, Bin, Fin, #state{streams = Streams} = State) ->
     case Streams of
-        #{Id := #entry{state = reading} = Entry} ->
-            read_request(Id, Entry, Bin, Fin, State);
-        #{Id := #entry{state = running, ref = Ref, pid = Pid} = Entry} ->
+        #{Id := #entry{state = Running, ref = Ref, pid = Pid} = Entry} when
+            Running =:= starting; Running =:= running
+        ->
             Pid ! {trevrpc_stream, Ref, {data, Bin, Fin}},
             case Fin of
                 true -> State#state{streams = Streams#{Id := Entry#entry{fin = true}}};
@@ -554,12 +596,9 @@ stream_data(Id, Bin, Fin, #state{streams = Streams} = State) ->
 %% The peer reset its request side or stopped reading: it abandoned the call.
 abandoned(Id, #state{streams = Streams, transport = Transport} = State) ->
     case Streams of
-        #{Id := #entry{state = reading} = Entry} ->
-            cancel_timer(Entry),
-            _ = trevrpc_transport:reset_stream(Transport, Id, ?CANCELLED),
-            _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
-            remove(Id, release(Id, Entry, State));
-        #{Id := #entry{state = running, pid = Pid} = Entry} ->
+        #{Id := #entry{state = Running, pid = Pid} = Entry} when
+            Running =:= starting; Running =:= running
+        ->
             exit(Pid, kill),
             cancel_timer(Entry),
             _ = trevrpc_transport:reset_stream(Transport, Id, ?CANCELLED),
@@ -570,154 +609,23 @@ abandoned(Id, #state{streams = Streams, transport = Transport} = State) ->
             State#state{pending = maps:remove(Id, State#state.pending)}
     end.
 
-%%% Reading the REQUEST
+%%% Admission
 
-read_request(Id, #entry{reader = Reader} = Entry, Bin, Fin, #state{transport = Transport} = State) ->
-    _ = trevrpc_transport:consume(Transport, Id, byte_size(Bin)),
-    case trevrpc_frame:feed(Bin, Reader) of
-        {ok, [], Next} when Fin ->
-            Message =
-                case trevrpc_frame:at_boundary(Next) of
-                    true -> <<"request stream ended before REQUEST">>;
-                    false -> <<"request stream ended inside a frame">>
-                end,
-            refuse(
-                Id, Entry#entry{fin = true}, trevrpc_status:new(invalid_argument, Message), State
-            );
-        {ok, [], Next} ->
-            State#state{streams = (State#state.streams)#{Id := Entry#entry{reader = Next}}};
-        {ok, [{request, Payload} | Rest], Next} ->
-            cancel_timer(Entry),
-            dispatch(
-                Id, Entry#entry{reader = Next, fin = Fin, timer = undefined}, Payload, Rest, State
-            );
-        {ok, [{Type, _} | _], _} ->
-            Message = iolist_to_binary(
-                io_lib:format("request stream must start with REQUEST, not ~s", [
-                    trevrpc_frame:name(Type)
-                ])
-            ),
-            refuse(
-                Id, Entry#entry{fin = Fin}, trevrpc_status:new(invalid_argument, Message), State
-            );
-        {error, Reason} ->
-            refuse(Id, Entry#entry{fin = Fin}, read_status(Reason, State), State)
-    end.
-
-read_status({frame_too_large, Length}, #state{config = #{max_frame_size := Max}}) ->
-    trevrpc_status:new(
-        resource_exhausted,
-        iolist_to_binary(io_lib:format("frame length ~b exceeds maximum ~b", [Length, Max]))
-    );
-read_status({body_too_large, Max}, _State) ->
-    trevrpc_status:new(
-        resource_exhausted,
-        iolist_to_binary(
-            io_lib:format("request stream exceeded maximum body size of ~b bytes", [Max])
-        )
-    ).
-
-dispatch(Id, Entry, Payload, Rest, #state{config = Config} = State) ->
-    case check_request(Payload, Config) of
-        {ok, Request, Route, Metadata, Timeout} ->
-            admit(Id, Entry, Request, Route, Metadata, Timeout, Rest, State);
-        {error, Status} ->
-            refuse(Id, Entry, Status, State)
-    end.
-
-%% Checks a REQUEST in the order the Go and Rust servers do, with their
-%% messages.
-check_request(Payload, #{routes := Routes}) ->
-    maybe
-        {ok, Request} ?= decode_request(Payload),
-        #{method := Method, kind := Kind, stream_compression := Compression} = Request,
-        ok ?= check_method(Method),
-        ok ?= check_kind(Kind),
-        ok ?= check_stream_compression(Compression),
-        {ok, Metadata} ?= merge_metadata(Request),
-        ok ?= validate_metadata(Metadata),
-        {ok, Timeout} ?= timeout(Request),
-        {ok, Route} ?= route(Method, Kind, Routes),
-        {ok, Request, Route, Metadata, Timeout}
-    end.
-
-decode_request(Payload) ->
-    case trevrpc_wire:decode_request(Payload) of
-        {ok, Request} -> {ok, Request};
-        error -> invalid(<<"invalid RPC request frame: malformed RpcRequest">>)
-    end.
-
-check_method(<<$/, Rest/binary>>) ->
-    case binary:split(Rest, <<"/">>) of
-        [Service, Method] when Service =/= <<>>, Method =/= <<>> ->
-            case binary:match(Method, <<"/">>) of
-                nomatch -> ok;
-                _ -> malformed_method()
-            end;
-        _ ->
-            malformed_method()
-    end;
-check_method(_) ->
-    malformed_method().
-
-malformed_method() ->
-    invalid(<<"malformed RPC method path; expected /<service>/<method>">>).
-
-check_kind({unknown, Value}) ->
-    invalid(iolist_to_binary(io_lib:format("unsupported TrevRPC RPC kind ~b", [Value])));
-check_kind(_) ->
-    ok.
-
-check_stream_compression({unknown, Value}) ->
-    invalid(iolist_to_binary(io_lib:format("unsupported TrevRPC stream compression ~b", [Value])));
-check_stream_compression(_) ->
-    ok.
-
-%% This server stores no connection metadata sets yet. An offer serves its
-%% own call and is never confirmed, as on the ordinary HTTP mapping, so the
-%% client keeps offering; a reference names a set it does not hold.
-merge_metadata(#{metadata := Own, connection_metadata := undefined}) ->
-    {ok, Own};
-merge_metadata(#{metadata := Own, connection_metadata := #{id := Id, metadata := Set}}) ->
-    case map_size(Set) of
-        0 -> invalid(iolist_to_binary(io_lib:format("unknown connection metadata set ~b", [Id])));
-        _ -> {ok, trevrpc_metadata:merge(Set, Own)}
-    end.
-
-validate_metadata(Metadata) ->
-    case trevrpc_metadata:validate(Metadata) of
-        ok -> ok;
-        {error, Message} -> invalid(Message)
-    end.
-
-%% Erlang timers take up to 2^32 - 1 ms; a longer timeout is rejected rather
-%% than truncated.
-timeout(#{timeout_nanos := 0}) ->
-    {ok, infinity};
-timeout(#{timeout_nanos := Nanos}) ->
-    case (Nanos + 999999) div 1000000 of
-        Millis when Millis =< 16#FFFFFFFF -> {ok, Millis};
-        _ -> invalid(<<"RPC timeout is too large">>)
-    end.
-
-route(Method, Kind, Routes) ->
-    case Routes of
-        #{Method := #{kind := Kind} = Route} ->
-            {ok, Route};
-        #{Method := #{kind := Registered}} ->
-            invalid(
-                iolist_to_binary(
-                    io_lib:format("streaming RPC kind mismatch for ~ts: expected ~b, got ~b", [
-                        Method, trevrpc_wire:kind_to_int(Registered), trevrpc_wire:kind_to_int(Kind)
-                    ])
-                )
-            );
-        #{} ->
-            {error,
-                trevrpc_status:new(
-                    unimplemented,
-                    iolist_to_binary(io_lib:format("unknown RPC method ~ts", [Method]))
-                )}
+%% Whether the server takes the call: a slot in its request limit, the
+%% datagram flow the call asks for, and the memory to decode its requests
+%% if it streams them compressed.
+admission(#{flow := Flow, kind := Kind, offer := Offer, requests := Requests}, State) ->
+    #state{config = #{requests := Counter, max_concurrent_requests := Max} = Config} = State,
+    case counters:get(Counter, 1) >= Max of
+        true ->
+            {error, trevrpc_status:new(unavailable, <<"too many concurrent RPCs">>)};
+        false ->
+            maybe
+                {ok, Taken} ?= flow(Flow, State),
+                {ok, Decode} ?=
+                    stream_requests(Offer, Requests, Kind, maps:get(stream_budget, Config)),
+                {ok, Taken, Decode}
+            end
     end.
 
 %% Whether the call decodes stream-compressed requests: the client offered
@@ -726,8 +634,7 @@ route(Method, Kind, Routes) ->
 %% it ends. An optimistic call it cannot decode is refused before any
 %% application code runs, and the client replays it without stream
 %% compression.
-stream_requests(#{stream_compression := Offer, kind := Kind}, Route, Budget) ->
-    {Requests, _} = trevrpc_zstd:directions(maps:get(compression, Route, none)),
+stream_requests(Offer, Requests, Kind, Budget) ->
     Decode =
         Offer =/= none andalso Requests =:= stream andalso trevrpc_wire:streams_requests(Kind) andalso
             trevrpc_zstd_stream:reserve(Budget, trevrpc_zstd_stream:decoder_cost()),
@@ -744,70 +651,40 @@ stream_requests(#{stream_compression := Offer, kind := Kind}, Route, Budget) ->
             {ok, false}
     end.
 
-invalid(Message) ->
-    {error, trevrpc_status:new(invalid_argument, Message)}.
-
-admit(Id, Entry, Request, Route, Metadata, Timeout, Rest, #state{config = Config} = State) ->
-    #{requests := Requests, max_concurrent_requests := Max} = Config,
-    case counters:get(Requests, 1) >= Max of
-        true ->
-            refuse(
-                Id, Entry, trevrpc_status:new(unavailable, <<"too many concurrent RPCs">>), State
-            );
-        false ->
-            maybe
-                {ok, Flow} ?= flow(Request, State),
-                {ok, Decode} ?= stream_requests(Request, Route, maps:get(stream_budget, Config)),
-                Flowing = Entry#entry{flow = Flow},
-                start_call(Id, Flowing, Request, Route, Metadata, Timeout, Rest, Decode, State)
-            else
-                {error, Status} -> refuse(Id, Entry, Status, State)
-            end
-    end.
-
 %% The call's datagram flow, on native QUIC, which alone carries datagrams
 %% here: another transport ignores it. A flow that is in use fails the call.
-flow(#{datagram_flow := Flow}, #state{transport = {quic, _}, flows = Flows}) when Flow > 0 ->
+flow(Flow, #state{transport = {quic, _}, flows = Flows}) when Flow > 0 ->
     case trevrpc_datagram_flows:in_use(Flow, Flows) of
         false ->
             {ok, Flow};
         true ->
-            invalid(iolist_to_binary(io_lib:format("datagram flow ~b is already in use", [Flow])))
+            Message = io_lib:format("datagram flow ~b is already in use", [Flow]),
+            {error, trevrpc_status:new(invalid_argument, iolist_to_binary(Message))}
     end;
-flow(_Request, _State) ->
+flow(_Flow, _State) ->
     {ok, undefined}.
 
-start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State) ->
-    #state{config = #{requests := Requests} = Config} = State,
+%% Takes what admission found free for the call, and starts its deadline.
+admitted(Id, #entry{ref = Ref, pid = Pid} = Entry, Admission, Flow, Decode, State) ->
+    #{kind := Kind, timeout := Timeout} = Admission,
+    #state{config = #{requests := Requests}, flows = Flows} = State,
     counters:add(Requests, 1, 1),
-    Deadline =
-        case Timeout of
-            infinity -> infinity;
-            _ -> erlang:monotonic_time(millisecond) + Timeout
+    %% The call's flow is its own from now on: the datagrams that arrived
+    %% for it before its REQUEST go to it now.
+    {Spec, Registered} =
+        case Flow of
+            undefined ->
+                {undefined, Flows};
+            _ ->
+                Credit = trevrpc_datagram_flows:credit(),
+                Receives = trevrpc_wire:streams_requests(Kind),
+                {ok, R} = trevrpc_datagram_flows:register(Flow, Pid, Ref, Credit, Receives, Flows),
+                {{Flow, Credit}, R}
         end,
-    Credit = trevrpc_datagram_flows:credit(),
-    Spec = #{
-        flow => flow_spec(Entry#entry.flow, Credit),
-        transport => State#state.transport,
-        id => Id,
-        ref => Entry#entry.ref,
-        router => self(),
-        reader => Entry#entry.reader,
-        frames => Rest,
-        fin => Entry#entry.fin,
-        request => Request,
-        metadata => Metadata,
-        route => Route,
-        deadline => Deadline,
-        config => Config,
-        stream_requests => Decode
-    },
-    {Pid, Monitor} = trevrpc_server_call:start(Spec),
-    Flows = register_flow(Entry, Pid, Credit, Request, State#state.flows),
     Running = Entry#entry{
         state = running,
-        pid = Pid,
-        monitor = Monitor,
+        admitted = true,
+        flow = Flow,
         timer = start_timer(Timeout, {deadline, Id}),
         reserved =
             case Decode of
@@ -815,28 +692,9 @@ start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State) ->
                 false -> 0
             end
     },
-    State#state{
-        streams = (State#state.streams)#{Id := Running},
-        monitors = (State#state.monitors)#{Monitor => Id},
-        flows = Flows
-    }.
-
-flow_spec(undefined, _Credit) -> undefined;
-flow_spec(Flow, Credit) -> {Flow, Credit}.
-
-%% The call's flow is its own from now on: the datagrams that arrived for it
-%% before its REQUEST go to it now.
-register_flow(#entry{flow = undefined}, _Pid, _Credit, _Request, Flows) ->
-    Flows;
-register_flow(#entry{flow = Flow, ref = Ref}, Pid, Credit, #{kind := Kind}, Flows) ->
-    Receives = trevrpc_wire:streams_requests(Kind),
-    {ok, Registered} = trevrpc_datagram_flows:register(Flow, Pid, Ref, Credit, Receives, Flows),
-    Registered.
-
-%% Ends a stream that has no call yet with a lone STATUS.
-refuse(Id, Entry, Status, State) ->
-    cancel_timer(Entry),
-    remove(Id, release(Id, Entry, lone_status(Id, Entry#entry.fin, Status, State))).
+    {reply, {ok, #{flow => Spec, stream_requests => Decode}}, State#state{
+        streams = (State#state.streams)#{Id := Running}, flows = Registered
+    }}.
 
 %% Writes a terminal STATUS from this process, which must not block, so it
 %% is queued without the send queue's ceiling, or over HTTP/3, which has
@@ -862,6 +720,9 @@ lone_status(
 
 call_down(Id, Reason, #state{streams = Streams} = State) ->
     case Streams of
+        #{Id := #entry{state = starting} = Entry} when Reason =:= normal ->
+            %% Its stream went before its REQUEST did.
+            maybe_close(remove(Id, release(Id, Entry, State)));
         #{Id := #entry{state = finishing}} ->
             maybe_close(remove(Id, State));
         #{Id := #entry{state = expiring, fin = Fin}} ->
@@ -874,7 +735,9 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
         #{Id := #entry{state = shutdown}} ->
             cut_off(Id, State),
             maybe_close(remove(Id, State));
-        #{Id := #entry{state = running, fin = Fin} = Entry} ->
+        #{Id := #entry{state = Running, fin = Fin} = Entry} when
+            Running =:= starting; Running =:= running
+        ->
             %% The call process failed outside its handler, which catches
             %% handler failures itself.
             logger:error("trevrpc call process on stream ~b exited: ~p", [Id, Reason]),
@@ -895,8 +758,11 @@ server_down(Monitor, State) ->
     _ = Monitor,
     handle_cast(shutdown, State).
 
-shutdown_stream(Id, #entry{state = reading} = Entry, State) ->
-    refuse(Id, Entry, trevrpc_status:new(unavailable, <<"server is shutting down">>), State);
+shutdown_stream(Id, #entry{state = starting, pid = Pid, fin = Fin} = Entry, State) ->
+    %% Nothing of the call ran yet; the stream ends as one refused.
+    exit(Pid, kill),
+    Status = trevrpc_status:new(unavailable, <<"server is shutting down">>),
+    remove(Id, release(Id, Entry, lone_status(Id, Fin, Status, State)));
 shutdown_stream(Id, #entry{state = running, pid = Pid} = Entry, State) ->
     %% A handler that traps exits gets the grace period to return.
     exit(Pid, shutdown),
@@ -912,8 +778,7 @@ cut_off(Id, #state{transport = Transport}) ->
     ok.
 
 maybe_close(#state{stopping = true, streams = Streams, transport = Transport} = State) ->
-    Calls = [Id || Id := #entry{pid = Pid} <- Streams, is_pid(Pid)],
-    case Calls =:= [] andalso map_size(State#state.pending) =:= 0 of
+    case map_size(Streams) =:= 0 andalso map_size(State#state.pending) =:= 0 of
         true ->
             ok = close_transport(Transport),
             {stop, normal, State};
@@ -933,10 +798,10 @@ close_transport(Transport) -> trevrpc_transport:close(Transport, 0).
 %% limit, unless it released them already.
 release(Id, #entry{counted = false} = Entry, State) ->
     State#state{streams = (State#state.streams)#{Id => Entry}};
-release(Id, #entry{pid = Pid} = Entry, #state{active = Active, config = Config} = State) ->
-    case Pid of
-        undefined -> ok;
-        _ -> counters:sub(maps:get(requests, Config), 1, 1)
+release(Id, #entry{admitted = Admitted} = Entry, #state{active = Active, config = Config} = State) ->
+    case Admitted of
+        true -> counters:sub(maps:get(requests, Config), 1, 1);
+        false -> ok
     end,
     State#state{
         streams = (State#state.streams)#{Id => Entry#entry{counted = false}}, active = Active - 1

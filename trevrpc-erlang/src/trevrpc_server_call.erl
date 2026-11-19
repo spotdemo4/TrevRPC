@@ -1,9 +1,14 @@
-%% @private The process of one server call: reads the request, runs the
-%% handler, and writes the response.
+%% @private The process of one server call: reads and checks the stream's
+%% REQUEST, runs the handler, and writes the response.
 %%
-%% `trevrpc_server_conn' starts it once the stream's REQUEST passed its
-%% checks, routes the stream's events to it, and stops it if the call ends
-%% for any other reason first.
+%% `trevrpc_server_conn' starts it as soon as the stream opens and routes
+%% the stream's events to it. Once the REQUEST passed its checks, the call
+%% asks the connection to admit it ({@link trevrpc_server_conn:admit/4}),
+%% which takes its slot in the server's request limit and, for its deadline,
+%% stops it if it runs too long. A stream refused before then ends with a
+%% lone STATUS the call writes. Reading the REQUEST here, with the stream's
+%% flow control and credit, keeps that work and the blocking calls into the
+%% transport out of the connection process, which every call goes through.
 -module(trevrpc_server_call).
 
 -include("trevrpc_call.hrl").
@@ -14,25 +19,256 @@
 %% How long a terminal STATUS may wait for the send queue to drain.
 -define(STATUS_TIMEOUT, 30000).
 
-%% @doc Starts the call process described by `Spec', linked to and
-%% monitored by the caller. The connection stops its calls when it exits
-%% however it can; if it is killed, the link takes them down too, unless a
-%% handler traps exits, which then only gets an `'EXIT'' message.
+%% @doc Starts the process of the call on stream `Id' of connection
+%% `Transport', whose events `Router', the caller, routes to it tagged with
+%% `Ref', linked to and monitored by the caller. The connection stops its
+%% calls when it exits however it can; if it is killed, the link takes them
+%% down too, unless a handler traps exits, which then only gets an `'EXIT''
+%% message.
 -spec start(map()) -> {pid(), reference()}.
 start(Spec) ->
     {Pid, Monitor} = spawn_opt(fun() -> run(Spec) end, [link, monitor]),
     {Pid, Monitor}.
 
-run(
+run(#{transport := Transport, id := Id, ref := Ref, router := Router, config := Config}) ->
     #{
-        transport := Transport,
-        id := Id,
-        ref := Ref,
-        router := Router,
-        route := Route,
-        config := Config
-    } = Spec
-) ->
+        max_frame_size := MaxFrame,
+        max_stream_body_size := MaxBody,
+        initial_request_timeout := Initial
+    } = Config,
+    Stream = trevrpc_stream:new(
+        Transport, Id, Ref, Router, trevrpc_frame:reader(MaxFrame, #{max_bytes => MaxBody})
+    ),
+    case request(Stream, deadline(Initial), Config) of
+        {ok, Request, Route, Metadata, Timeout, Next} ->
+            admit(Request, Route, Metadata, Timeout, Next, Router, Config);
+        {error, Status, Next} ->
+            case trevrpc_server_conn:finish(Router, Id, Ref) of
+                ok -> lone_status(Status, Next, MaxFrame);
+                cancelled -> ok
+            end;
+        gone ->
+            ok
+    end.
+
+deadline(infinity) -> infinity;
+deadline(Timeout) -> erlang:monotonic_time(millisecond) + Timeout.
+
+%% The stream's REQUEST, checked, within the initial request timeout. A
+%% stream the peer reset, or whose connection closed, is gone: the
+%% connection ends the call itself.
+request(Stream, Deadline, Config) ->
+    case trevrpc_stream:next_frame(Stream, Deadline) of
+        {ok, {request, Payload}, Next} ->
+            case check_request(Payload, Config) of
+                {ok, Request, Route, Metadata, Timeout} ->
+                    {ok, Request, Route, Metadata, Timeout, Next};
+                {error, Status} ->
+                    {error, Status, Next}
+            end;
+        {ok, {Type, _}, Next} ->
+            {error,
+                invalid_status(
+                    iolist_to_binary(
+                        io_lib:format("request stream must start with REQUEST, not ~s", [
+                            trevrpc_frame:name(Type)
+                        ])
+                    )
+                ),
+                Next};
+        {datagram, _Messages, Next} ->
+            %% Datagrams are read only once the call took its flow.
+            request(Next, Deadline, Config);
+        {eof, Next} ->
+            {error, invalid_status(<<"request stream ended before REQUEST">>), Next};
+        {error, truncated, Next} ->
+            {error, invalid_status(<<"request stream ended inside a frame">>), Next};
+        {error, timeout, Next} ->
+            {error, trevrpc_status:new(deadline_exceeded, <<"initial request frame timeout">>),
+                Next};
+        {error, {frame_too_large, Length}, Next} ->
+            {error,
+                trevrpc_status:new(
+                    resource_exhausted,
+                    iolist_to_binary(
+                        io_lib:format("frame length ~b exceeds maximum ~b", [
+                            Length, maps:get(max_frame_size, Config)
+                        ])
+                    )
+                ),
+                Next};
+        {error, {body_too_large, Max}, Next} ->
+            {error,
+                trevrpc_status:new(
+                    resource_exhausted,
+                    iolist_to_binary(
+                        io_lib:format("request stream exceeded maximum body size of ~b bytes", [
+                            Max
+                        ])
+                    )
+                ),
+                Next};
+        {error, _Gone, _Next} ->
+            gone
+    end.
+
+%% Checks a REQUEST in the order the Go and Rust servers do, with their
+%% messages.
+check_request(Payload, #{routes := Routes}) ->
+    maybe
+        {ok, Request} ?= decode_request(Payload),
+        #{method := Method, kind := Kind, stream_compression := Compression} = Request,
+        ok ?= check_method(Method),
+        ok ?= check_kind(Kind),
+        ok ?= check_stream_compression(Compression),
+        {ok, Metadata} ?= merge_metadata(Request),
+        ok ?= validate_metadata(Metadata),
+        {ok, Timeout} ?= timeout(Request),
+        {ok, Route} ?= route(Method, Kind, Routes),
+        {ok, Request, Route, Metadata, Timeout}
+    end.
+
+decode_request(Payload) ->
+    case trevrpc_wire:decode_request(Payload) of
+        {ok, Request} -> {ok, Request};
+        error -> invalid(<<"invalid RPC request frame: malformed RpcRequest">>)
+    end.
+
+check_method(<<$/, Rest/binary>>) ->
+    case binary:split(Rest, <<"/">>) of
+        [Service, Method] when Service =/= <<>>, Method =/= <<>> ->
+            case binary:match(Method, <<"/">>) of
+                nomatch -> ok;
+                _ -> malformed_method()
+            end;
+        _ ->
+            malformed_method()
+    end;
+check_method(_) ->
+    malformed_method().
+
+malformed_method() ->
+    invalid(<<"malformed RPC method path; expected /<service>/<method>">>).
+
+check_kind({unknown, Value}) ->
+    invalid(iolist_to_binary(io_lib:format("unsupported TrevRPC RPC kind ~b", [Value])));
+check_kind(_) ->
+    ok.
+
+check_stream_compression({unknown, Value}) ->
+    invalid(iolist_to_binary(io_lib:format("unsupported TrevRPC stream compression ~b", [Value])));
+check_stream_compression(_) ->
+    ok.
+
+%% This server stores no connection metadata sets yet. An offer serves its
+%% own call and is never confirmed, as on the ordinary HTTP mapping, so the
+%% client keeps offering; a reference names a set it does not hold.
+merge_metadata(#{metadata := Own, connection_metadata := undefined}) ->
+    {ok, Own};
+merge_metadata(#{metadata := Own, connection_metadata := #{id := Id, metadata := Set}}) ->
+    case map_size(Set) of
+        0 -> invalid(iolist_to_binary(io_lib:format("unknown connection metadata set ~b", [Id])));
+        _ -> {ok, trevrpc_metadata:merge(Set, Own)}
+    end.
+
+validate_metadata(Metadata) ->
+    case trevrpc_metadata:validate(Metadata) of
+        ok -> ok;
+        {error, Message} -> invalid(Message)
+    end.
+
+%% Erlang timers take up to 2^32 - 1 ms; a longer timeout is rejected rather
+%% than truncated.
+timeout(#{timeout_nanos := 0}) ->
+    {ok, infinity};
+timeout(#{timeout_nanos := Nanos}) ->
+    case (Nanos + 999999) div 1000000 of
+        Millis when Millis =< 16#FFFFFFFF -> {ok, Millis};
+        _ -> invalid(<<"RPC timeout is too large">>)
+    end.
+
+route(Method, Kind, Routes) ->
+    case Routes of
+        #{Method := #{kind := Kind} = Route} ->
+            {ok, Route};
+        #{Method := #{kind := Registered}} ->
+            invalid(
+                iolist_to_binary(
+                    io_lib:format("streaming RPC kind mismatch for ~ts: expected ~b, got ~b", [
+                        Method, trevrpc_wire:kind_to_int(Registered), trevrpc_wire:kind_to_int(Kind)
+                    ])
+                )
+            );
+        #{} ->
+            {error,
+                trevrpc_status:new(
+                    unimplemented,
+                    iolist_to_binary(io_lib:format("unknown RPC method ~ts", [Method]))
+                )}
+    end.
+
+invalid(Message) ->
+    {error, invalid_status(Message)}.
+
+invalid_status(Message) ->
+    trevrpc_status:new(invalid_argument, Message).
+
+%% Asks the connection to admit the call, then serves it; the connection
+%% may refuse it, and then it ends with the lone STATUS of that refusal.
+admit(Request, Route, Metadata, Timeout, Stream, Router, Config) ->
+    #{kind := Kind, stream_compression := Offer} = Request,
+    {Requests, _} = trevrpc_zstd:directions(maps:get(compression, Route, none)),
+    Admission = #{
+        flow => maps:get(datagram_flow, Request, 0),
+        kind => Kind,
+        offer => Offer,
+        requests => Requests,
+        timeout => Timeout
+    },
+    Id = trevrpc_stream:id(Stream),
+    %% From now on the stream's unread bytes count against the
+    %% connection's window too, as its handler may read them slowly.
+    ok = trevrpc_transport:track_flow_control(
+        trevrpc_stream:transport(Stream), Id, trevrpc_stream:consumed(Stream)
+    ),
+    case trevrpc_server_conn:admit(Router, Id, trevrpc_stream:ref(Stream), Admission) of
+        {ok, #{flow := Flow, stream_requests := Decode}} ->
+            serve(#{
+                stream => Stream,
+                router => Router,
+                request => Request,
+                route => Route,
+                metadata => Metadata,
+                deadline => deadline(Timeout),
+                config => Config,
+                flow => Flow,
+                stream_requests => Decode
+            });
+        {refuse, Status} ->
+            lone_status(Status, Stream, maps:get(max_frame_size, Config));
+        cancelled ->
+            ok
+    end.
+
+%% Ends a call refused before it ran: its STATUS, and, if the peer has not
+%% finished the request side, a stop to it.
+lone_status(Status, Stream, Max) ->
+    Deadline = erlang:monotonic_time(millisecond) + ?STATUS_TIMEOUT,
+    _ = trevrpc_stream:send(Stream, status_frame(Status, Max), true, Deadline),
+    _ =
+        case trevrpc_stream:peer_finished(Stream) of
+            true ->
+                ok;
+            false ->
+                trevrpc_transport:stop_sending(
+                    trevrpc_stream:transport(Stream), trevrpc_stream:id(Stream), ?CANCELLED
+                )
+        end,
+    trevrpc_stream:release(Stream).
+
+serve(#{stream := Stream0, router := Router, route := Route, config := Config} = Spec) ->
+    Id = trevrpc_stream:id(Stream0),
+    Ref = trevrpc_stream:ref(Stream0),
     #{kind := Kind, handler := Handler} = Route,
     #{request := #{method := Method} = Request, metadata := Metadata, deadline := Deadline} = Spec,
     #{
@@ -50,11 +286,6 @@ run(
     StreamResponses =
         maps:get(stream_compression, Request) =/= none andalso Responses =:= stream andalso
             trevrpc_wire:streams_responses(Kind),
-    Stream0 = trevrpc_stream:resume(
-        maps:get(frames, Spec),
-        maps:get(fin, Spec),
-        trevrpc_stream:new(Transport, Id, Ref, Router, maps:get(reader, Spec))
-    ),
     %% A request that is a single message is bounded by the frame size
     %% alone; a stream of them by the cumulative body limit too.
     Stream1 = trevrpc_stream:charge_messages(trevrpc_wire:streams_requests(Kind), Stream0),

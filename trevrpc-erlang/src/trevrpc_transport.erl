@@ -23,6 +23,8 @@
     reset_stream/3,
     stop_sending/3,
     manual_flow_control/2,
+    hold_streams/1,
+    track_flow_control/3,
     notify_send_ready/1,
     open_stream/1,
     send_datagram/2,
@@ -142,12 +144,47 @@ stop_sending({h2, _Conn}, _Id, _Code) ->
     ok.
 
 %% @doc Puts a stream in manual flow control, which QMux streams always
-%% are, and HTTP request streams from their acceptance.
+%% are, and HTTP request streams from their acceptance, without waiting.
+%% The client channel calls it for each stream it opens; a server's
+%% streams are held from the start instead (see {@link hold_streams/1}).
+%% Over QUIC it is erlang_quic's own asynchronous form of
+%% `quic:set_stream_flow_control/3', which its HTTP/3 layer uses, and does
+%% nothing on a connection that is gone: what was delivered before still
+%% counts as not consumed.
 -spec manual_flow_control(t(), non_neg_integer()) -> ok.
 manual_flow_control({quic, Conn}, Id) ->
-    _ = ?SAFE(quic:set_stream_flow_control(Conn, Id, manual)),
-    ok;
+    quic_connection:set_stream_flow_control(Conn, Id, {manual, 0});
 manual_flow_control(_Transport, _Id) ->
+    ok.
+
+%% @doc Makes every stream the peer opens from now on start in manual
+%% flow control, as QMux streams do, without a message to the connection
+%% process for each as it opens: over native QUIC, erlang_quic holds them,
+%% as for its HTTP/3 layer. A held stream earns credit only as its reader
+%% returns it, which bounds what it buffers by its window, but its bytes
+%% earn connection credit as they arrive, until
+%% {@link track_flow_control/3} makes them count against the connection's
+%% window too, as a server call does once it read its REQUEST. Called from
+%% the connection's ALPN handler, in the connection's own process, so it
+%% applies before any stream opens.
+%%
+%% erlang_quic drains its packets with selective receives, which pass over
+%% the other messages in its mailbox. Measured with 64 concurrent calls, a
+%% message from the owner for each stream as it opened cost a fifth of the
+%% throughput of client streams; one from each call once it read its
+%% REQUEST costs nothing measurable.
+-spec hold_streams(t()) -> ok.
+hold_streams({quic, Conn}) ->
+    quic_connection:hold_peer_streams(Conn);
+hold_streams(_Transport) ->
+    ok.
+
+%% @doc Makes a held stream's unread bytes count against the connection's
+%% window, as well as its own, once its reader returned `Consumed' bytes.
+-spec track_flow_control(t(), non_neg_integer(), non_neg_integer()) -> ok.
+track_flow_control({quic, Conn}, Id, Consumed) ->
+    quic_connection:set_stream_flow_control(Conn, Id, {manual, Consumed});
+track_flow_control(_Transport, _Id, _Consumed) ->
     ok.
 
 %% @doc Asks for a `send_ready' event once the send queue drained. Over

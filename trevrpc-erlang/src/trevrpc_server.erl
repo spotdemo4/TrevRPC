@@ -368,8 +368,13 @@ quic_handlers(Start, #{http := _}) ->
         max_stream_data_uni => 16384,
         connection_handler => Start,
         alpn_handler => fun
-            (Conn, ?H3, Owner) -> serve_h3(Conn, Owner);
-            (_Conn, _Alpn, Owner) -> {ok, Owner}
+            (Conn, ?H3, Owner) ->
+                serve_h3(Conn, Owner);
+            (Conn, _Alpn, Owner) ->
+                %% Every stream the client opens starts in manual flow
+                %% control (see trevrpc_transport:hold_streams/1).
+                ok = trevrpc_transport:hold_streams({quic, Conn}),
+                {ok, Owner}
         end
     }.
 

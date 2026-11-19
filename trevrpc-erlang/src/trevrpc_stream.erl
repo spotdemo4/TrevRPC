@@ -29,16 +29,19 @@
 %% The stream is in manual flow control: the peer may send one window past
 %% the bytes returned with `trevrpc_transport:consume/3'. Bytes are returned as they are
 %% read into the frame reader, which is only fed when the decoded frames
-%% have all been taken, so a slow reader holds the peer back.
+%% have all been taken, so a slow reader holds the peer back. They are
+%% returned in batches while more data is already waiting, and at once
+%% before the reader waits.
 -module(trevrpc_stream).
 
 -export([
     new/5,
-    resume/3,
     transport/1,
     id/1,
     ref/1,
     finished/1,
+    peer_finished/1,
+    consumed/1,
     stopped/1,
     charge_messages/2,
     charge_message/2,
@@ -77,6 +80,8 @@
     frames = [] :: [trevrpc_frame:frame()],
     %% Bytes read and not returned to the peer as credit yet.
     unconsumed = 0 :: non_neg_integer(),
+    %% Bytes returned to the peer as credit so far.
+    consumed = 0 :: non_neg_integer(),
     %% The peer finished sending (FIN).
     fin = false :: boolean(),
     %% The peer stopped reading (STOP_SENDING); sends are pointless.
@@ -102,12 +107,6 @@
 new(Transport, Id, Ref, Router, Reader) ->
     #stream{transport = Transport, id = Id, ref = Ref, router = Router, reader = Reader}.
 
-%% @doc Hands frames already read, and whether the peer already finished,
-%% to a stream that continues another reader's work.
--spec resume([trevrpc_frame:frame()], boolean(), stream()) -> stream().
-resume(Frames, Fin, Stream) ->
-    Stream#stream{frames = Frames, fin = Fin}.
-
 -spec transport(stream()) -> trevrpc_transport:t().
 transport(#stream{transport = Transport}) -> Transport.
 
@@ -120,6 +119,15 @@ ref(#stream{ref = Ref}) -> Ref.
 %% @doc Whether the peer finished sending and every frame it sent was taken.
 -spec finished(stream()) -> boolean().
 finished(#stream{fin = Fin, frames = Frames}) -> Fin andalso Frames =:= [].
+
+%% @doc Whether the peer finished sending, whether or not every frame it
+%% sent was taken.
+-spec peer_finished(stream()) -> boolean().
+peer_finished(#stream{fin = Fin}) -> Fin.
+
+%% @doc The bytes returned to the peer as credit so far.
+-spec consumed(stream()) -> non_neg_integer().
+consumed(#stream{consumed = Consumed}) -> Consumed.
 
 %% @doc Whether the peer stopped reading.
 -spec stopped(stream()) -> boolean().
@@ -311,7 +319,7 @@ flush_credit(#stream{transport = Transport, id = Id, unconsumed = Unconsumed} = 
     %% The stream may already be gone (finished or reset); its credit no
     %% longer matters then.
     _ = trevrpc_transport:consume(Transport, Id, Unconsumed),
-    Stream#stream{unconsumed = 0}.
+    Stream#stream{unconsumed = 0, consumed = Stream#stream.consumed + Unconsumed}.
 
 %% @doc Writes `Data' to the stream, finishing it with `Fin'. When the
 %% connection's send queue is full, or over HTTP/2 the peer's window, waits
