@@ -18,7 +18,7 @@ require (
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/dunglas/httpsfv v1.1.1 // indirect
-	github.com/klauspost/compress v1.20.4 // indirect
+	github.com/klauspost/compress v1.20.5 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/webtransport-go v0.13.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect

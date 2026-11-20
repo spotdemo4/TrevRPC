@@ -120,8 +120,8 @@ cachePackages = [
     hash = 'sha256-MwE5SaqcGD5RxpQqSpbydi6cMriyeT/FrvJoBB9KoE4='
 
   [mod.'github.com/klauspost/compress']
-    version = 'v1.20.4'
-    hash = 'sha256-KYm39Vrg8cR7bU0aqK2KTdth8UhHnH17Vcl9FB0Hf/E='
+    version = 'v1.20.5'
+    hash = 'sha256-F+7R/K9y3md95FX3UxavK0pz8aFJp67zRKqNeMMCths='
 
   [mod.'github.com/quic-go/qpack']
     version = 'v0.6.0'
