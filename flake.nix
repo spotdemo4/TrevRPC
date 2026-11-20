@@ -189,6 +189,8 @@
               # kotlin
               jdk25
               gradle_9
+              # gleam: the gleam manager updates trevrpc-erlang/manifest.toml with it
+              gleam
             ];
           };
 
