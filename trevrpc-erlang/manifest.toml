@@ -7,7 +7,7 @@
 # You should check this file into your source control repository.
 
 packages = [
-  { name = "erlang_h1", version = "0.11.0", build_tools = ["rebar3"], requirements = [], otp_app = "h1", source = "hex", outer_checksum = "EE34B740EBBE5B0AC31BA653B345D3D82C814757F6711EEECABA9519D9A3781D" },
+  { name = "erlang_h1", version = "0.13.0", build_tools = ["rebar3"], requirements = [], otp_app = "h1", source = "hex", outer_checksum = "5B270C4C737765F9DE0029037FF627746B0D12ABAE192C4B09E9451052D2DE79" },
   { name = "erlang_ws", version = "0.5.0", build_tools = ["rebar3"], requirements = [], otp_app = "ws", source = "hex", outer_checksum = "CAD7961A5AF19C463948A77DDE525E43D55D71F709A21AE3EA929EC6E50B065F" },
   { name = "gleam_stdlib", version = "1.0.5", build_tools = ["gleam"], requirements = [], otp_app = "gleam_stdlib", source = "hex", outer_checksum = "CEE5B6C076A85B45F60C585F4316C63EC8B7127C119D5738C3958A9C4D50404E" },
   { name = "gleeunit", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleeunit", source = "hex", outer_checksum = "EC31ABA74256AEA531EDF8169931D775BBB384FED0A8A1BDC4DD9354E3E21826" },
@@ -18,7 +18,7 @@ packages = [
 ]
 
 [requirements]
-erlang_h1 = { version = ">= 0.11.0 and < 0.12.0" }
+erlang_h1 = { version = ">= 0.11.0 and < 0.14.0" }
 erlang_ws = { version = ">= 0.5.0 and < 0.6.0" }
 gleam_stdlib = { version = ">= 0.44.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
