@@ -14,6 +14,7 @@
 - Commits created by agents must include an `Assisted-by: [tool name] ([primary model name and version])` Git commit trailer.
 - Branch names created by agents must follow [Conventional Branch 1.0.0](https://conventionalbranch.org/v1.0.0/).
 - Issues created by agents must follow `.forgejo/ISSUE_TEMPLATE/issue.md`, including its title format and labeling instructions.
+- In pull request descriptions and commit messages, put a closing keyword (`close`, `closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved`) right before an issue reference only when the change should close that issue, and a reopening keyword (`reopen`, `reopens`, `reopened`) only when it should reopen it. Forgejo acts on the keyword on merge wherever it appears, even in a negated sentence such as "this does not close #123". Refer to an issue that stays as it is as "Refs #123" or "#123 stays open".
 - `wiki/` is a Git submodule for the project wiki. When an agent changes it, commit and push those changes in the submodule to its `main` branch, then commit the updated submodule pointer in this repository along with the related changes.
 
 ## Template Update Requirements
