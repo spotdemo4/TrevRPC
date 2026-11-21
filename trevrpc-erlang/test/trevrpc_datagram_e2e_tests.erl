@@ -126,7 +126,8 @@ tests(Transport) ->
                 {"DATAGRAM_COUNT waits for missing datagrams", fun count_wait_test/1},
                 {"a unary call drops request datagrams", fun unary_test/1},
                 {"datagrams count towards the message limit", fun message_limit_test/1},
-                {"response datagrams end with DATAGRAM_COUNT", fun response_count_test/1}
+                {"response datagrams end with DATAGRAM_COUNT", fun response_count_test/1},
+                {"senders that stop between messages start again", fun restart_test/1}
             ]
         ]
     end}.
@@ -274,13 +275,52 @@ message_limit_test(#{transport := tcp}) ->
     ok.
 
 %% A raw stream's flow is unknown to the channel, which drops the server's
-%% datagrams; its stream shows how the responses ended.
+%% datagrams; its stream shows how the responses ended. The three responses
+%% take one to three datagrams, as many as were queued when each went.
 response_count_test(#{transport := quic} = Env) ->
     Request = request(#{method => ?FLOOD, kind => server_streaming, datagram_flow => 80}),
     Frames = raw(env_channel(Env), [Request, trevrpc_frame:encode(message, <<"3:10">>)], true),
-    ?assertMatch([headers, {datagram_count, 3}, {status, #{code := ok}}], Frames);
+    ?assertMatch([headers, {datagram_count, _}, {status, #{code := ok}}], Frames),
+    [headers, {datagram_count, Count}, _] = Frames,
+    ?assert(Count >= 1 andalso Count =< 3, Count);
 response_count_test(#{transport := tcp}) ->
     ok.
+
+%% With no idle time, each call's datagram sender stops whenever its queue
+%% runs dry, which on loopback is between most messages, so frames race
+%% the stop and senders start again within one call, on the client and on
+%% the server: more than the two a call starts without stopping, as call
+%% counting shows. Every message still goes at most once, and the call ends
+%% normally.
+restart_test(#{transport := Transport} = Env) ->
+    Start = {trevrpc_datagram_sender, start, 2},
+    try
+        ok = application:set_env(trevrpc, datagram_sender_idle, 0),
+        {module, _} = code:ensure_loaded(trevrpc_datagram_sender),
+        1 = erlang:trace_pattern(Start, true, [local, call_count]),
+        {ok, Call} = trevrpc_client:bidi(env_channel(Env), ?BIDI, #{unreliable => ?BOTH}),
+        Requests = [integer_to_binary(N) || N <- lists:seq(1, 200)],
+        _ = [ok = trevrpc_client:send(Call, Request) || Request <- Requests],
+        ok = trevrpc_client:close_send(Call),
+        {Responses, Trailers} = drain(Call, []),
+        Received = binary_to_integer(maps:get(<<"x-received">>, Trailers)),
+        Datagrams = binary_to_integer(maps:get(<<"x-datagrams">>, Trailers)),
+        {call_count, Starts} = erlang:trace_info(Start, call_count),
+        case Transport of
+            quic ->
+                ?assertEqual(lists:usort(Responses), lists:sort(Responses)),
+                ?assertEqual([], Responses -- Requests),
+                ?assert(Received >= 1 andalso Received =< 200, Received),
+                ?assert(Datagrams >= 1, Datagrams),
+                ?assert(Starts > 2, Starts);
+            tcp ->
+                ?assertEqual(Requests, Responses),
+                ?assertEqual({200, 0, 0}, {Received, Datagrams, Starts})
+        end
+    after
+        _ = erlang:trace_pattern(Start, false, [local, call_count]),
+        ok = application:unset_env(trevrpc, datagram_sender_idle)
+    end.
 
 %%% Helpers
 

@@ -502,7 +502,7 @@ await_waiting(Client, Id, Version) ->
     {200, _, <<>>, false} = response_head(Client, Id),
     case Version of
         h3 ->
-            Pattern = {trevrpc_stream, wait_send_ready, 4},
+            Pattern = {trevrpc_stream, wait_send_ready, 5},
             {module, trevrpc_stream} = code:ensure_loaded(trevrpc_stream),
             _ = erlang:trace_pattern(Pattern, true, [local]),
             _ = erlang:trace(Writer, true, [call]),

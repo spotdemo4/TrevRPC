@@ -135,7 +135,7 @@
     %% datagram messages that arrived before the headers, which wait for
     %% them.
     flow :: pos_integer() | undefined,
-    datagram_sender :: trevrpc_datagram:sender() | undefined,
+    datagram_sender :: trevrpc_datagram_sender:sender() | undefined,
     early = [] :: [binary()],
     early_bytes = 0 :: non_neg_integer(),
     %% While recv/2 waits: when it stops waiting, in
@@ -304,7 +304,7 @@ flow(#{flow := {Flow, Credit}}, Kind, {Requests, _}, Stream) ->
         end,
     Sender =
         case Requests of
-            true -> trevrpc_datagram:sender(trevrpc_stream:transport(Stream), Flow);
+            true -> trevrpc_datagram_sender:new(Stream, Flow);
             false -> undefined
         end,
     {Flow, Reading, Sender}.
@@ -449,10 +449,10 @@ send_message(Call, State, Message) ->
             put_state(Call, keep(Encoded, Message)),
             write(Call, Frame, false);
         {ok, #cstate{datagram_sender = Sender} = Ready} ->
-            %% In a datagram, or on the stream when it does not fit one or
-            %% cannot be sent.
+            %% In a datagram, or on the stream when it does not fit one.
             {Frame, Encoded} = encode_request(Call, Ready, Message),
-            case trevrpc_datagram:send(Frame, Sender) of
+            Deadline = Call#client_call.deadline,
+            case trevrpc_datagram_sender:send(Frame, Deadline, Sender) of
                 {sent, Next} ->
                     put_state(Call, Encoded#cstate{datagram_sender = Next});
                 {stream, Next} ->
@@ -721,7 +721,8 @@ close_send(Call) ->
         #cstate{send_closed = true} ->
             ok;
         #cstate{terminal = undefined, datagram_sender = Sender} ->
-            write(Call, trevrpc_datagram:count_frame(Sender), true);
+            End = trevrpc_datagram_sender:finish(Call#client_call.deadline, Sender),
+            write(Call, End, true);
         #cstate{terminal = Terminal} ->
             {error, terminal_status(Terminal)}
     end.

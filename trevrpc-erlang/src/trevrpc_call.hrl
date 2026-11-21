@@ -57,5 +57,5 @@
     datagrams_ended = false :: boolean(),
     datagram_messages = [] :: [{binary(), non_neg_integer() | raw}],
     datagrams_received = 0 :: non_neg_integer(),
-    datagram_sender :: trevrpc_datagram:sender() | undefined
+    datagram_sender :: trevrpc_datagram_sender:sender() | undefined
 }).

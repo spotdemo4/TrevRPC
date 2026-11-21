@@ -144,7 +144,7 @@ send_datagram(Call, #call_state{headers_sent = false} = State, Frame) ->
         Error -> Error
     end;
 send_datagram(Call, #call_state{datagram_sender = Sender} = State, Frame) ->
-    case trevrpc_datagram:send(Frame, Sender) of
+    case trevrpc_datagram_sender:send(Frame, Call#call.deadline, Sender) of
         {sent, Next} ->
             put_state(Call, State#call_state{datagram_sender = Next, messages_sent = true});
         {stream, Next} ->

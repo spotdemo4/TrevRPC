@@ -634,14 +634,25 @@ paced_stream(Call, Schedule, Payload, Next, Sent, Echoed) ->
     Due = Base + Next * Interval,
     case Now >= Due of
         true ->
-            {Message, Payload1} = trevrpc_interop_payload:next(Payload),
-            Request = #{message => paced_message(Next, Message), count => 1},
-            At = erlang:monotonic_time(nanosecond),
-            case trevrpc_client:send(Call, Request) of
-                ok ->
-                    paced_stream(Call, Schedule, Payload1, Next + 1, Sent#{Next => At}, Echoed);
-                {error, _} ->
-                    {error, Payload1, Next + 1, Sent#{Next => At}, Echoed}
+            %% The echoes that already arrived first, so that a worker that
+            %% fell behind its schedule, and sends without waiting, still
+            %% reads them as they come, as the other runtimes' workers do on
+            %% a receiver of their own.
+            case paced_arrived(Call, Sent, Echoed) of
+                {ok, Echoed1} ->
+                    {Message, Payload1} = trevrpc_interop_payload:next(Payload),
+                    Request = #{message => paced_message(Next, Message), count => 1},
+                    At = erlang:monotonic_time(nanosecond),
+                    case trevrpc_client:send(Call, Request) of
+                        ok ->
+                            paced_stream(
+                                Call, Schedule, Payload1, Next + 1, Sent#{Next => At}, Echoed1
+                            );
+                        {error, _} ->
+                            {error, Payload1, Next + 1, Sent#{Next => At}, Echoed1}
+                    end;
+                {error, Echoed1} ->
+                    {error, Payload, Next, Sent, Echoed1}
             end;
         false ->
             %% Rounded up, so that the worker waits instead of spinning
@@ -659,6 +670,20 @@ paced_stream(Call, Schedule, Payload, Next, Sent, Echoed) ->
                 _Ended ->
                     {error, Payload, Next, Sent, Echoed}
             end
+    end.
+
+%% Records the echoes that already arrived, without waiting for more.
+paced_arrived(Call, Sent, Echoed) ->
+    case trevrpc_client:recv(Call, 0) of
+        timeout ->
+            {ok, Echoed};
+        {ok, #{message := Echo}} ->
+            case echoed(Echo, Sent, Echoed) of
+                {ok, Echoed1} -> paced_arrived(Call, Sent, Echoed1);
+                error -> {error, Echoed}
+            end;
+        _Ended ->
+            {error, Echoed}
     end.
 
 paced_drain(Call, Next, Sent, Echoed) ->

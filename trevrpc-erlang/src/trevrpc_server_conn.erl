@@ -364,6 +364,9 @@ terminate(_Reason, #state{streams = Streams, sessions = Sessions} = State) ->
     %% Calls still in flight, as when the connection closes under them,
     %% give their slots in the server's request limit back.
     _ = maps:fold(fun release/3, State, Streams),
+    %% Writers waiting for the send queue that outlive their call, as a
+    %% call's datagram sender may, stop waiting.
+    _ = [Pid ! {trevrpc_stream, Ref, closed} || {Pid, Ref} <- State#state.send_waiters],
     _ = [shutdown(Pid) || Pid <- maps:values(Sessions)],
     _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams)],
     Budget = maps:get(stream_budget, State#state.config),

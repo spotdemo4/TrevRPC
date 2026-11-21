@@ -1,7 +1,8 @@
 %% @doc Datagram messages: their payload (a call's flow ID as a QUIC varint,
 %% then one or more TrevRPC frames to the end of the datagram), the
 %% `unreliable' option that lets a streaming direction's messages travel in
-%% them, and the sending and receiving that client and server calls share.
+%% them, and the receiving that client and server calls share; {@link
+%% trevrpc_datagram_sender} sends them.
 %%
 %% Native QUIC carries the payload in a DATAGRAM frame; WebTransport carries
 %% it as a session datagram after the session's quarter stream ID.
@@ -9,9 +10,9 @@
 
 -export([encode/2, encode_messages/2, decode/1, parse/1]).
 -export([check_unreliable/1, effective/2, compression/2]).
--export([sender/2, send/2, sent/1, count_frame/1, messages/4, count_wait/1]).
+-export([messages/4, count_wait/1]).
 
--export_type([message/0, unreliable/0, sender/0]).
+-export_type([message/0, unreliable/0]).
 
 %% A message of the call: a MESSAGE payload, or a ZSTD_MESSAGE payload the
 %% receiver still has to decompress.
@@ -24,25 +25,9 @@
 %% not stream has no effect.
 -type unreliable() :: #{requests => boolean(), responses => boolean()}.
 
-%% How long the largest datagram the connection takes is trusted before it
-%% is asked again: path MTU discovery can raise it.
--define(MAX_SIZE_AGE, 100).
 %% How long the end of a direction waits for the datagrams its
 %% DATAGRAM_COUNT announced that have not arrived.
 -define(COUNT_WAIT, 10).
-
--record(sender, {
-    transport :: trevrpc_transport:t(),
-    flow :: pos_integer(),
-    prefix :: iodata(),
-    %% Datagrams the transport accepted, which DATAGRAM_COUNT announces.
-    sent = 0 :: non_neg_integer(),
-    %% The largest payload the connection takes, and when it said so.
-    max_size = 0 :: non_neg_integer(),
-    checked :: integer() | undefined
-}).
-
--opaque sender() :: #sender{}.
 
 %% @doc Encodes a datagram payload from frames already encoded.
 -spec encode(non_neg_integer(), [iodata()]) -> iodata().
@@ -154,63 +139,6 @@ compression({Requests, Responses}, {UnreliableRequests, UnreliableResponses}) ->
 
 per_message(stream, true) -> message;
 per_message(Mode, _Unreliable) -> Mode.
-
-%%% Sending
-
-%% @doc The sender of a call's messages on flow `Flow' of `Transport'.
--spec sender(trevrpc_transport:t(), pos_integer()) -> sender().
-sender(Transport, Flow) ->
-    #sender{transport = Transport, flow = Flow, prefix = trevrpc_varint:encode(Flow)}.
-
-%% @doc Sends `Frame', a MESSAGE or ZSTD_MESSAGE frame, in a datagram of its
-%% own. `stream' means it belongs on the stream instead: it does not fit the
-%% largest datagram the connection takes now, or the send failed, as when
-%% the congestion window is full (`congestion_limited'). erlang_quic never
-%% waits to send a datagram, so a call never waits for one either. Only a
-%% send refused for its size, as when path MTU discovery fell back, asks
-%% the connection for the largest datagram again before the next.
--spec send(iodata(), sender()) -> {sent | stream, sender()}.
-send(Frame, #sender{transport = Transport, prefix = Prefix} = Sender) ->
-    #sender{max_size = Max} = Checked = max_size(Sender),
-    case iolist_size(Prefix) + iolist_size(Frame) of
-        Size when Size > Max ->
-            {stream, Checked};
-        _ ->
-            case trevrpc_transport:send_datagram(Transport, [Prefix | Frame]) of
-                ok ->
-                    {sent, Checked#sender{sent = Checked#sender.sent + 1}};
-                {error, Reason} when
-                    Reason =:= datagram_too_large; Reason =:= datagram_too_large_for_path
-                ->
-                    {stream, Checked#sender{checked = undefined}};
-                {error, _} ->
-                    {stream, Checked}
-            end
-    end.
-
-max_size(#sender{checked = Checked} = Sender) ->
-    Now = erlang:monotonic_time(millisecond),
-    case Checked of
-        At when is_integer(At), Now - At < ?MAX_SIZE_AGE ->
-            Sender;
-        _ ->
-            Max = trevrpc_transport:datagram_max_size(Sender#sender.transport),
-            Sender#sender{max_size = Max, checked = Now}
-    end.
-
-%% @doc How many datagrams the transport accepted.
--spec sent(sender() | undefined) -> non_neg_integer().
-sent(undefined) -> 0;
-sent(#sender{sent = Sent}) -> Sent.
-
-%% @doc The DATAGRAM_COUNT that ends a direction which sent datagrams, right
-%% before its end, or nothing for one that sent none.
--spec count_frame(sender() | undefined) -> iodata().
-count_frame(Sender) ->
-    case sent(Sender) of
-        0 -> [];
-        Sent -> trevrpc_frame:encode_datagram_count(Sent)
-    end.
 
 %%% Receiving
 

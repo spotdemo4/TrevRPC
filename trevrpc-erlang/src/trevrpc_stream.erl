@@ -52,9 +52,11 @@
     end_datagrams/4,
     take_datagrams/1,
     send/4,
+    send/5,
     abort/2,
     release/1,
-    flush_events/1
+    flush_events/1,
+    timeout/1
 ]).
 
 -export_type([stream/0, deadline/0, read_error/0]).
@@ -326,36 +328,52 @@ flush_credit(#stream{transport = Transport, id = Id, unconsumed = Unconsumed} = 
 %% until `Deadline' for it to drain.
 -spec send(stream(), iodata(), boolean(), deadline()) ->
     {ok, stream()} | {error, timeout | stopped | closed | term(), stream()}.
-send(#stream{stopped = true} = Stream, _Data, _Fin, _Deadline) ->
+send(Stream, Data, Fin, Deadline) ->
+    send(Stream, Data, Fin, Deadline, undefined).
+
+%% @doc Writes `Data' as {@link send/4} does, for a process other than the
+%% stream's reader, which gets none of its events: a wait for the send
+%% queue also ends, with `abandoned', when `Monitor', a monitor that
+%% process holds, goes down. Wake-ups the router sends after the wait ended
+%% are left in the mailbox, for the writer to drop.
+-spec send(stream(), iodata(), boolean(), deadline(), reference() | undefined) ->
+    {ok, stream()} | {error, timeout | stopped | closed | abandoned | term(), stream()}.
+send(#stream{stopped = true} = Stream, _Data, _Fin, _Deadline, _Monitor) ->
     {error, stopped, Stream};
-send(#stream{transport = Transport, id = Id} = Stream, Data, Fin, Deadline) ->
+send(#stream{transport = Transport, id = Id} = Stream, Data, Fin, Deadline, Monitor) ->
     case trevrpc_transport:send_data(Transport, Id, Data, Fin, timeout(Deadline)) of
         ok -> {ok, Stream};
-        {error, send_queue_full} -> wait_send_ready(Stream, Data, Fin, Deadline);
+        {error, send_queue_full} -> wait_send_ready(Stream, Data, Fin, Deadline, Monitor);
         {error, Reason} -> {error, Reason, Stream}
     end.
 
 %% quic_h3 tells the writer it refused itself.
-wait_send_ready(#stream{transport = {h3, H3, _}, id = Id, ref = Ref} = Stream, Data, Fin, Deadline) ->
+wait_send_ready(
+    #stream{transport = {h3, H3, _}, id = Id, ref = Ref} = Stream, Data, Fin, Deadline, Monitor
+) ->
     receive
         {quic_h3, H3, {send_ready, Id}} ->
-            send(Stream, Data, Fin, Deadline);
+            send(Stream, Data, Fin, Deadline, Monitor);
         {trevrpc_stream, Ref, closed} ->
             {error, closed, Stream#stream{error = closed}};
         {trevrpc_stream, Ref, {stop_sending, _}} ->
-            {error, stopped, Stream#stream{stopped = true}}
+            {error, stopped, Stream#stream{stopped = true}};
+        {'DOWN', Monitor, process, _, _} ->
+            {error, abandoned, Stream}
     after timeout(Deadline) ->
         {error, timeout, Stream}
     end;
-wait_send_ready(#stream{ref = Ref, router = Router} = Stream, Data, Fin, Deadline) ->
+wait_send_ready(#stream{ref = Ref, router = Router} = Stream, Data, Fin, Deadline, Monitor) ->
     Router ! {trevrpc_send_ready, self(), Ref},
     receive
         {trevrpc_stream, Ref, send_ready} ->
-            send(Stream, Data, Fin, Deadline);
+            send(Stream, Data, Fin, Deadline, Monitor);
         {trevrpc_stream, Ref, closed} ->
             {error, closed, Stream#stream{error = closed}};
         {trevrpc_stream, Ref, {stop_sending, _}} ->
-            {error, stopped, Stream#stream{stopped = true}}
+            {error, stopped, Stream#stream{stopped = true}};
+        {'DOWN', Monitor, process, _, _} ->
+            {error, abandoned, Stream}
     after timeout(Deadline) ->
         {error, timeout, Stream}
     end.
@@ -396,5 +414,9 @@ flush_events(Ref) when is_reference(Ref) ->
     after 0 -> ok
     end.
 
-timeout(infinity) -> infinity;
-timeout(Deadline) -> max(0, Deadline - erlang:monotonic_time(millisecond)).
+%% @doc The milliseconds left until `Deadline', for a `receive ... after'.
+-spec timeout(deadline()) -> timeout().
+timeout(infinity) ->
+    infinity;
+timeout(Deadline) when is_integer(Deadline) ->
+    max(0, Deadline - erlang:monotonic_time(millisecond)).

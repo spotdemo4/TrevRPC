@@ -341,7 +341,7 @@ flow({Flow, Credit}, Kind, Route, Stream) ->
     {_, Responses} = trevrpc_datagram:effective(maps:get(unreliable, Route, #{}), Kind),
     Sender =
         case Responses of
-            true -> trevrpc_datagram:sender(trevrpc_stream:transport(Stream), Flow);
+            true -> trevrpc_datagram_sender:new(Stream, Flow);
             false -> undefined
         end,
     case trevrpc_wire:streams_requests(Kind) of
@@ -463,7 +463,9 @@ finish(Call, Kind, Result, Router, Id) ->
     State = trevrpc_call:state(Call),
     #call_state{trailers = Trailers, max_frame_size = Max, answer = Answer} = State,
     %% A call that sent response datagrams announces them before its STATUS.
-    Count = trevrpc_datagram:count_frame(State#call_state.datagram_sender),
+    Count = trevrpc_datagram_sender:finish(
+        earliest(Call#call.deadline, ?STATUS_TIMEOUT), State#call_state.datagram_sender
+    ),
     Frames =
         case response(Kind, Result, Max) of
             {ok, Message} ->
