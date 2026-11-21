@@ -169,6 +169,9 @@
 -define(STREAM_COMPRESSION_MEMORY, 268435456).
 -define(HTTP_PATH, <<"/trevrpc">>).
 -define(H3, <<"h3">>).
+%% How long a stopping server waits at most for its QUIC connections to
+%% drain before it closes the listener's socket; see close_quic/2.
+-define(QUIC_DRAIN_WAIT, 2000).
 
 %% @doc Starts a server linked to the caller, listening once it returns.
 -spec start_link(options()) -> {ok, pid()} | ignore | {error, term()}.
@@ -703,7 +706,8 @@ terminate(_Reason, State) ->
     ok.
 
 %% Stops new connections, has every connection cancel its calls and close,
-%% and waits for them, then stops the listener.
+%% and waits for them, then for the QUIC connections to drain, and stops
+%% the listener.
 shutdown(#state{counters = Counters, connections = Connections, name = Name} = State) ->
     case counters:get(Counters, ?STOPPING) of
         1 ->
@@ -721,8 +725,33 @@ shutdown(#state{counters = Counters, connections = Connections, name = Name} = S
             Deadline = erlang:monotonic_time(millisecond) + Grace + 5000,
             Left = await_connections(Connections, Deadline),
             _ = [exit(Pid, kill) || Pid <- maps:values(Left)],
+            close_quic(Name, Deadline),
             _ = quic:stop_server(Name),
             State#state{connections = #{}, tcp = undefined}
+    end.
+
+%% Closes every QUIC connection of the listener and waits for them to end,
+%% for up to ?QUIC_DRAIN_WAIT and not past `Deadline'. Stopping the listener
+%% closes its socket, and on OTP's `socket' module the CONNECTION_CLOSE a
+%% connection just wrote may still be queued in the listener's sender
+%% process then, so the peer would only notice at its idle timeout. A
+%% closed connection drains for three probe timeouts before it ends,
+%% answering the peer's packets with its close, and its close has long gone
+%% out by then. That takes a few round trips on a healthy path; one whose
+%% probes went unanswered, as when its peer is gone, backed its timeout off
+%% and drains far longer, and is not waited for. A connection that already
+%% closed takes the close as a duplicate.
+close_quic(Name, Deadline) ->
+    case quic:get_server_connections(Name) of
+        {ok, Conns} ->
+            Monitors = maps:from_list([{monitor(process, Conn), Conn} || Conn <- Conns]),
+            _ = [quic:close(Conn, 0) || Conn <- Conns],
+            Wait = min(Deadline, erlang:monotonic_time(millisecond) + ?QUIC_DRAIN_WAIT),
+            Left = await_connections(Monitors, Wait),
+            _ = [demonitor(Monitor, [flush]) || Monitor <- maps:keys(Left)],
+            ok;
+        {error, _} ->
+            ok
     end.
 
 await_connections(Connections, _Deadline) when map_size(Connections) =:= 0 ->

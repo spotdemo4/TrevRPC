@@ -287,22 +287,39 @@ response_count_test(#{transport := tcp}) ->
     ok.
 
 %% With no idle time, each call's datagram sender stops whenever its queue
-%% runs dry, which on loopback is between most messages, so frames race
-%% the stop and senders start again within one call, on the client and on
-%% the server: more than the two a call starts without stopping, as call
-%% counting shows. Every message still goes at most once, and the call ends
-%% normally.
+%% runs dry, so frames race the stop and senders start again within one
+%% call, on the client and on the server: more than the two a call starts
+%% without stopping, as call counting shows. Every message still goes at
+%% most once, and the call ends normally. Within a group of requests the
+%% queue may run dry between messages or not at all, as fast as the
+%% connection takes them; after each group the test waits for the client's
+%% sender to stop, so the next group starts another.
 restart_test(#{transport := Transport} = Env) ->
     Start = {trevrpc_datagram_sender, start, 2},
+    %% The client's senders start in this process; a collector traces its
+    %% calls and hands it their pids.
+    Collector = start_collector(self()),
     try
         ok = application:set_env(trevrpc, datagram_sender_idle, 0),
         {module, _} = code:ensure_loaded(trevrpc_datagram_sender),
         1 = erlang:trace_pattern(Start, true, [local, call_count]),
+        1 = erlang:trace_pattern(Start, [{'_', [], [{return_trace}]}], [local]),
+        1 = erlang:trace(self(), true, [call, {tracer, Collector}]),
         {ok, Call} = trevrpc_client:bidi(env_channel(Env), ?BIDI, #{unreliable => ?BOTH}),
-        Requests = [integer_to_binary(N) || N <- lists:seq(1, 200)],
-        _ = [ok = trevrpc_client:send(Call, Request) || Request <- Requests],
+        Groups = [
+            [integer_to_binary(N) || N <- lists:seq(First, First + 49)]
+         || First <- lists:seq(1, 200, 50)
+        ],
+        ClientStarts = lists:sum([
+            begin
+                _ = [ok = trevrpc_client:send(Call, Request) || Request <- Group],
+                await_senders_stopped(Collector)
+            end
+         || Group <- Groups
+        ]),
         ok = trevrpc_client:close_send(Call),
         {Responses, Trailers} = drain(Call, []),
+        Requests = lists:append(Groups),
         Received = binary_to_integer(maps:get(<<"x-received">>, Trailers)),
         Datagrams = binary_to_integer(maps:get(<<"x-datagrams">>, Trailers)),
         {call_count, Starts} = erlang:trace_info(Start, call_count),
@@ -312,14 +329,65 @@ restart_test(#{transport := Transport} = Env) ->
                 ?assertEqual([], Responses -- Requests),
                 ?assert(Received >= 1 andalso Received =< 200, Received),
                 ?assert(Datagrams >= 1, Datagrams),
+                ?assert(ClientStarts >= length(Groups), ClientStarts),
                 ?assert(Starts > 2, Starts);
             tcp ->
                 ?assertEqual(Requests, Responses),
-                ?assertEqual({200, 0, 0}, {Received, Datagrams, Starts})
+                ?assertEqual({200, 0, 0, 0}, {Received, Datagrams, Starts, ClientStarts})
         end
     after
-        _ = erlang:trace_pattern(Start, false, [local, call_count]),
+        _ = erlang:trace(self(), false, [call]),
+        %% Both the call count and the return trace above.
+        _ = erlang:trace_pattern(Start, false, [call_count]),
+        _ = erlang:trace_pattern(Start, false, [local]),
+        unlink(Collector),
+        exit(Collector, kill),
         ok = application:unset_env(trevrpc, datagram_sender_idle)
+    end.
+
+%% A tracer of the test process's calls that sends it the pid of each
+%% sender it starts, and answers a sync once it has sent those it has seen.
+start_collector(Test) ->
+    spawn_link(fun() -> collect(Test) end).
+
+collect(Test) ->
+    receive
+        {trace, Test, return_from, {trevrpc_datagram_sender, start, 2}, Pid} ->
+            Test ! {sender_started, self(), Pid},
+            collect(Test);
+        {trace, Test, call, _} ->
+            collect(Test);
+        {sync, Ref} ->
+            Test ! {synced, Ref},
+            collect(Test)
+    end.
+
+%% Waits for every sender this process started since the last wait to stop,
+%% and returns how many it started. Once its trace messages reached the
+%% collector, a sync behind them returns after their pids.
+await_senders_stopped(Collector) ->
+    Delivered = erlang:trace_delivered(self()),
+    receive
+        {trace_delivered, _, Delivered} -> ok
+    end,
+    Ref = make_ref(),
+    Collector ! {sync, Ref},
+    receive
+        {synced, Ref} -> ok
+    end,
+    await_started(Collector, 0).
+
+await_started(Collector, Started) ->
+    receive
+        {sender_started, Collector, Pid} ->
+            Monitor = monitor(process, Pid),
+            receive
+                {'DOWN', Monitor, process, Pid, _} -> ok
+            after 10000 -> error({sender_still_running, Pid})
+            end,
+            await_started(Collector, Started + 1)
+    after 0 ->
+        Started
     end.
 
 %%% Helpers

@@ -5,6 +5,11 @@
 %% the 16 bytes of the largest frame header. The connection's window holds
 %% one frame per concurrent stream, capped at 16 MiB, and never below one
 %% frame, as the Go and Rust runtimes size theirs.
+%%
+%% Connections and listeners run on OTP's `socket' module where it works
+%% (Linux), which lets erlang_quic send batches of packets with GSO and
+%% receive them with GRO. Its default, `gen_udp', sends every packet on its
+%% own, which caps what the one process of a connection can send.
 -module(trevrpc_quic).
 
 -export([
@@ -89,8 +94,9 @@ connection_window(MaxFrameSize, Streams) when is_integer(Streams), Streams > 0 -
 
 %% @doc The transport options of a connection: its receive windows, idle
 %% timeout (with keep-alives at half of it, so a healthy connection stays
-%% open), how many concurrent bidirectional streams the peer may open, and
-%% a congestion controller that leaves recovery after a round trip.
+%% open), how many concurrent bidirectional streams the peer may open, a
+%% congestion controller that leaves recovery after a round trip, and its
+%% UDP socket backend.
 -spec transport_opts(pos_integer(), pos_integer(), pos_integer() | infinity) -> map().
 transport_opts(MaxFrameSize, Streams, IdleTimeout) ->
     StreamWindow = stream_window(MaxFrameSize),
@@ -120,8 +126,14 @@ transport_opts(MaxFrameSize, Streams, IdleTimeout) ->
         %% values above 0, so 1 ms is as close to RFC 9002 as it gets:
         %% recovery then ends a round trip after the loss
         %% (benoitc/erlang_quic#605).
-        min_recovery_duration => ?MIN_RECOVERY_DURATION
+        min_recovery_duration => ?MIN_RECOVERY_DURATION,
+        socket_backend => socket_backend()
     }.
+
+%% `socket' where the platform has it, as erlang_quic detects it: Linux,
+%% where it also has GSO and GRO.
+socket_backend() ->
+    maps:get(backend, quic_socket:detect_capabilities(), gen_udp).
 
 %% @doc The QMux transport parameters of a session receiving on up to
 %% `ReceiveStreams' streams at once, allowing the peer to open `PeerStreams'

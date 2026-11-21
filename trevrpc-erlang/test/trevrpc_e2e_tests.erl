@@ -284,7 +284,8 @@ e2e(Transport) ->
                 {"a stream opened on a replaced connection is opened again",
                     fun stale_stream_test/1},
                 {"callers wait behind queued opens", fun queued_opens_test/1},
-                {"bulk streams in both directions", fun bulk_test/1}
+                {"bulk streams in both directions", fun bulk_test/1},
+                {"QUIC sends in GSO batches", fun gso_test/1}
             ]
         ]
     end}.
@@ -694,6 +695,31 @@ bulk_test(#{channel := Channel}) ->
         end
      || Pid <- Pids
     ].
+
+%% Where the platform has GSO, both ends of a QUIC connection run on OTP's
+%% socket module and send a large message in GSO batches: gen_udp sends
+%% every packet on its own, which caps a connection's throughput.
+gso_test(#{credentials := #{transport := quic}, channel := Channel, server := Server}) ->
+    case quic_socket:detect_capabilities() of
+        #{gso := true} ->
+            {ok, #{transport := {quic, Client}, id := Id, ref := Ref}} =
+                trevrpc_channel:open_stream(Channel, infinity),
+            trevrpc_channel:stream_done(Channel, Id, Ref),
+            %% The server's connections report the GSO batches their listener
+            %% sent.
+            {Name, _Listener} = quic_listener(Server),
+            {ok, [ServerConn | _]} = quic:get_server_connections(Name),
+            Large = binary:copy(<<"g">>, 1048576),
+            ?assertMatch(
+                {ok, Large, _}, trevrpc_client:unary(Channel, ?UNARY, Large, #{timeout => 10000})
+            ),
+            ?assertMatch({ok, #{gso_flushes := N}} when N > 0, quic:get_stats(Client)),
+            ?assertMatch({ok, #{gso_flushes := N}} when N > 0, quic:get_stats(ServerConn));
+        #{} ->
+            ok
+    end;
+gso_test(#{}) ->
+    ok.
 
 %%% Raw requests, for what the client never sends
 
@@ -2196,6 +2222,8 @@ stop_test_() ->
         fun(Credentials) ->
             [
                 {timeout, 30, fun() -> stop_exits(Credentials) end},
+                {timeout, 30, fun() -> stop_closes_connections(Credentials) end},
+                {timeout, 30, fun() -> stop_drains_quic_first(Credentials) end},
                 {timeout, 30, fun() -> exit_signal_stops(Credentials) end},
                 {timeout, 30, fun() -> normal_exit_signal_ignored(Credentials) end},
                 {timeout, 30, fun() -> stale_listener_exit(Credentials) end},
@@ -2210,6 +2238,75 @@ stop_exits(Credentials) ->
     ?assertEqual(ok, trevrpc_server:stop(Server)),
     ?assertEqual(normal, down_reason(Monitor)),
     ?assertExit({noproc, _}, trevrpc_server:port(Server)).
+
+%% Stopping a server closes its QUIC connections before its listener: its
+%% clients learn at once, not at their idle timeout (30 s). Whether a close
+%% would have been lost is a race, which stop_drains_quic_first/1 checks
+%% the order behind.
+stop_closes_connections(Credentials) ->
+    Server = start_server(Credentials, #{graceful_shutdown_timeout => 0}),
+    Channels = [connect(Credentials, Server) || _ <- lists:seq(1, 8)],
+    try
+        _ = [ok = trevrpc_channel:subscribe(Channel) || Channel <- Channels],
+        _ = [await_state(Channel, {ready, 1}) || Channel <- Channels],
+        ok = trevrpc_server:stop(Server),
+        _ = [
+            receive
+                {trevrpc_channel, Channel, connecting} -> ok
+            after 5000 -> error({still_connected, Channel})
+            end
+         || Channel <- Channels
+        ]
+    after
+        _ = [trevrpc_channel:close(Channel) || Channel <- Channels]
+    end.
+
+%% Stopping the listener closes its socket, where a connection's
+%% CONNECTION_CLOSE may still wait in the listener's sender process, so the
+%% server's QUIC connections end, having drained, before it stops the
+%% listener. Trace timestamps, taken as each event happens, give the order.
+stop_drains_quic_first(Credentials) ->
+    Server = start_server(Credentials, #{graceful_shutdown_timeout => 0}),
+    Channels = [connect(Credentials, Server) || _ <- lists:seq(1, 4)],
+    {Name, _Listener} = quic_listener(Server),
+    {ok, Conns} = quic:get_server_connections(Name),
+    Self = self(),
+    Collector = spawn_link(fun() -> collect_traces(Self, []) end),
+    StopServer = {quic, stop_server, 1},
+    try
+        ?assertEqual(4, length(Conns)),
+        1 = erlang:trace_pattern(StopServer, true, [local]),
+        _ = [
+            1 = erlang:trace(Conn, true, [procs, monotonic_timestamp, {tracer, Collector}])
+         || Conn <- Conns
+        ],
+        1 = erlang:trace(Server, true, [call, monotonic_timestamp, {tracer, Collector}]),
+        ok = trevrpc_server:stop(Server),
+        Delivered = erlang:trace_delivered(all),
+        receive
+            {trace_delivered, all, Delivered} -> ok
+        end,
+        Collector ! {done, Self},
+        Traces =
+            receive
+                {traces, Collector, Collected} -> Collected
+            end,
+        [Stopped] = [T || {trace_ts, P, call, {quic, stop_server, _}, T} <- Traces, P =:= Server],
+        Exited = [{P, T} || {trace_ts, P, exit, _, T} <- Traces, lists:member(P, Conns)],
+        ?assertEqual(lists:sort(Conns), lists:sort([P || {P, _} <- Exited])),
+        ?assertEqual([], [P || {P, T} <- Exited, T >= Stopped])
+    after
+        _ = erlang:trace_pattern(StopServer, false, [local]),
+        unlink(Collector),
+        exit(Collector, kill),
+        _ = [trevrpc_channel:close(Channel) || Channel <- Channels]
+    end.
+
+collect_traces(Test, Acc) ->
+    receive
+        {done, Test} -> Test ! {traces, self(), lists:reverse(Acc)};
+        Trace -> collect_traces(Test, [Trace | Acc])
+    end.
 
 %% A server started with start/1 is its own parent: an exit signal that
 %% would end a process not trapping exits ends it, gracefully.
