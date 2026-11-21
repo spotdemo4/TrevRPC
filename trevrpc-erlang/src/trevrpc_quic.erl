@@ -20,6 +20,9 @@
 -define(MAX_FRAME_HEADER, 16).
 %% The largest DATAGRAM frame a connection takes, as quinn advertises.
 -define(MAX_DATAGRAM_FRAME_SIZE, 65535).
+%% The shortest recovery period erlang_quic's congestion controllers take, in
+%% milliseconds; see transport_opts/3.
+-define(MIN_RECOVERY_DURATION, 1).
 
 %% @doc The certificate, chain and key for TLS, from `cert', `cert_chain'
 %% and `key' (DER certificates and a decoded key), or from `certfile' and
@@ -86,7 +89,8 @@ connection_window(MaxFrameSize, Streams) when is_integer(Streams), Streams > 0 -
 
 %% @doc The transport options of a connection: its receive windows, idle
 %% timeout (with keep-alives at half of it, so a healthy connection stays
-%% open), and how many concurrent bidirectional streams the peer may open.
+%% open), how many concurrent bidirectional streams the peer may open, and
+%% a congestion controller that leaves recovery after a round trip.
 -spec transport_opts(pos_integer(), pos_integer(), pos_integer() | infinity) -> map().
 transport_opts(MaxFrameSize, Streams, IdleTimeout) ->
     StreamWindow = stream_window(MaxFrameSize),
@@ -107,7 +111,16 @@ transport_opts(MaxFrameSize, Streams, IdleTimeout) ->
         max_receive_window => ConnectionWindow,
         notify_streams_available => true,
         %% Datagram messages: a DATAGRAM frame of any size the path carries.
-        max_datagram_frame_size => ?MAX_DATAGRAM_FRAME_SIZE
+        max_datagram_frame_size => ?MAX_DATAGRAM_FRAME_SIZE,
+        %% erlang_quic keeps the window from growing for 100 ms after a
+        %% loss, where RFC 9002 leaves recovery once a packet sent after the
+        %% loss is acknowledged. On a 20 ms path that is five round trips,
+        %% and with loss every few round trips the window stays at about
+        %% one burst of paced datagrams, refusing the rest. It takes only
+        %% values above 0, so 1 ms is as close to RFC 9002 as it gets:
+        %% recovery then ends a round trip after the loss
+        %% (benoitc/erlang_quic#605).
+        min_recovery_duration => ?MIN_RECOVERY_DURATION
     }.
 
 %% @doc The QMux transport parameters of a session receiving on up to
