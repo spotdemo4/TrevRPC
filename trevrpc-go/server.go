@@ -254,6 +254,13 @@ type ServerDiagnosticPhase string
 // handler that watches its context does, is not reported.
 // ServerDiagnosticExecutionFinallyExited reports that an execution reported
 // as detached returned.
+// ServerDiagnosticTLSHandshakeFailed reports a TCP connection whose TLS
+// handshake failed. Its Message says how long after the listener accepted the
+// connection the handshake ended and, on Linux, the bytes the connection
+// received and how long ago the last arrived, and the bytes it sent and the
+// client acknowledged. A ClientHello that arrived long before a handshake that
+// ended at once points at a connection that waited to be accepted; a server
+// flight the client acknowledged but never answered, at a stalled client.
 const (
 	ServerDiagnosticHandlerPanic           ServerDiagnosticPhase = "handler_panic"
 	ServerDiagnosticAuthorizerPanic        ServerDiagnosticPhase = "authorizer_panic"

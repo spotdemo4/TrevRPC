@@ -60,8 +60,9 @@ func (l *Listener) listenTCP(addr string, options ListenOptions) (connSource, er
 			if err != nil {
 				return acceptedConn{}, err
 			}
+			accepted := time.Now()
 			return acceptedConn{
-				serve: func() { l.serveTCPConn(conn) },
+				serve: func() { l.serveTCPConn(conn, accepted) },
 				close: func(string) { _ = conn.Close() },
 			}, nil
 		},
@@ -106,10 +107,11 @@ func acceptWithBackoff(ctx context.Context, ln net.Listener) (net.Conn, error) {
 
 // serveTCPConn reads the PROXY header of a connection from a trusted proxy,
 // completes the TLS handshake of one TCP connection and serves it on its
-// negotiated ALPN until it ends.
-func (l *Listener) serveTCPConn(raw net.Conn) {
+// negotiated ALPN until it ends. accepted is when the listener accepted it.
+func (l *Listener) serveTCPConn(raw net.Conn, accepted time.Time) {
 	ctx, cancel := context.WithTimeout(l.ctx, l.handshakeTimeout)
 	defer cancel()
+	socket := raw
 	if trustedProxy(l.trustedTCPProxies, raw.RemoteAddr()) {
 		proxied, err := readProxyHeaderBefore(ctx, raw)
 		if err != nil {
@@ -127,6 +129,7 @@ func (l *Listener) serveTCPConn(raw net.Conn) {
 	if err := conn.HandshakeContext(ctx); err != nil {
 		l.runtime.emitDiagnostic(ServerDiagnostic{
 			Phase:      ServerDiagnosticTLSHandshakeFailed,
+			Message:    handshakeFailureMessage(socket, accepted),
 			Err:        err,
 			RemoteAddr: raw.RemoteAddr().String(),
 		})

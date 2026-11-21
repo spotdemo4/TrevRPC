@@ -10,13 +10,13 @@ require (
 	github.com/quic-go/webtransport-go v0.13.0
 	golang.org/x/crypto v0.59.0
 	golang.org/x/net v0.63.0
+	golang.org/x/sys v0.50.0
 	google.golang.org/protobuf v1.36.12
 )
 
 require (
 	github.com/dunglas/httpsfv v1.1.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 )
 
