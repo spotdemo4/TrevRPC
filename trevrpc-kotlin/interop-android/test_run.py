@@ -96,12 +96,86 @@ class ParseInstrumentationTest(unittest.TestCase):
             outcomes.lines(),
         )
 
+    SKIPPED = SUCCESS.replace("-2", "-4").replace(
+        "java.lang.AssertionError: unary-error: expected NOT_FOUND",
+        "org.junit.AssumptionViolatedException: not in --scenarios",
+    )
+
+    def test_skips_pass_only_with_may_skip(self) -> None:
+        outcomes = run.parse_instrumentation(self.SKIPPED)
+        outcomes.listed = ["unary", "bidi"]
+
+        self.assertFalse(outcomes.passed)
+        self.assertEqual(
+            [
+                "ok unary",
+                "skip unary-error: not in --scenarios",
+                "ok bidi",
+                "fail skips: 1 scenarios skipped, without --may-skip",
+            ],
+            outcomes.lines(),
+        )
+        outcomes.may_skip = True
+        self.assertTrue(outcomes.passed)
+        self.assertEqual(
+            ["ok unary", "skip unary-error: not in --scenarios", "ok bidi"], outcomes.lines()
+        )
+
+    def test_may_skip_does_not_pass_failures(self) -> None:
+        outcomes = run.parse_instrumentation(SUCCESS)
+        outcomes.may_skip, outcomes.listed = True, ["unary", "bidi"]
+
+        self.assertFalse(outcomes.passed)
+
+    def test_a_scenario_the_server_supports_may_not_be_skipped(self) -> None:
+        for listed in (["unary", "unary-error", "bidi"], None):
+            with self.subTest(listed=listed):
+                outcomes = run.parse_instrumentation(self.SKIPPED)
+                outcomes.may_skip, outcomes.listed = True, listed
+
+                self.assertFalse(outcomes.passed)
+                self.assertIn(
+                    "fail unary-error: skipped, but the server supports it (not in --scenarios)",
+                    outcomes.lines(),
+                )
+
+    def test_a_run_that_skipped_every_scenario_fails(self) -> None:
+        text = textwrap.dedent(
+            """\
+            INSTRUMENTATION_STATUS: test=scenario[validation]
+            INSTRUMENTATION_STATUS_CODE: 1
+            INSTRUMENTATION_STATUS: stack=org.junit.AssumptionViolatedException: not in --scenarios
+            INSTRUMENTATION_STATUS: test=scenario[validation]
+            INSTRUMENTATION_STATUS_CODE: -4
+            INSTRUMENTATION_CODE: -1
+            """
+        )
+        outcomes = run.parse_instrumentation(text)
+        outcomes.may_skip, outcomes.listed = True, ["unary"]
+
+        self.assertFalse(outcomes.passed)
+        self.assertEqual(
+            ["skip validation: not in --scenarios", "fail scenarios: every scenario was skipped"],
+            outcomes.lines(),
+        )
+
     def test_truncated_output_is_a_failure(self) -> None:
         outcomes = run.parse_instrumentation(
             "INSTRUMENTATION_STATUS: test=scenario[unary]\nINSTRUMENTATION_STATUS_CODE: 0\n"
         )
 
         self.assertFalse(outcomes.passed)
+
+
+class InstrumentationArgumentsTest(unittest.TestCase):
+    def test_passes_the_scenarios_a_server_lists(self) -> None:
+        server = ["-e", "host", run.EMULATOR_HOST, "-e", "port", "4433", "-e", "transport", "http3"]
+
+        self.assertEqual(server, run.instrumentation_arguments(4433, "http3", None))
+        self.assertEqual(
+            [*server, "-e", "scenarios", "unary,bidi"],
+            run.instrumentation_arguments(4433, "http3", ["unary", "bidi"]),
+        )
 
 
 def fake_server(root: Path, ports: str) -> list[str]:
@@ -134,6 +208,19 @@ class StartServerTest(unittest.TestCase):
                 + f" --dictionary {dictionary}",
                 server.log.read_text(encoding="utf-8").strip(),
             )
+
+    def test_reads_the_scenarios_a_server_lists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = fake_server(root, '{"http3":4434,"http2":4436,"scenarios":["unary"]}')
+            certificates = run.Certificates(
+                root / "ca.pem", root / "server.pem", root / "server.key"
+            )
+
+            server = run.start_server(command, certificates, "0.0.0.0", root / "interop.dict", root)
+            _ = server.stop()
+
+            self.assertEqual(["unary"], server.scenarios)
 
     def test_requires_a_port_for_every_transport(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

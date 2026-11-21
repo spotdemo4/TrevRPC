@@ -77,3 +77,38 @@ jobs:
           name: ${{ env.CELL }}
           path: ${{ runner.temp }}/${{ env.CELL }}
           if-no-files-found: ignore
+
+  android-to-erlang:
+    # zizmor: ignore[excessive-permissions]
+    # Runs after the rust job, pass or fail, for the same reason as that job.
+    needs: android-to-rust
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    env:
+      CELL: android-to-erlang
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@de735751eb768b127a25bde1a8b776e3d3b0ec70 # v1.82.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          shell: android
+
+      - name: Run Android interop
+        # Forgejo takes a local path here, not GitHub's `$/` syntax.
+        uses: ./.forgejo/actions/android-interop # zizmor: ignore[self-repository]
+        with:
+          server: erlang
+          # The Erlang runtime does not validate requests yet (#641): the scenarios it does not
+          # support are skipped, as in the packaged matrix.
+          may-skip: "true"
+          output: ${{ runner.temp }}/${{ env.CELL }}
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: https://data.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: ${{ env.CELL }}
+          path: ${{ runner.temp }}/${{ env.CELL }}
+          if-no-files-found: ignore

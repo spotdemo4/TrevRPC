@@ -3,8 +3,12 @@ description: Runs the Android interop scenarios against one server, over HTTP/3 
 
 inputs:
   server:
-    description: The interop server to run the scenarios against (go or rust)
+    description: The interop server to run the scenarios against (go, rust or erlang)
     required: true
+  may-skip:
+    description: Whether the scenarios the server does not support may be skipped (a partial runtime)
+    required: false
+    default: "false"
   output:
     description: The directory for logs and diagnostics, with one subdirectory per transport
     required: true
@@ -18,15 +22,21 @@ runs:
       shell: bash
       env:
         SERVER: ${{ inputs.server }}
+        MAY_SKIP: ${{ inputs.may-skip }}
         OUTPUT: ${{ inputs.output }}
         WORK_DIR: ${{ runner.temp }}/android-work
       run: |
+        skip=()
+        if [ "$MAY_SKIP" = true ]; then
+          skip=(--may-skip)
+        fi
         status=0
         for transport in http3 http2; do
           trevrpc-interop-android \
             --server-command "trevrpc-interop-$SERVER" \
             --transport "$transport" \
             --output "$OUTPUT/$transport" \
-            --work-dir "$WORK_DIR/$transport" || status=1
+            --work-dir "$WORK_DIR/$transport" \
+            "${skip[@]}" || status=1
         done
         exit "$status"

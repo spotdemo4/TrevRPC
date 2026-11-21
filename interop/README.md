@@ -11,15 +11,16 @@ client also has a TCP fallback for networks that block UDP.
 | Erlang                   | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
 | JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
 | JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
-| Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust         |
+| Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust, Erlang |
 | JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
 
 The Erlang runtime ([#477](https://trev.zip/llc/TrevRPC/issues/477)) serves native QUIC, QMux
 over TLS, WebTransport, QMux over WebSocket and the HTTP mapping over HTTP/3 and HTTP/2, and calls
 native QUIC and QMux over TLS, so far. It takes part in what it implements; see
 [Partial runtimes](#partial-runtimes). Browsers reach it over every lane, the app lanes'
-page coming from its HTTP fallback. The Android client, which runs every scenario, is not run
-against it yet: it does not validate requests (`validation`, [#641](https://trev.zip/llc/TrevRPC/issues/641)).
+page coming from its HTTP fallback, and the Android client over HTTP/3 and HTTP/2. Its server does
+not validate requests yet (`validation`, [#641](https://trev.zip/llc/TrevRPC/issues/641)), so
+clients skip that scenario.
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
 packaged Go, Rust and Erlang servers and clients and, on Linux, Chromium and Firefox,
@@ -53,9 +54,12 @@ what it does, and what it skips is reported, never counted as passed:
 Only the cells of runtimes named with `--may-skip` (a client, browser or server
 name) may skip; a skipped cell or scenario anywhere else fails the run, so a
 regression in a complete runtime cannot pass as a skip. The packaged matrix and
-the `safari` workflow pass `--may-skip erlang`. Every run that skipped anything ends with a summary
-of the skipped cells and of the passing cells that skipped scenarios, and says
-which runtimes those skips were allowed for instead of that every cell passed.
+the `safari` workflow pass `--may-skip erlang`, and the `android` workflow runs
+the Android runner against Erlang with `--may-skip`, which lets it skip only the
+scenarios the server leaves out of its readiness line. Every run that skipped
+anything ends with a summary of the skipped cells and of the passing cells that
+skipped scenarios, and says which runtimes those skips were allowed for instead
+of that every cell passed.
 
 ## Cells
 
@@ -343,7 +347,11 @@ Safari neither.
 `http2` runs with Cronet's QUIC disabled, so the scenarios use the server's
 HTTP/2 mapping on its TCP port. Over either, the server holds the interop
 dictionary, which the runner reads from the test APK's golden vectors, and the
-instrumented test compresses with it.
+instrumented test compresses with it. A server that lists its scenarios has the
+instrumented test skip the others (`-e scenarios`), each printed as
+`skip <name>: <reason>`. Skips fail the run unless `--may-skip` is given, and
+even then a skip of a scenario the server lists, or a run in which every
+scenario was skipped, fails.
 
 ### Certificates
 

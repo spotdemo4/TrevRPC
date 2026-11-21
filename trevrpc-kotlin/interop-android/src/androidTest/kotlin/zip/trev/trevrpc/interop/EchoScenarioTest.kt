@@ -12,6 +12,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.chromium.net.CronetEngine
 import org.junit.AfterClass
+import org.junit.Assume.assumeTrue
 import org.junit.BeforeClass
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -43,7 +44,9 @@ import kotlin.time.Duration.Companion.seconds
 /**
  * Runs the scenarios from interop/README.md against the host's interop server over ordinary
  * HTTP/3. Each scenario is one test case named `scenario[<name>]`, which the runner reports as
- * `ok <name>` or `fail <name>: <reason>`.
+ * `ok <name>` or `fail <name>: <reason>`. With the `scenarios` argument, the comma-separated
+ * scenarios a server supports, the others are skipped as failed assumptions, which the runner
+ * reports as `skip <name>: <reason>`.
  */
 @RunWith(Parameterized::class)
 class EchoScenarioTest(
@@ -51,6 +54,8 @@ class EchoScenarioTest(
 ) {
     @Test(timeout = 60_000)
     fun scenario() {
+        val listed = InstrumentationRegistry.getArguments().getString("scenarios")?.split(',')
+        assumeTrue("not in --scenarios", listed == null || name in listed)
         val body = checkNotNull(SCENARIOS[name]) { "unknown scenario $name" }
         val options = CallOptions(timeout = 10.seconds)
         runBlocking {

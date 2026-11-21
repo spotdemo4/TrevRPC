@@ -6,6 +6,10 @@ interop server on the host (see interop/README.md), boots an emulator that trust
 runs the instrumented test, and prints one `ok <name>` or `fail <name>: <reason>` line per
 scenario. It exits 0 only if every scenario passed. With `--transport http2` Cronet's QUIC is
 disabled, as when a network blocks UDP, and the scenarios run over the server's TCP listener.
+
+A server that supports only some scenarios lists them in its readiness line, as for `run.py`: the
+others are skipped, each reported as `skip <name>: <reason>`. Skips fail the run unless
+`--may-skip` says the server is a runtime that may skip, as `run.py --may-skip` does.
 """
 
 from __future__ import annotations
@@ -539,35 +543,63 @@ class Emulator:
 _STATUS = re.compile(r"^INSTRUMENTATION_STATUS: ([^=]+)=(.*)$")
 _CODE = re.compile(r"^INSTRUMENTATION_STATUS_CODE: (-?\d+)$")
 _SCENARIO = re.compile(r"\[(.+)\]$")
-_STARTED, _OK = (
-    1,
-    0,
-)  # other codes are failures: -1 error, -2 failure, -3 ignored, -4 assumption
+# Status codes of a finished test case; the others are failures: -1 error, -2 failure, -3 ignored.
+_STARTED, _OK, _ASSUMPTION = 1, 0, -4
+# How the instrumented test skips a scenario its server does not list: a failed assumption.
+_ASSUMPTION_FAILURE = "org.junit.AssumptionViolatedException: "
 
 
 @dataclass
 class Outcomes:
-    """Scenario outcomes in execution order. A reason of None means the scenario passed."""
+    """Scenario outcomes in execution order. A reason of None means the scenario passed; a
+    skipped scenario has the reason it was skipped.
+
+    Only a scenario the server leaves out of `listed`, the scenarios its readiness line lists, may
+    be skipped, and only with `may_skip`: a server that lists none supports every scenario, so it
+    skips none. A run passes once a scenario passed and every other was skipped that way."""
 
     scenarios: dict[str, str | None] = field(default_factory=dict[str, str | None])
+    skipped: set[str] = field(default_factory=set[str])
     problems: list[str] = field(default_factory=list[str])
     started: set[str] = field(default_factory=set[str])
+    may_skip: bool = False
+    listed: list[str] | None = None
+
+    def _allowed_skip(self, name: str) -> bool:
+        return name in self.skipped and self.listed is not None and name not in self.listed
 
     @property
     def passed(self) -> bool:
         return (
-            bool(self.scenarios)
-            and not self.problems
-            and all(reason is None for reason in self.scenarios.values())
+            not self.problems
+            and not self._refused_skips()
+            and any(reason is None for reason in self.scenarios.values())
+            and all(
+                reason is None or self._allowed_skip(name)
+                for name, reason in self.scenarios.items()
+            )
         )
 
+    def _refused_skips(self) -> bool:
+        return not self.may_skip and any(self._allowed_skip(name) for name in self.skipped)
+
     def lines(self) -> list[str]:
-        lines = [
-            f"ok {name}" if reason is None else f"fail {name}: {reason}"
-            for name, reason in self.scenarios.items()
-        ]
+        lines = [self._line(name, reason) for name, reason in self.scenarios.items()]
         lines += [f"fail instrumentation: {problem}" for problem in self.problems]
+        if self.scenarios and all(name in self.skipped for name in self.scenarios):
+            lines.append("fail scenarios: every scenario was skipped")
+        if self._refused_skips():
+            lines.append(f"fail skips: {len(self.skipped)} scenarios skipped, without --may-skip")
         return lines
+
+    def _line(self, name: str, reason: str | None) -> str:
+        if reason is None:
+            return f"ok {name}"
+        if self._allowed_skip(name):
+            return f"skip {name}: {reason}"
+        if name in self.skipped:
+            return f"fail {name}: skipped, but the server supports it ({reason})"
+        return f"fail {name}: {reason}"
 
 
 def parse_instrumentation(text: str) -> Outcomes:
@@ -613,17 +645,30 @@ def _finish_block(outcomes: Outcomes, block: dict[str, str], code: int) -> None:
     outcomes.started.discard(name)
     if code == _OK:
         outcomes.scenarios[name] = None
-    else:
-        stack = [line.strip() for line in block.get("stack", "").splitlines() if line.strip()]
-        outcomes.scenarios[name] = (
-            stack[0] if stack else f"test failed with instrumentation status {code}"
-        )
+        return
+    stack = [line.strip() for line in block.get("stack", "").splitlines() if line.strip()]
+    reason = stack[0] if stack else f"test failed with instrumentation status {code}"
+    if code == _ASSUMPTION:
+        outcomes.skipped.add(name)
+        reason = reason.removeprefix(_ASSUMPTION_FAILURE)
+    outcomes.scenarios[name] = reason
 
 
-def run_instrumentation(emulator: Emulator, port: int, transport: str, output: Path) -> Outcomes:
+def instrumentation_arguments(port: int, transport: str, scenarios: list[str] | None) -> list[str]:
+    """The `am instrument -e` arguments of the instrumented test: the server's address and
+    transport, and the scenarios it supports, when it lists them."""
+    arguments = ["-e", "host", EMULATOR_HOST, "-e", "port", str(port), "-e", "transport", transport]
+    if scenarios is not None:
+        arguments += ["-e", "scenarios", ",".join(scenarios)]
+    return arguments
+
+
+def run_instrumentation(
+    emulator: Emulator, port: int, transport: str, scenarios: list[str] | None, output: Path
+) -> Outcomes:
     command = emulator.adb_command(
         "shell", "am", "instrument", "-w", "-r",
-        "-e", "host", EMULATOR_HOST, "-e", "port", str(port), "-e", "transport", transport,
+        *instrumentation_arguments(port, transport, scenarios),
         f"{TEST_PACKAGE}/{TEST_RUNNER}",
     )  # fmt: skip
     try:
@@ -671,6 +716,7 @@ class Options:
     server_host: str
     system_image: str
     transport: str
+    may_skip: bool
 
 
 def parse_args(argv: list[str]) -> Options:
@@ -702,6 +748,11 @@ def parse_args(argv: list[str]) -> Options:
         default="http3",
         help="http3, or http2 with Cronet's QUIC disabled",
     )
+    _ = parser.add_argument(
+        "--may-skip",
+        action="store_true",
+        help="let the scenarios the server does not list be skipped, for a partial runtime",
+    )
     args = parser.parse_args(argv)
     return Options(
         server_command=cast(list[str], args.server_command),
@@ -712,6 +763,7 @@ def parse_args(argv: list[str]) -> Options:
         server_host=cast(str, args.server_host),
         system_image=cast(str, args.system_image),
         transport=cast(str, args.transport),
+        may_skip=cast(bool, args.may_skip),
     )
 
 
@@ -747,8 +799,9 @@ def execute(args: Options) -> Outcomes:
         _ = emulator.adb("install", "-r", str(args.test_apk), timeout=90)
         _ = emulator.adb("logcat", "-c")
         outcomes = run_instrumentation(
-            emulator, server.port(args.transport), args.transport, args.output
+            emulator, server.port(args.transport), args.transport, server.scenarios, args.output
         )
+        outcomes.may_skip, outcomes.listed = args.may_skip, server.scenarios
         if (problem := server.stop()) is not None:
             outcomes.problems.append(problem)
         return outcomes

@@ -128,11 +128,12 @@
             ];
           };
 
-          # The Android interop harness and both servers, for the android workflow. The shell is
+          # The Android interop harness and every server, for the android workflow. The shell is
           # only offered where the harness builds.
           android = pkgs.mkShell {
             packages = with self.packages.${system}; [
               trevrpc-kotlin.interopAndroid
+              trevrpc-erlang-interop
               trevrpc-go-interop
               trevrpc-rust
             ];
