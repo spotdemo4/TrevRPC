@@ -518,7 +518,7 @@ connect(Id, Target, Headers, #state{config = #{webtransport := WebTransport}} = 
     end.
 
 %% Starts the session's connection process, then the session, which tells
-%% that process it started. erlang-webtransport 0.5.11 answers the CONNECT,
+%% that process it started. erlang-webtransport 0.5.13 answers the CONNECT,
 %% refusals included: `webtransport:accept/4' returns an error only after it
 %% refused or reset the request, and `{ok, Session}' once the session's
 %% `init/3' ran and the `200' went out. A session that ends later takes

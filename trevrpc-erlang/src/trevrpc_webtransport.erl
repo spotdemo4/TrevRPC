@@ -12,7 +12,7 @@
 %%
 %% == Flow control ==
 %%
-%% erlang-webtransport 0.5.11 returns a stream's receive credit when the
+%% erlang-webtransport 0.5.13 returns a stream's receive credit when the
 %% handler's callback returns, and every stream of the session shares the
 %% session's process. So the callback blocks while its stream holds more
 %% than a stream window of bytes its call has not read (`consume/3'), or
@@ -300,7 +300,7 @@ handle_info(_Message, State) ->
 
 %% A write the session refused for its full send queue waits for the
 %% retry, at the head of its stream's queue; its writer was told already.
-%% Any other failure means the stream is gone. erlang-webtransport 0.5.11
+%% Any other failure means the stream is gone. erlang-webtransport 0.5.13
 %% runs a callback's actions as soon as the callback returns, calling this
 %% for each that fails, before it handles another message: no later write
 %% of the stream can go out ahead of the refused one.

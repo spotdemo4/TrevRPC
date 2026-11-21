@@ -1,6 +1,6 @@
 %% WebTransport over HTTP/3, against erlang-webtransport's client standing
 %% in for a browser: sessions, their refusals, and calls on them, among
-%% them those that 0.5.11's credit model could stall or deadlock (see
+%% them those that 0.5.13's credit model could stall or deadlock (see
 %% trevrpc_webtransport).
 -module(trevrpc_webtransport_tests).
 
