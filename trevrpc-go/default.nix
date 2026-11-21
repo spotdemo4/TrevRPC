@@ -10,7 +10,7 @@
 }:
 callPackage ./module.nix { } rec {
   pname = "trevrpc-go";
-  version = "1.11.1";
+  version = "1.12.0";
 
   directory = ./.;
   # The module itself plus the shared files its tests read: the wire, QMux and

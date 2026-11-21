@@ -18,7 +18,7 @@ let
 in
 (buildRebar3 (final: {
   name = "trevrpc";
-  version = "1.11.1";
+  version = "1.12.0";
 
   # The application plus the golden vectors its tests read. rebar3 leaves the Gleam binding's
   # sources alone; gleam.nix builds and tests them.

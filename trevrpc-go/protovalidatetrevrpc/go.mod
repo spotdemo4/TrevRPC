@@ -6,7 +6,7 @@ require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2
 	buf.build/go/protovalidate v1.4.1
 	google.golang.org/protobuf v1.36.12
-	trev.zip/llc/trevrpc/trevrpc-go v1.11.1
+	trev.zip/llc/trevrpc/trevrpc-go v1.12.0
 )
 
 require (

@@ -8,7 +8,7 @@
 }:
 callPackage ../../module.nix { } {
   pname = "trevrpc-go-interop";
-  version = "1.11.1";
+  version = "1.12.0";
 
   directory = ./.;
   # The module plus the TrevRPC and protovalidate modules its go.mod replaces

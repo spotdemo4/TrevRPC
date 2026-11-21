@@ -10,7 +10,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
 	google.golang.org/protobuf v1.36.12
-	trev.zip/llc/trevrpc/trevrpc-go v1.11.1
+	trev.zip/llc/trevrpc/trevrpc-go v1.12.0
 )
 
 require (

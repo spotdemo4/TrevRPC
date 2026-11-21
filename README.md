@@ -27,7 +27,7 @@ messages as QUIC datagrams.
 
 > [!NOTE]
 > Every TrevRPC package shares one version, and packages of the same version are compatible with each other:
-> `trevrpc-rust` 1.11.1 works with `trevrpc-go` 1.11.1, `trevrpc-js` 1.11.1, and `trevrpc-kotlin` 1.11.1. Compatibility
+> `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, and `trevrpc-kotlin` 1.12.0. Compatibility
 > across different versions isn't guaranteed yet; that's a milestone for 2.0. TrevRPC speaks its own protocol and is
 > not wire-compatible with gRPC, gRPC-Web, or Connect. See [current limitations](https://trev.zip/llc/TrevRPC/wiki/Current-Limitations).
 

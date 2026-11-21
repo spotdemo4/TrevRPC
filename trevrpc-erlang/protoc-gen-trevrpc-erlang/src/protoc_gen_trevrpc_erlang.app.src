@@ -1,6 +1,6 @@
 {application, protoc_gen_trevrpc_erlang, [
     {description, "protoc plugin generating Erlang code for TrevRPC services"},
-    {vsn, "1.11.1"},
+    {vsn, "1.12.0"},
     {registered, []},
     {applications, [kernel, stdlib, gpb]},
     {licenses, ["MIT"]},

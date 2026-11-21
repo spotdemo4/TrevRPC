@@ -12,7 +12,7 @@ let
 in
 stdenv.mkDerivation (final: {
   pname = "protoc-gen-trevrpc-erlang";
-  version = "1.11.1";
+  version = "1.12.0";
 
   # The plugin plus trevrpc/options.proto, which its tests' protos import.
   src = lib.fileset.toSource {
