@@ -51,11 +51,13 @@ import java.net.URLStreamHandlerFactory
 import java.nio.ByteBuffer
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.Continuation
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.coroutines.startCoroutine
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -787,35 +789,43 @@ class Http3RpcTransportTest {
             assertEquals(Code.UNAVAILABLE, outcome.status.code)
         }
 
+    /**
+     * A local close races Cronet's terminal callback. Whichever settles the call, the call settles
+     * once, the lease is released and the native stream is canceled at most once. The callback asks
+     * for the cancel before it marks the stream terminal, so when the callback settles the call, the
+     * cancel always goes out. When the close settles it, the callback can still mark the stream
+     * terminal before the close asks for the cancel, and then there is nothing left to cancel.
+     */
     @Test
     fun `close and terminal callbacks race to exactly one completion`() =
         runTest {
-            val fake = FakeFactory()
-            val stream =
-                openStreaming(
-                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
-                    fake,
-                )
-            val race = CyclicBarrier(3)
-            val localClose =
-                async(Dispatchers.Default) {
-                    race.await(5, TimeUnit.SECONDS)
-                    stream.close(TrevRpcException(Status.cancelled("local close")))
-                }
-            val terminalCallback =
-                async(Dispatchers.Default) {
-                    race.await(5, TimeUnit.SECONDS)
-                    fake.cancelCallback()
-                }
-            race.await(5, TimeUnit.SECONDS)
-            localClose.await()
-            terminalCallback.await()
+            RaceThreads(2).use { threads ->
+                repeat(500) { round ->
+                    val fake = FakeFactory()
+                    // Close in real time: it waits for a cancel handed to a detached worker.
+                    val transport =
+                        Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = Dispatchers.Default)
+                    val stream = openStreaming(transport, fake)
+                    val cause = TrevRpcException(Status.cancelled("local close"))
+                    threads.round(
+                        // Close never suspends here; runBlocking would start it far behind the callback.
+                        { suspend { stream.close(cause) }.startCoroutine(Continuation(EmptyCoroutineContext) { it.getOrThrow() }) },
+                        { fake.cancelCallback() },
+                    )
+                    stream.close()
+                    fake.fail(IllegalStateException("late failure"))
+                    val outcome = assertInstanceOf(TrevRpcException::class.java, stream.receiveFailure())
+                    assertEquals(0, transport.activeExchangeCount, "round $round: the lease was not released")
+                    // Close returns once every provider call, the cancel included, has finished.
+                    transport.close()
 
-            stream.close()
-            fake.fail(IllegalStateException("late failure"))
-            assertTrue(fake.awaitCancel())
-            assertEquals(1, fake.cancelCalls)
-            assertInstanceOf(TrevRpcException::class.java, stream.receiveFailure())
+                    when (outcome.status.code) {
+                        Code.UNAVAILABLE -> assertEquals(1, fake.cancelCalls, "round $round: callback settled")
+                        Code.CANCELLED -> assertTrue(fake.cancelCalls <= 1, "round $round: close settled, ${fake.cancelCalls} cancels")
+                        else -> throw AssertionError("round $round: unexpected outcome $outcome")
+                    }
+                }
+            }
         }
 
     @Test
