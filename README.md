@@ -6,11 +6,13 @@
 [![safari](https://trev.zip/llc/TrevRPC/actions/workflows/safari.yaml/badge.svg?branch=main&logo=safari&logoColor=%23bac2de&label=safari&labelColor=%23313244)](https://trev.zip/llc/TrevRPC/actions?workflow=safari.yaml)
 [![nixpkgs](https://nix-shield.trev.zip/?url=https://trev.zip/llc/TrevRPC/raw/branch/main/flake.lock&input=nixpkgs&logoColor=%23bac2de&labelColor=%23313244&color=%235277C3)](https://nixos.org/)
 
+[![erlang](<https://shields.trev.zip/badge/dynamic/regex?url=https://trev.zip/llc/TrevRPC/raw/branch/main/trevrpc-erlang/rebar.config&search=minimum_otp_vsn,%20%22(.*)%22&replace=%3E%3D%241&logo=erlang&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%23A90533>)](https://www.erlang.org/downloads)
 [![go](<https://shields.trev.zip/badge/dynamic/regex?url=https://trev.zip/llc/TrevRPC/raw/branch/main/trevrpc-go/go.mod&search=go%20(.*)&replace=%3E%3D%241&logo=go&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%2300ADD8>)](https://go.dev/doc/devel/release)
 [![javascript](https://shields.trev.zip/badge/dynamic/json?url=https://trev.zip/llc/TrevRPC/raw/branch/main/trevrpc-js/package.json&query=%24.engines.node&logo=javascript&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%23F7DF1E)](https://nodejs.org/en/about/previous-releases)
 [![kotlin](https://shields.trev.zip/badge/dynamic/toml?url=https%3A%2F%2Ftrev.zip%2Fllc%2FTrevRPC%2Fraw%2Fbranch%2Fmain%2Ftrevrpc-kotlin%2Fgradle%2Flibs.versions.toml&query=%24.versions.minimum-kotlin&prefix=%3E%3D&logo=kotlin&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%237F52FF)](https://kotlinlang.org/docs/releases.html)
 [![rust](https://shields.trev.zip/badge/dynamic/toml?url=https%3A%2F%2Ftrev.zip%2Fllc%2FTrevRPC%2Fraw%2Fbranch%2Fmain%2Ftrevrpc-rust%2FCargo.toml&query=%24.package.rust-version&prefix=%3E%3D&logo=rust&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%23D34516)](https://releases.rs/)
 
+[![hex.pm](https://shields.trev.zip/hexpm/v/trevrpc?logo=erlang&logoColor=%23bac2de&labelColor=%23313244&color=%23A90533)](https://hex.pm/packages/trevrpc)
 [![pkg.go.dev](https://shields.trev.zip/badge/dynamic/json?url=https%3A%2F%2Fpkg.go.dev%2Fv1beta%2Fpackage%2Ftrev.zip%2Fllc%2Ftrevrpc%2Ftrevrpc-go&query=%24.version&logo=go&logoColor=%23bac2de&label=pkg.go.dev&labelColor=%23313244&color=%2300ADD8)](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go)
 [![npm](https://shields.trev.zip/npm/v/%40trevrpc%2Ftrevrpc-js?logo=npm&logoColor=%23bac2de&labelColor=%23313244&color=%23F7DF1E)](https://www.npmjs.com/package/@trevrpc/trevrpc-js)
 [![maven-central](https://shields.trev.zip/maven-central/v/zip.trev.trevrpc/core?strategy=highestVersion&logo=apachemaven&logoColor=%23bac2de&labelColor=%23313244&color=%237F52FF)](https://central.sonatype.com/search?namespace=zip.trev.trevrpc)
@@ -307,7 +309,13 @@ dependencies {
 
 ### erlang
 
-the Erlang runtime is in progress and not published yet ([#477](https://trev.zip/llc/TrevRPC/issues/477)).
+the Erlang runtime is in progress ([#477](https://trev.zip/llc/TrevRPC/issues/477)). Add the `trevrpc` Hex package to
+`rebar.config`:
+
+```erlang
+{deps, [trevrpc]}.
+```
+
 `protoc-gen-trevrpc-erlang` generates [gpb](https://github.com/tomas-abrahamsson/gpb) message modules and
 service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
 `trevrpc-erlang/protoc-gen-trevrpc-erlang/`. See [`trevrpc-erlang`](trevrpc-erlang#code-generation).
@@ -315,7 +323,13 @@ service modules; it is available from [nix](#nix), or from a checkout with `reba
 ### gleam
 
 the typed [Gleam binding](trevrpc-erlang#gleam) to the Erlang runtime is in progress too, in the same `trevrpc`
-package as the runtime. `protoc-gen-trevrpc-gleam` generates Gleam types for messages, which gpb encodes and
+package as the runtime:
+
+```sh
+gleam add trevrpc
+```
+
+`protoc-gen-trevrpc-gleam` generates Gleam types for messages, which gpb encodes and
 decodes, and service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
 `trevrpc-erlang/protoc-gen-trevrpc-gleam/`. See [`trevrpc-erlang`](trevrpc-erlang#gleam-code-generation).
 

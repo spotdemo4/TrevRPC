@@ -2,7 +2,7 @@
 
 The Erlang runtime for TrevRPC, with its typed [Gleam binding](#gleam): one Hex package, `trevrpc`, for Erlang, Gleam and Elixir projects. `gleam publish` builds it, shipping the runtime's Erlang modules, the binding's Gleam sources and the Erlang Gleam compiles them to, so rebar3 and mix build it without Gleam. Erlang projects get the binding's modules (`trevrpc@*`, `trevrpc_gleam_ffi`) and its one dependency, `gleam_stdlib`, too, which the runtime's own modules do not use.
 
-> **Status:** early work in progress, not published. Progress is tracked in [#477](https://trev.zip/llc/TrevRPC/issues/477).
+> **Status:** early work in progress. Progress is tracked in [#477](https://trev.zip/llc/TrevRPC/issues/477).
 
 ## Transports
 
