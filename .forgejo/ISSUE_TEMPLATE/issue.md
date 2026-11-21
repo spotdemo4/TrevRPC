@@ -31,6 +31,10 @@ A JS change that also changes the typings (e.g. a new client option) gets
 both `javascript` and `typescript`. These match .forgejo/labeler.yaml, which
 labels pull requests the same way. `dep` is reserved for Renovate. If you can't set labels, name the affected areas in
 the issue and a maintainer will add them.
+
+Also add `upstream` when the fix belongs in a dependency (e.g. quic-go, quinn,
+h3, qmux, erlang_quic) rather than in TrevRPC, and link the upstream issue or
+PR. Keep the implementation labels for the code that is affected.
 -->
 
 ## What happens
