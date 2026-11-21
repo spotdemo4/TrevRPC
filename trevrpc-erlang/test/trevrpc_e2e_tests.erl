@@ -2874,8 +2874,31 @@ with_settling_attempt(Credentials, End) ->
 
 %% A channel whose pool grows to two connections, only for crowded streams:
 %% its call rate is one no test reaches, and two streaming calls crowd a
-%% connection whose round trip is under 20 ms.
+%% connection whose round trip is under 20 ms. Its connection's round trip
+%% is pinned at 0, as an idle loopback measures it: under load erlang_quic
+%% measures far more (238 ms in #636), which leaves the connection
+%% uncrowded. The connections the pool adds take that round trip when they
+%% join.
 growth_channel(Credentials, Server, Opts) ->
+    Channel = measured_growth_channel(Credentials, Server, Opts),
+    pin_round_trip(Channel),
+    Channel.
+
+%% Stops the channel measuring its connections, then sets its own
+%% connection's round trip to 0. A measure under way when it stops is
+%% ignored when it ends, as its reference is not the channel's. The channel
+%% does not measure again in a later generation either, so a test that
+%% loses the generation's own connection cannot wait for the next one to be
+%% ready.
+pin_round_trip(Channel) ->
+    #{sampling := SamplingField, counters := CountersField} = channel_fields(),
+    _ = sys:replace_state(Channel, fun(State) ->
+        setelement(SamplingField, State, {make_ref(), self(), make_ref()})
+    end),
+    ok = trevrpc_quic_pool:set_rtt(element(CountersField, sys:get_state(Channel)), 1, 0).
+
+%% A growth_channel/3 that measures its connections' round trips.
+measured_growth_channel(Credentials, Server, Opts) ->
     {ok, Channel} = trevrpc_channel:start(
         maps:merge(
             (ports(Server))#{
@@ -3059,7 +3082,7 @@ held_opens_fail_with_their_generation(Credentials) ->
 %% after its timeout.
 unanswered_measures_are_given_up(Credentials) ->
     Server = start_server(Credentials, #{}),
-    Channel = growth_channel(Credentials, Server, #{}),
+    Channel = measured_growth_channel(Credentials, Server, #{}),
     %% No call measures the connection in between: the channel was ready once
     %% it measured it.
     #{sampling := SamplingField, transport := TransportField} = channel_fields(),
@@ -3092,7 +3115,7 @@ unanswered_measures_are_given_up(Credentials) ->
 %% rate. The measure is set up by hand, as a loopback round trip measures 0.
 measured_round_trips_are_published(Credentials) ->
     Server = start_server(Credentials, #{}),
-    Channel = growth_channel(Credentials, Server, #{}),
+    Channel = measured_growth_channel(Credentials, Server, #{}),
     try
         #{sampling := SamplingField, transport := TransportField, counters := CountersField} =
             channel_fields(),
