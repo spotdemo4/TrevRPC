@@ -107,8 +107,8 @@ cachePackages = [
     hash = 'sha256-xaxHnTKIZt1cHK5ZqTuSTOt5RNSjQB37GlrIgEGBskM='
 
   [mod.'github.com/quic-go/quic-go']
-    version = 'v0.64.1'
-    hash = 'sha256-lbt3F0zedf5iGYOTkNknGsrSQClxWy+/1i5GnmWgCI4='
+    version = 'v0.65.0'
+    hash = 'sha256-G132ivNnNjxWsjjvNjWCiSfvnxsF6gTXKpcwWum9XbU='
 
   [mod.'github.com/quic-go/webtransport-go']
     version = 'v0.13.0'
