@@ -125,7 +125,7 @@ crowded_rule_test() ->
 
 %% The call rate is measured over windows of at least 100 ms: the call
 %% that ends one turns its calls into the rate, and asks for the byte rate,
-%% clearing the last one until it is measured again.
+%% keeping the last one until it is measured again.
 call_rate_windows_test() ->
     Counters = counters(1),
     Start = erlang:monotonic_time(millisecond) + 1000,
@@ -137,7 +137,17 @@ call_rate_windows_test() ->
     ?assertEqual({100, 0, true}, trevrpc_quic_pool:record(Counters, Start + 100)),
     ok = trevrpc_quic_pool:set_byte_rate(Counters, 7),
     ?assertEqual({100, 7, false}, trevrpc_quic_pool:record(Counters, Start + 150)),
-    ?assertEqual({20, 0, true}, trevrpc_quic_pool:record(Counters, Start + 200)).
+    ?assertEqual({20, 7, true}, trevrpc_quic_pool:record(Counters, Start + 200)).
+
+%% A window that a pause in calls stretched to twice its length clears the
+%% byte rate, which was measured before the pause.
+pauses_clear_the_byte_rate_test() ->
+    Counters = counters(1),
+    Start = erlang:monotonic_time(millisecond) + 1000,
+    ?assertMatch({_, 0, true}, trevrpc_quic_pool:record(Counters, Start)),
+    ok = trevrpc_quic_pool:set_byte_rate(Counters, 7),
+    ?assertEqual({5, 7, true}, trevrpc_quic_pool:record(Counters, Start + 199)),
+    ?assertEqual({5, 0, true}, trevrpc_quic_pool:record(Counters, Start + 399)).
 
 %% A call picked for again, without counting, does not count toward the
 %% call rate: of the calls in this window only the one that ends it does.

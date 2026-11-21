@@ -89,6 +89,9 @@
 -define(BUSY_CALLS, 2).
 %% The shortest window the rates are measured over, in milliseconds.
 -define(RATE_WINDOW, 100).
+%% A window that lasted this long had a pause in calls, which clears the
+%% byte rate.
+-define(PAUSE, (2 * ?RATE_WINDOW)).
 
 %% Counters for a pool of up to Max connections.
 -spec new(pos_integer()) -> counters().
@@ -241,9 +244,12 @@ decide([{1, Own} | _] = Pool, Counters, #limits{} = Limits, Datagrams, Streaming
 %% Counts a call started at Now, and returns the rates of the last window
 %% and whether this call ended the window. The call rate is measured here;
 %% the byte rate by the channel, from its connections, once the window
-%% ends, which clears the last one until then: after a pause, the rate
-%% before it would grow the pool for traffic that is gone. A window that a
-%% pause stretched out yields low rates, which the next window corrects.
+%% ends. The last byte rate holds until that measure replaces it, which
+%% takes the connections' processes a while under load: cleared, calls
+%% would go to the generation's own connection meanwhile and crowd it. A
+%% window that a pause in calls stretched out does clear it, since the rate
+%% before the pause would grow the pool for traffic that may be gone, and
+%% yields a low call rate, which the next window corrects.
 -spec record(counters(), integer()) -> rates().
 record(Counters, Now) ->
     atomics:add(Counters, ?WINDOW_CALLS, 1),
@@ -257,7 +263,10 @@ record(Counters, Now) ->
             true ->
                 Calls = atomics:exchange(Counters, ?WINDOW_CALLS, 0),
                 atomics:put(Counters, ?CALL_RATE, Calls * 1000 div Elapsed),
-                atomics:put(Counters, ?BYTE_RATE, 0);
+                case Elapsed >= ?PAUSE of
+                    true -> atomics:put(Counters, ?BYTE_RATE, 0);
+                    false -> ok
+                end;
             false ->
                 ok
         end,
