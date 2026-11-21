@@ -54,6 +54,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
@@ -795,6 +796,11 @@ class Http3RpcTransportTest {
      * for the cancel before it marks the stream terminal, so when the callback settles the call, the
      * cancel always goes out. When the close settles it, the callback can still mark the stream
      * terminal before the close asks for the cancel, and then there is nothing left to cancel.
+     *
+     * Only the callback-settled rounds pin the cancel down exactly, so the test relies on both sides
+     * winning some of the 500 rounds; on the dev box the callback settles about a fifth of them. A
+     * close with no racing callback must cancel exactly once, which `logical close remains
+     * registered until native termination and callback barrier` checks without a race.
      */
     @Test
     fun `close and terminal callbacks race to exactly one completion`() =
@@ -807,11 +813,21 @@ class Http3RpcTransportTest {
                         Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = Dispatchers.Default)
                     val stream = openStreaming(transport, fake)
                     val cause = TrevRpcException(Status.cancelled("local close"))
+                    val closed = AtomicBoolean()
                     threads.round(
                         // Close never suspends here; runBlocking would start it far behind the callback.
-                        { suspend { stream.close(cause) }.startCoroutine(Continuation(EmptyCoroutineContext) { it.getOrThrow() }) },
+                        {
+                            suspend { stream.close(cause) }.startCoroutine(
+                                Continuation(EmptyCoroutineContext) {
+                                    it.getOrThrow()
+                                    closed.set(true)
+                                },
+                            )
+                        },
                         { fake.cancelCallback() },
                     )
+                    // A close that suspended would finish after the round, racing nothing.
+                    assertTrue(closed.get(), "round $round: close suspended instead of finishing in the race")
                     stream.close()
                     fake.fail(IllegalStateException("late failure"))
                     val outcome = assertInstanceOf(TrevRpcException::class.java, stream.receiveFailure())
