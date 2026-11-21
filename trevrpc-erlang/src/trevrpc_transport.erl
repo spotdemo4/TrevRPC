@@ -1,10 +1,13 @@
 %% @private A connection of any transport: native QUIC (an erlang_quic
-%% connection), QMux (a `trevrpc_qmux' session), the HTTP mapping over
-%% HTTP/3 (a `quic_h3' connection) or HTTP/2 (an erlang_h2 connection), or
-%% a WebTransport session (see {@link trevrpc_webtransport}).
+%% connection), QMux (a `trevrpc_qmux' session), HTTP/3 (a `quic_h3'
+%% connection), HTTP/2 (an erlang_h2 connection) or HTTP/1.1 (an erlang_h1
+%% connection), or a WebTransport session (see {@link trevrpc_webtransport}).
 %%
 %% Each carries bidirectional streams with flow control, and sends its owner
-%% events tagged `quic', `trevrpc_qmux', `quic_h3', `h2' or `trevrpc_wt'.
+%% events tagged `quic', `trevrpc_qmux', `quic_h3', `h2', `h1' or
+%% `trevrpc_wt'. HTTP/1.1 carries no RPCs, only the requests of the HTTP
+%% fallback, one at a time, and has no stream reset: resetting a request
+%% whose response has not ended closes the connection.
 %% QUIC, QMux and WebTransport streams are the RPCs' own streams; HTTP request streams carry one RPC in
 %% their request and response bodies, on streams the client opened, and are
 %% cancelled with the HTTP codes (`H3_REQUEST_CANCELLED', `CANCEL') instead
@@ -17,6 +20,8 @@
     pid/1,
     kind/1,
     tag/1,
+    send_response/4,
+    respond/5,
     send_data/4,
     send_data/5,
     send_data_async/4,
@@ -37,7 +42,7 @@
 
 -export_type([t/0, kind/0]).
 
--type kind() :: quic | qmux | h3 | h2 | wt.
+-type kind() :: quic | qmux | h3 | h2 | h1 | wt.
 
 %% A call on a connection that may be gone.
 -define(SAFE(Call),
@@ -57,10 +62,15 @@
     | {qmux, pid(), trevrpc_qmux:send_queue()}
     | {h3, pid(), pid()}
     | {h2, pid()}
+    | {h1, pid()}
     | {wt, pid(), pid(), pos_integer()}.
 
 -define(H3_NO_ERROR, 16#100).
 -define(H3_REQUEST_CANCELLED, 16#10c).
+%% erlang_h1 writes are calls with gen_statem's default 5 s timeout, which
+%% a slow client could run out on one large write: each takes at most this
+%% many bytes.
+-define(H1_CHUNK, 65536).
 
 -spec pid(t()) -> pid().
 pid(Transport) -> element(2, Transport).
@@ -69,12 +79,56 @@ pid(Transport) -> element(2, Transport).
 kind(Transport) -> element(1, Transport).
 
 %% @doc The tag of the events the connection sends its owner.
--spec tag(t()) -> quic | trevrpc_qmux | quic_h3 | h2 | trevrpc_wt.
+-spec tag(t()) -> quic | trevrpc_qmux | quic_h3 | h2 | h1 | trevrpc_wt.
 tag({quic, _}) -> quic;
 tag({qmux, _, _}) -> trevrpc_qmux;
 tag({h3, _, _}) -> quic_h3;
 tag({h2, _}) -> h2;
+tag({h1, _}) -> h1;
 tag({wt, _, _, _}) -> trevrpc_wt.
+
+%% @doc Writes the response head of HTTP request `Id', whose body follows
+%% with {@link send_data/5}. quic_h3 holds a response's HEADERS back until
+%% its first DATA, so an empty one follows them at once: the client hears
+%% of the response right away, as from Go and Rust.
+-spec send_response(t(), non_neg_integer(), 100..599, [{binary(), iodata()}]) ->
+    ok | {error, term()}.
+send_response({h3, H3, _Quic}, Id, Status, Headers) ->
+    case ?SAFE(quic_h3:send_response(H3, Id, Status, Headers)) of
+        ok ->
+            _ = ?SAFE(quic_h3:send_data(H3, Id, <<>>, false)),
+            ok;
+        {error, _} = Error ->
+            Error
+    end;
+send_response({h2, Conn}, Id, Status, Headers) ->
+    ?SAFE(h2:send_response(Conn, Id, Status, Headers));
+send_response({h1, Conn}, Id, Status, Headers) ->
+    ?SAFE(h1_connection:send_response(Conn, Id, Status, Headers)).
+
+%% @doc Writes the whole response of HTTP request `Id', which ends its
+%% sending side.
+-spec respond(t(), non_neg_integer(), 100..599, [{binary(), iodata()}], iodata()) ->
+    ok | {error, term()}.
+respond({h3, H3, _Quic}, Id, Status, Headers, Body) ->
+    ?SAFE(quic_h3:respond(H3, Id, Status, Headers, iolist_to_binary(Body)));
+respond({h2, Conn}, Id, Status, Headers, Body) ->
+    ?SAFE(h2:respond(Conn, Id, Status, Headers, iolist_to_binary(Body)));
+respond({h1, Conn}, Id, Status, Headers, Body) ->
+    Size = iolist_size(Body),
+    Framed =
+        lists:keymember(<<"content-length">>, 1, Headers) orelse
+            lists:keymember(<<"transfer-encoding">>, 1, Headers),
+    case Size > ?H1_CHUNK of
+        false ->
+            ?SAFE(h1_connection:respond(Conn, Id, Status, Headers, Body));
+        true ->
+            Length = [{<<"content-length">>, integer_to_binary(Size)} || not Framed],
+            case ?SAFE(h1_connection:send_response(Conn, Id, Status, Length ++ Headers)) of
+                ok -> h1_send(Conn, Id, iolist_to_binary(Body), true);
+                {error, _} = Error -> Error
+            end
+    end.
 
 %% @doc Writes `Data', finishing the stream with `Fin', waiting as long as
 %% it takes over HTTP/2.
@@ -99,6 +153,9 @@ send_data({h3, H3, _Quic}, Id, Data, Fin, _Timeout) ->
     ?SAFE(quic_h3:send_data(H3, Id, iolist_to_binary(Data), Fin));
 send_data({h2, Conn}, Id, Data, Fin, Timeout) ->
     ?SAFE(h2:send_data(Conn, Id, iolist_to_binary(Data), Fin, #{block => Timeout}));
+send_data({h1, Conn}, Id, Data, Fin, _Timeout) ->
+    %% erlang_h1 writes to the socket before it returns.
+    h1_send(Conn, Id, iolist_to_binary(Data), Fin);
 send_data({wt, Session, _Quic, _Prefix}, Id, Data, Fin, Timeout) ->
     trevrpc_webtransport:send(Session, Id, Data, Fin, Timeout).
 
@@ -122,9 +179,23 @@ send_data_async({h2, Conn}, Id, Data, Fin) ->
     %% HTTP/2 buffers what the peer's window does not take yet.
     _ = ?SAFE(h2:send_data(Conn, Id, iolist_to_binary(Data), Fin)),
     ok;
+send_data_async({h1, Conn}, Id, Data, Fin) ->
+    _ = h1_send(Conn, Id, iolist_to_binary(Data), Fin),
+    ok;
 send_data_async({wt, Session, _Quic, _Prefix}, Id, Data, Fin) ->
     %% The session queues what its send queue does not take yet.
     trevrpc_webtransport:send_async(Session, Id, Data, Fin).
+
+%% An HTTP/1.1 write in parts of at most ?H1_CHUNK bytes, so that each of
+%% erlang_h1's calls has its 5 s for one part only: only a client that
+%% takes less than that in 5 s fails the write.
+h1_send(Conn, Id, <<Part:?H1_CHUNK/binary, Rest/binary>>, Fin) when Rest =/= <<>> ->
+    case ?SAFE(h1_connection:send_data(Conn, Id, Part, false)) of
+        ok -> h1_send(Conn, Id, Rest, Fin);
+        {error, _} = Error -> Error
+    end;
+h1_send(Conn, Id, Data, Fin) ->
+    ?SAFE(h1_connection:send_data(Conn, Id, Data, Fin)).
 
 -spec consume(t(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 consume({quic, Conn}, Id, Bytes) ->
@@ -135,6 +206,8 @@ consume({h3, H3, _Quic}, Id, Bytes) ->
     ?SAFE(quic_h3:consume(H3, Id, Bytes));
 consume({h2, Conn}, Id, Bytes) ->
     ?SAFE(h2:consume(Conn, Id, Bytes));
+consume({h1, Conn}, Id, Bytes) ->
+    ?SAFE(h1_connection:consume(Conn, Id, Bytes));
 consume({wt, Session, _Quic, _Prefix}, Id, Bytes) ->
     trevrpc_webtransport:consume(Session, Id, Bytes).
 
@@ -149,11 +222,14 @@ reset_stream({h3, H3, _Quic}, Id, _Code) ->
     ?SAFE(quic_h3:cancel(H3, Id, ?H3_REQUEST_CANCELLED));
 reset_stream({h2, Conn}, Id, _Code) ->
     ?SAFE(h2:cancel(Conn, Id, cancel));
+reset_stream({h1, Conn}, Id, _Code) ->
+    %% Closes the connection if the response has not ended.
+    ?SAFE(h1_connection:cancel_stream(Conn, Id));
 reset_stream({wt, Session, _Quic, _Prefix}, Id, Code) ->
     trevrpc_webtransport:reset_stream(Session, Id, Code).
 
-%% @doc Stops the receiving side. HTTP/2 cannot: the connection consumes
-%% what still arrives.
+%% @doc Stops the receiving side. HTTP/2 and HTTP/1.1 cannot: the
+%% connection consumes what still arrives.
 -spec stop_sending(t(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 stop_sending({quic, Conn}, Id, Code) ->
     ?SAFE(quic:stop_sending(Conn, Id, Code));
@@ -164,6 +240,8 @@ stop_sending({h3, _H3, Quic}, Id, _Code) ->
     %% with a reset, which quic_h3 reports as for any other.
     ?SAFE(quic:stop_sending(Quic, Id, ?H3_REQUEST_CANCELLED));
 stop_sending({h2, _Conn}, _Id, _Code) ->
+    ok;
+stop_sending({h1, _Conn}, _Id, _Code) ->
     ok;
 stop_sending({wt, Session, _Quic, _Prefix}, Id, Code) ->
     trevrpc_webtransport:stop_sending(Session, Id, Code).
@@ -214,11 +292,17 @@ track_flow_control(_Transport, _Id, _Consumed) ->
 
 %% @doc Tells the connection that nothing reads stream `Id' any more, as
 %% when its call ended: over WebTransport, the bytes its call left unread
-%% no longer hold the session back. The other transports return credit for
-%% each byte as it is read or dropped.
+%% no longer hold the session back, and over HTTP/1.1 the connection reads
+%% and drops the rest of the request body. The other transports return
+%% credit for each byte as it is read or dropped.
 -spec forget(t(), non_neg_integer()) -> ok.
 forget({wt, Session, _Quic, _Prefix}, Id) ->
     trevrpc_webtransport:forget(Session, Id);
+forget({h1, Conn}, Id) ->
+    %% The rest of the request body is read and dropped, so that the next
+    %% request can follow it.
+    _ = ?SAFE(h1_connection:release_window(Conn, Id)),
+    ok;
 forget(_Transport, _Id) ->
     ok.
 
@@ -279,6 +363,11 @@ goaway({h3, H3, _Quic}) ->
 goaway({h2, Conn}) ->
     _ = ?SAFE(h2:goaway(Conn, #{timeout => infinity})),
     ok;
+goaway({h1, Conn}) ->
+    %% The next response says `Connection: close', after which erlang_h1
+    %% closes the connection; the owner closes an idle one.
+    _ = ?SAFE(h1_connection:send_goaway(Conn, no_error)),
+    ok;
 goaway({wt, Session, _Quic, _Prefix}) ->
     trevrpc_webtransport:drain(Session);
 goaway(_Transport) ->
@@ -298,6 +387,9 @@ close({h2, Conn}, _Code) ->
     %% sent it already at shutdown, when it does nothing.
     _ = ?SAFE(h2:goaway(Conn)),
     _ = ?SAFE(h2:close(Conn)),
+    ok;
+close({h1, Conn}, _Code) ->
+    _ = ?SAFE(h1_connection:close(Conn)),
     ok;
 close({wt, Session, _Quic, _Prefix}, _Code) ->
     trevrpc_webtransport:close(Session).

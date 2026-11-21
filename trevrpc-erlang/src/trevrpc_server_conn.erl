@@ -1,5 +1,5 @@
 %% @private The owner of one server-side connection: native QUIC, QMux,
-%% the HTTP mapping over HTTP/3 or HTTP/2, or a WebTransport session.
+%% HTTP/3, HTTP/2 or HTTP/1.1, or a WebTransport session.
 %%
 %% It receives every event of the connection. For each stream it starts a
 %% call process (`trevrpc_server_call') at once and routes the stream's
@@ -10,6 +10,14 @@
 %% ({@link trevrpc_http}): a request they refuse gets an HTTP error, and an
 %% accepted one a `200', after which its bodies are the stream as on the
 %% other transports.
+%%
+%% An HTTP request that TrevRPC does not claim goes to the HTTP fallback,
+%% when the server has one: it takes a stream slot like a call, and its
+%% handler runs in a request process of its own
+%% ({@link trevrpc_http_request}), to which this process routes the
+%% request body. HTTP/1.1 carries only the fallback's requests, one at a
+%% time, and WebSocket upgrades at the HTTP path, after which the
+%% connection is a QMux session.
 %%
 %% A WebTransport CONNECT on an HTTP/3 connection that passes its checks
 %% becomes a session of erlang-webtransport, with a connection process of
@@ -29,10 +37,13 @@
 
 -behaviour(gen_server).
 
--export([start/2, start_qmux/3, start_h2/2, serve_h3/3, shutdown/1, admit/4, finish/3, reserve/4]).
+-export([start/2, start_qmux/3, start_http/3, serve_h3/3, shutdown/1, admit/4, finish/3, reserve/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(entry, {
+    %% A call, or a request of the HTTP fallback, which is running until its
+    %% process ends, or cancelling once the peer abandoned it.
+    kind = call :: call | fallback,
     %% starting: the call process reads and checks the REQUEST; running: it
     %% was admitted and runs its handler; finishing: it is writing its
     %% terminal STATUS; expiring: it was stopped at its deadline;
@@ -122,11 +133,12 @@ start_qmux(Socket, Opts, Config) ->
             Error
     end.
 
-%% @doc Starts the owner of an HTTP/2 connection over the TLS connection
-%% `Socket', whose handshake completed. The caller must be the socket's
-%% controlling process; the HTTP/2 connection takes it over.
--spec start_h2(ssl:sslsocket(), trevrpc_server:config()) -> {ok, pid()} | {error, term()}.
-start_h2(Socket, Config) ->
+%% @doc Starts the owner of an HTTP/2 or HTTP/1.1 connection over the TLS
+%% connection `Socket', whose handshake completed. The caller must be the
+%% socket's controlling process; the HTTP connection takes it over.
+-spec start_http(h2 | h1, ssl:sslsocket(), trevrpc_server:config()) ->
+    {ok, pid()} | {error, term()}.
+start_http(Kind, Socket, Config) ->
     case gen_server:start(?MODULE, {undefined, Config}, []) of
         {ok, Pid} ->
             Peer =
@@ -136,7 +148,7 @@ start_h2(Socket, Config) ->
                 end,
             case ssl:controlling_process(Socket, Pid) of
                 ok ->
-                    gen_server:cast(Pid, {h2, Socket, Peer}),
+                    gen_server:cast(Pid, {Kind, Socket, Peer}),
                     {ok, Pid};
                 {error, _} = Error ->
                     exit(Pid, kill),
@@ -271,12 +283,13 @@ handle_cast({qmux, Socket, Opts}, #state{config = Config} = State) ->
         {error, _Reason} ->
             {stop, normal, State}
     end;
-handle_cast({h2, Socket, Peer}, #state{config = Config} = State) ->
-    case start_h2_connection(Socket, Config) of
+handle_cast({Kind, Socket, Peer}, #state{config = Config} = State) when
+    Kind =:= h2; Kind =:= h1
+->
+    case start_http_connection(Kind, Socket, Config) of
         {ok, Conn} ->
-            arm_idle(maps:get(idle_timeout, maps:get(http, Config))),
             {noreply, State#state{
-                transport = {h2, Conn},
+                transport = arm_idle({Kind, Conn}, Config),
                 peer = Peer,
                 active_at = erlang:monotonic_time(millisecond)
             }};
@@ -311,13 +324,18 @@ handle_info({Tag, Pid, Event}, #state{transport = Transport} = State) when
     is_tuple(Transport),
     element(2, Transport) =:= Pid,
     (Tag =:= quic orelse Tag =:= trevrpc_qmux orelse Tag =:= quic_h3 orelse Tag =:= h2 orelse
-        Tag =:= trevrpc_wt)
+        Tag =:= h1 orelse Tag =:= trevrpc_wt)
 ->
     quic_event(Event, State);
-handle_info({'EXIT', Pid, _Reason}, #state{transport = {h2, Pid}} = State) ->
-    %% The HTTP/2 connection, linked, ended.
+handle_info({'EXIT', Pid, _Reason}, #state{transport = {Kind, Pid}} = State) when
+    Kind =:= h2; Kind =:= h1
+->
+    %% The HTTP connection, linked, ended; an HTTP/1.1 connection that
+    %% upgraded to a WebSocket is not the transport any more.
     {stop, normal, State};
-handle_info({timeout, _Timer, idle}, State) ->
+handle_info({timeout, _Timer, idle}, #state{transport = {Kind, _}} = State) when
+    Kind =:= h2; Kind =:= h1
+->
     idle(State);
 handle_info({timeout, _Timer, trevrpc_datagram_hold}, #state{flows = Flows} = State) ->
     Now = erlang:monotonic_time(millisecond),
@@ -383,12 +401,21 @@ quic_event({stream_opened, Id}, State) ->
 quic_event({stream_data, Id, Bin, Fin}, State) ->
     {noreply, stream_data(Id, Bin, Fin, State)};
 quic_event({request, Id, Method, Target, Headers}, State) ->
-    {noreply, http_request(Id, Method, Target, Headers, State)};
+    {noreply, http_request(Id, Method, Target, Headers, requested(State))};
+quic_event({upgrade, Id, _Protocol, Method, Target, Headers}, State) ->
+    upgrade(Id, Method, Target, Headers, requested(State));
 quic_event({data, Id, Bin, Fin}, State) ->
     {noreply, stream_data(Id, Bin, Fin, State)};
-quic_event({trailers, Id, _Trailers}, State) ->
-    %% The HTTP mapping has no request trailers: the client broke it.
-    maybe_close(abandoned(Id, State));
+quic_event({trailers, Id, _Trailers}, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Id := #entry{kind = fallback}} ->
+            %% They end the request body, and the fallback does not read
+            %% them.
+            {noreply, stream_data(Id, <<>>, true, State)};
+        #{} ->
+            %% The HTTP mapping has no request trailers: the client broke it.
+            maybe_close(abandoned(Id, State))
+    end;
 quic_event({stream_reset, Id, _Code}, State) ->
     %% The STATUS a stopping connection waited on may have gone with it.
     maybe_close(abandoned(Id, State));
@@ -458,13 +485,29 @@ open_stream(Id, #state{active = Active, config = Config} = State) ->
 
 %%% HTTP requests
 
-http_request(Id, <<"CONNECT">>, Target, Headers, State) ->
-    connect(Id, Target, Headers, State);
-http_request(Id, _Method, _Target, _Headers, #state{config = #{http := undefined}} = State) ->
-    %% A server that serves WebTransport but not the HTTP mapping.
-    refuse_http(Id, 404, trevrpc_http:refusal_headers([], #{}), <<"not found">>, State),
+%% TrevRPC claims the HTTP path while it serves the HTTP mapping or
+%% browsers; every other request goes to the fallback, CONNECTs included,
+%% as on the Go server.
+http_request(Id, Method, Target, Headers, #state{config = #{http_path := HttpPath}} = State) ->
+    case trevrpc_http:path(Target) of
+        HttpPath -> claimed(Id, Method, Target, Headers, State);
+        _ -> unclaimed(Id, Method, Target, Headers, State)
+    end.
+
+claimed(Id, _Method, _Target, _Headers, #state{transport = {h1, _}} = State) ->
+    %% WebSocket upgrades come as upgrade events.
+    Message = <<"TrevRPC over HTTP requires HTTP/2 or HTTP/3">>,
+    refuse_http(Id, 505, refusal_headers([], State), Message, State),
     State;
-http_request(Id, Method, Target, Headers, #state{transport = Transport} = State0) ->
+claimed(Id, <<"CONNECT">>, Target, Headers, #state{transport = {h3, _, _}} = State) when
+    map_get(webtransport, State#state.config) =/= undefined
+->
+    connect(Id, Target, Headers, State);
+claimed(Id, _Method, _Target, _Headers, #state{config = #{http := undefined}} = State) ->
+    %% A server that serves WebTransport but not the HTTP mapping.
+    refuse_http(Id, 404, refusal_headers([], State), <<"not found">>, State),
+    State;
+claimed(Id, Method, Target, Headers, #state{transport = Transport} = State0) ->
     {Peer, State} = peer(State0),
     Version =
         case trevrpc_transport:kind(Transport) of
@@ -492,12 +535,134 @@ http_request(Id, Method, Target, Headers, #state{transport = Transport} = State0
             State
     end.
 
+%% A request for the fallback, which takes a stream slot like a call.
+unclaimed(Id, _Method, _Target, _Headers, #state{config = #{fallback := undefined}} = State) ->
+    refuse_http(Id, 404, refusal_headers([], State), <<"not found">>, State),
+    State;
+unclaimed(Id, _Method, _Target, _Headers, #state{stopping = true} = State) ->
+    refuse_http(Id, 503, refusal_headers([], State), <<"server is shutting down">>, State),
+    State;
+unclaimed(Id, Method, Target, Headers, State0) ->
+    case full(State0) of
+        true ->
+            Message = <<"too many concurrent requests on HTTP connection">>,
+            refuse_http(Id, 503, refusal_headers([], State0), Message, State0),
+            State0;
+        false ->
+            {Peer, State} = peer(State0),
+            start_fallback(Id, Method, Target, Headers, Peer, State)
+    end.
+
+%% The request's body comes here from now on, credited as the request's
+%% process reads it.
+start_fallback(Id, Method, Target, Headers, Peer, State) ->
+    #state{transport = Transport, config = Config, active = Active} = State,
+    case claim_stream(Transport, Id) of
+        ok ->
+            Ref = make_ref(),
+            {Pid, Monitor} = trevrpc_http_request:start(#{
+                transport => Transport,
+                id => Id,
+                ref => Ref,
+                router => self(),
+                handler => maps:get(fallback, Config),
+                alt_svc => maps:get(alt_svc, Config),
+                request => #{
+                    method => Method,
+                    target => Target,
+                    headers => Headers,
+                    protocol => protocol(Transport),
+                    peer => Peer
+                }
+            }),
+            Entry = #entry{
+                kind = fallback, state = running, ref = Ref, pid = Pid, monitor = Monitor
+            },
+            State#state{
+                streams = (State#state.streams)#{Id => Entry},
+                monitors = (State#state.monitors)#{Monitor => Id},
+                active = Active + 1,
+                active_at = erlang:monotonic_time(millisecond)
+            };
+        {error, _} ->
+            %% The stream is gone already.
+            _ = trevrpc_transport:reset_stream(Transport, Id, ?CANCELLED),
+            State
+    end.
+
+protocol({h3, _, _}) -> <<"HTTP/3.0">>;
+protocol({h2, _}) -> <<"HTTP/2.0">>;
+protocol({h1, _}) -> <<"HTTP/1.1">>.
+
+%% An HTTP/1.1 upgrade request: a WebSocket session at the HTTP path, if it
+%% passes the checks; off the path, a request for the fallback, whose
+%% response declines the upgrade.
+upgrade(Id, Method, Target, Headers, #state{config = #{http_path := HttpPath} = Config} = State0) ->
+    Claimed = trevrpc_http:path(Target) =:= HttpPath,
+    case {Claimed, Config} of
+        {false, _} ->
+            {noreply, unclaimed(Id, Method, Target, Headers, State0)};
+        {true, #{webtransport := undefined}} ->
+            {noreply, claimed(Id, Method, Target, Headers, State0)};
+        {true, #{webtransport := WebTransport}} ->
+            {Peer, State} = peer(State0),
+            Checked =
+                case trevrpc_http1:check_upgrade(Method, Target, Headers, Peer, WebTransport) of
+                    {ok, _, Request} when State#state.stopping ->
+                        {refuse, 503, <<"server is shutting down">>, Request};
+                    Result ->
+                        Result
+                end,
+            case Checked of
+                {ok, Accept, Accepted} ->
+                    accept_websocket(Id, Accept, Accepted, State);
+                {refuse, Status, Message, Refused} ->
+                    logger:warning("trevrpc: refused WebSocket upgrade from ~s with ~b: ~s", [
+                        trevrpc_http1:describe(Refused), Status, Message
+                    ]),
+                    refuse_http(Id, Status, refusal_headers([], State), Message, State),
+                    {noreply, State}
+            end
+    end.
+
+%% Answers the upgrade, after which this process owns the socket and the
+%% connection is a QMux session, as one over TLS would be.
+accept_websocket(Id, Accept, Request, #state{transport = {h1, Conn}, config = Config} = State) ->
+    Upgraded =
+        try
+            h1_connection:accept_upgrade(Conn, Id, Accept)
+        catch
+            exit:Exit -> {error, Exit}
+        end,
+    case Upgraded of
+        {ok, Socket, Received} ->
+            Opts = maps:merge(maps:get(qmux, Config), #{framing => websocket, received => Received}),
+            case trevrpc_qmux:start(Socket, server, self(), Opts) of
+                {ok, Session, Queue} ->
+                    logger:info("trevrpc: WebSocket session from ~s", [
+                        trevrpc_http1:describe(Request)
+                    ]),
+                    {noreply, State#state{
+                        transport = {qmux, Session, Queue},
+                        session_monitor = monitor(process, Session)
+                    }};
+                {error, Reason} ->
+                    logger:warning("trevrpc: refused WebSocket session from ~s: ~p", [
+                        trevrpc_http1:describe(Request), Reason
+                    ]),
+                    ok = trevrpc_http1:refuse_session(Socket),
+                    {stop, normal, State}
+            end;
+        {error, Reason} ->
+            logger:warning("trevrpc: WebSocket upgrade from ~s failed: ~p", [
+                trevrpc_http1:describe(Request), Reason
+            ]),
+            {stop, normal, State}
+    end.
+
 %% A WebTransport CONNECT: a session if it passes the checks, the ones of
 %% erlang-webtransport included, of which there is one per connection, as
 %% from the Rust server.
-connect(Id, _Target, _Headers, #state{config = #{webtransport := undefined}} = State) ->
-    refuse_http(Id, 404, trevrpc_http:refusal_headers([], #{}), <<"not found">>, State),
-    State;
 connect(Id, Target, Headers, #state{config = #{webtransport := WebTransport}} = State0) ->
     {Peer, State} = peer(State0),
     Checked =
@@ -562,14 +727,30 @@ peer(#state{peer = Peer} = State) when is_tuple(Peer) ->
 peer(State) ->
     {undefined, State}.
 
-%% HTTP/2 responses advertise HTTP/3; HTTP/3 ones need not.
-http_options(#state{transport = {h2, _}, config = #{http := Http}}) -> Http;
-http_options(#state{config = #{http := Http}}) -> maps:remove(alt_svc, Http).
+%% HTTP/2 and HTTP/1.1 responses advertise HTTP/3; HTTP/3 ones need not.
+http_options(#state{transport = {h3, _, _}, config = #{http := Http}}) ->
+    maps:remove(alt_svc, Http);
+http_options(#state{config = #{http := Http}}) ->
+    Http.
+
+refusal_headers(Extra, #state{transport = {h3, _, _}}) ->
+    trevrpc_http:refusal_headers(Extra, #{});
+refusal_headers(Extra, #state{config = #{alt_svc := undefined}}) ->
+    trevrpc_http:refusal_headers(Extra, #{});
+refusal_headers(Extra, #state{config = #{alt_svc := AltSvc}}) ->
+    trevrpc_http:refusal_headers(Extra, #{alt_svc => AltSvc}).
 
 %% Accepts the call: the stream's data comes here from now on, credited as
 %% it is read, and the call starts once its REQUEST arrived.
 accept_http(Id, Http, #state{transport = Transport} = State) ->
-    case accept_stream(Transport, Id, trevrpc_http:accepted_headers(Http)) of
+    Accepted =
+        maybe
+            ok ?= claim_stream(Transport, Id),
+            trevrpc_transport:send_response(
+                Transport, Id, 200, trevrpc_http:accepted_headers(Http)
+            )
+        end,
+    case Accepted of
         ok ->
             open_stream(Id, State#state{active_at = erlang:monotonic_time(millisecond)});
         {error, _} ->
@@ -578,67 +759,82 @@ accept_http(Id, Http, #state{transport = Transport} = State) ->
             State
     end.
 
-accept_stream({h3, H3, _Quic}, Id, Headers) ->
-    maybe
-        ok ?= h3_handler(H3, Id),
-        ok ?= quic_h3:send_response(H3, Id, 200, Headers),
-        %% quic_h3 holds a response's HEADERS back until its first DATA;
-        %% the client hears of its acceptance at once, as from Go and Rust.
-        _ = quic_h3:send_data(H3, Id, <<>>, false),
-        ok
-    end;
-accept_stream({h2, Conn}, Id, Headers) ->
-    maybe
-        ok ?= h2:set_stream_handler(Conn, Id, self(), #{flow_control => manual}),
-        h2:send_response(Conn, Id, 200, Headers)
-    end.
-
-%% What arrived before is sent here as messages, after this.
-h3_handler(H3, Id) ->
+%% Makes the stream's data come here, in manual flow control; what arrived
+%% before is sent here as messages, after this. An HTTP/1.1 connection
+%% sends every request's data here, and is in manual flow control from the
+%% start.
+claim_stream({h3, H3, _Quic}, Id) ->
     case
         quic_h3:set_stream_handler(H3, Id, self(), #{flow_control => manual, drain_buffer => false})
     of
         ok -> ok;
         {ok, _} -> ok;
         {error, _} = Error -> Error
-    end.
+    end;
+claim_stream({h2, Conn}, Id) ->
+    h2:set_stream_handler(Conn, Id, self(), #{flow_control => manual});
+claim_stream({h1, _Conn}, _Id) ->
+    ok.
 
-%% Answers a request the mapping refused, and stops reading its body.
-refuse_http(Id, Status, Headers, Message, #state{transport = {h3, H3, Quic}}) ->
-    _ = quic_h3:respond(H3, Id, Status, Headers, <<Message/binary, $\n>>),
+%% Answers a request that is refused, and stops reading its body.
+refuse_http(Id, Status, Headers, Message, #state{transport = Transport}) ->
+    _ = trevrpc_transport:respond(Transport, Id, Status, Headers, <<Message/binary, $\n>>),
+    stop_request(Transport, Id).
+
+stop_request({h3, _H3, Quic}, Id) ->
     _ = quic:stop_sending(Quic, Id, ?H3_NO_ERROR),
     ok;
-refuse_http(Id, Status, Headers, Message, #state{transport = {h2, Conn}}) ->
+stop_request({h2, Conn}, Id) ->
     %% The response is written whole, so the stream can end (RFC 9113
     %% Section 8.1): erlang_h2 would otherwise hold the rest of the body.
-    _ = h2:respond(Conn, Id, Status, Headers, <<Message/binary, $\n>>),
     _ = h2:cancel(Conn, Id, no_error),
-    ok.
-
-%% HTTP/2 connections without a stream for the idle timeout are closed, as
-%% the Go server's are. QUIC's idle timeout covers HTTP/3.
-arm_idle(infinity) ->
     ok;
-arm_idle(Timeout) ->
-    _ = erlang:start_timer(Timeout, self(), idle),
+stop_request({h1, _Conn}, _Id) ->
+    %% erlang_h1 drains a body left unread for a second after the response,
+    %% then closes the connection.
     ok.
 
-idle(#state{config = #{http := #{idle_timeout := Timeout}}, streams = Streams} = State) when
+%% HTTP/2 connections without a stream for the connection idle timeout
+%% are closed, as the Go server's are, and HTTP/1.1 ones that send no
+%% request head within the TLS handshake timeout, after the handshake or
+%% the request before, as the Rust server's are. A request in flight holds
+%% neither back, however long its body takes. QUIC's idle timeout covers
+%% HTTP/3. Returns the transport.
+arm_idle(Transport, Config) ->
+    _ = start_timer(idle_timeout(Transport, Config), idle),
+    Transport.
+
+idle_timeout({h1, _}, #{h1_idle_timeout := Timeout}) -> Timeout;
+idle_timeout(_Transport, #{idle_timeout := Timeout}) -> Timeout.
+
+%% A request arrived: the idle time starts again once it is answered.
+requested(State) ->
+    State#state{active_at = erlang:monotonic_time(millisecond)}.
+
+idle(#state{transport = Transport, config = Config, streams = Streams} = State) when
     map_size(Streams) > 0
 ->
-    arm_idle(Timeout),
+    _ = arm_idle(Transport, Config),
     {noreply, State};
-idle(#state{config = #{http := #{idle_timeout := Timeout}}, active_at = At} = State) ->
+idle(#state{transport = Transport, config = Config, active_at = At} = State) ->
+    Timeout = idle_timeout(Transport, Config),
     case erlang:monotonic_time(millisecond) - At of
         Idle when Idle >= Timeout ->
-            ok = close_transport(State#state.transport),
+            ok = close_transport(Transport),
             {stop, normal, State};
         Idle ->
-            arm_idle(Timeout - Idle),
+            _ = start_timer(Timeout - Idle, idle),
             {noreply, State}
     end.
 
-start_h2_connection(Socket, Config) ->
+start_http_connection(h1, Socket, #{h1 := Opts}) ->
+    maybe
+        {ok, Conn} ?= h1_connection:start_link(server, Socket, self(), Opts),
+        ok ?= transfer(Socket, Conn),
+        ok ?= h1_connection:activate(Conn),
+        {ok, Conn}
+    end;
+start_http_connection(h2, Socket, Config) ->
     #{max_frame_size := MaxFrame, max_streams_per_connection := Max} = Config,
     Opts = #{
         settings => #{
@@ -832,6 +1028,16 @@ lone_status(
 
 call_down(Id, Reason, #state{streams = Streams} = State) ->
     case Streams of
+        #{Id := #entry{kind = fallback, state = Running} = Entry} ->
+            %% A request process ends its response itself, failing handlers
+            %% included; one that was killed, as at the end of the graceful
+            %% shutdown, has its stream reset.
+            _ =
+                case Running =:= running andalso Reason =/= normal of
+                    true -> cut_off(Id, State);
+                    false -> ok
+                end,
+            maybe_close(remove(Id, release(Id, Entry, State)));
         #{Id := #entry{state = starting} = Entry} when Reason =:= normal ->
             %% Its stream went before its REQUEST did.
             maybe_close(remove(Id, release(Id, Entry, State)));
@@ -873,6 +1079,9 @@ server_down(Monitor, State) ->
     _ = Monitor,
     handle_cast(shutdown, State).
 
+shutdown_stream(_Id, #entry{kind = fallback}, State) ->
+    %% A request of the fallback gets the grace period to finish.
+    State;
 shutdown_stream(Id, #entry{state = starting, pid = Pid, fin = Fin} = Entry, State) ->
     %% Nothing of the call ran yet; the stream ends as one refused.
     exit(Pid, kill),
@@ -947,9 +1156,12 @@ remove(Id, #state{streams = Streams, config = Config, flows = Flows} = State) ->
     }.
 
 %% Over WebTransport, what the call left unread no longer holds the session
-%% back. The other transports need no call: this process makes none into
-%% them for a call that ends normally.
+%% back, and over HTTP/1.1 the connection reads and drops the rest of a
+%% request body. The other transports need no call: this process makes
+%% none into them for a call that ends normally.
 forget(Id, #state{transport = {wt, _, _, _} = Transport}) ->
+    trevrpc_transport:forget(Transport, Id);
+forget(Id, #state{transport = {h1, _} = Transport}) ->
     trevrpc_transport:forget(Transport, Id);
 forget(_Id, _State) ->
     ok.

@@ -30,6 +30,13 @@
 %% other calls while one call is a window behind on reading its own (see
 %% {@link trevrpc_webtransport}).
 %%
+%% With `http_fallback => Handler', every other HTTP request on the same
+%% sockets goes to `Handler', over HTTP/3, HTTP/2 and HTTP/1.1, such as the
+%% static content of a web application: see {@link trevrpc_http_request}.
+%% TrevRPC claims the HTTP path while `http' or `webtransport' is on, and
+%% setting a fallback serves those HTTP versions even with both off. HTTP/2
+%% and HTTP/1.1 responses advertise HTTP/3 through `Alt-Svc'.
+%%
 %% Messages are opaque binaries here: a handler decodes its request and
 %% encodes its response, usually through generated code. See
 %% {@link trevrpc_call} for the handler API.
@@ -116,7 +123,8 @@
     http_admission => trevrpc_admission:admission(),
     webtransport => boolean(),
     webtransport_admission => trevrpc_admission:admission(),
-    http_path => binary()
+    http_path => binary(),
+    http_fallback => trevrpc_http_request:handler()
 }.
 
 %% What each connection process needs, shared by all of them.
@@ -137,9 +145,10 @@
     stream_budget := trevrpc_zstd_stream:budget() | undefined,
     %% The options of QMux sessions.
     qmux := trevrpc_qmux:options(),
-    %% The HTTP mapping's options, with the idle timeout of HTTP/2
-    %% connections, unless HTTP is off.
-    http := (trevrpc_http:options() | #{idle_timeout := timeout()}) | undefined,
+    %% The HTTP mapping's options, unless HTTP is off.
+    http := trevrpc_http:options() | undefined,
+    %% How long an HTTP/2 or HTTP/1.1 connection may go without a request.
+    idle_timeout := timeout(),
     %% How WebTransport sessions are admitted, the limits each session
     %% grants its client, and erlang-webtransport's HTTP/3 options for them,
     %% unless WebTransport is off.
@@ -150,7 +159,19 @@
             session := map(),
             h3 := map()
         }
-        | undefined
+        | undefined,
+    %% The HTTP path TrevRPC claims, while it serves the HTTP mapping or
+    %% browsers: other paths go to the fallback.
+    http_path := binary() | undefined,
+    %% The handler of the requests TrevRPC does not claim.
+    fallback := trevrpc_http_request:handler() | undefined,
+    %% The `Alt-Svc' value HTTP/2 and HTTP/1.1 responses advertise HTTP/3
+    %% with, while HTTP/2 is served.
+    alt_svc := binary() | undefined,
+    %% erlang_h1's options for HTTP/1.1 connections, and how long one may
+    %% go without a request in flight.
+    h1 := map(),
+    h1_idle_timeout := timeout()
 }.
 
 -record(state, {
@@ -258,6 +279,8 @@ check_browsers(Opts) ->
             {error, {invalid_option, webtransport}};
         #{webtransport_admission := Admission} when not is_function(Admission, 1) ->
             {error, {invalid_option, webtransport_admission}};
+        #{http_fallback := Fallback} when not is_function(Fallback, 1) ->
+            {error, {invalid_option, http_fallback}};
         #{http_path := <<"/", _/binary>>} ->
             ok;
         #{http_path := _} ->
@@ -415,10 +438,10 @@ webtransport_quic(#{webtransport := _}) ->
     #{reset_stream_at => true, stream_reset_final_size => true}.
 
 %% Who owns each QUIC connection: the process `Start' starts for it. With
-%% HTTP or WebTransport, a connection that negotiated `h3' is HTTP/3, whose
-%% `quic_h3' process the owner hands the connection to in the ALPN hook,
-%% which runs in the connection's process.
-quic_handlers(Start, #{http := undefined, webtransport := undefined}) ->
+%% HTTP, WebTransport or the fallback, a connection that negotiated `h3' is
+%% HTTP/3, whose `quic_h3' process the owner hands the connection to in the
+%% ALPN hook, which runs in the connection's process.
+quic_handlers(Start, #{http := undefined, webtransport := undefined, fallback := undefined}) ->
     #{connection_handler => Start};
 quic_handlers(Start, Config) ->
     #{
@@ -467,12 +490,16 @@ accept_h3(Conn, Owner, Opts) ->
         {ok, H3}
     end.
 
-%% HTTP/2 responses advertise HTTP/3 on the UDP socket.
-alt_svc(#{http := undefined} = Config, _UdpPort) ->
+%% HTTP/2 and HTTP/1.1 responses advertise HTTP/3 on the UDP socket, while
+%% HTTP/2 is served: for the HTTP mapping or the fallback.
+alt_svc(#{http := undefined, fallback := undefined} = Config, _UdpPort) ->
     Config;
 alt_svc(#{http := Http} = Config, UdpPort) ->
     AltSvc = iolist_to_binary(io_lib:format("h3=\":~b\"; ma=86400", [UdpPort])),
-    Config#{http := Http#{alt_svc => AltSvc}}.
+    case Http of
+        undefined -> Config#{alt_svc := AltSvc};
+        _ -> Config#{alt_svc := AltSvc, http := Http#{alt_svc => AltSvc}}
+    end.
 
 %% The TCP listener for QMux over TLS, by default on the UDP socket's port
 %% number, or any free port if that one is taken and none was asked for.
@@ -481,60 +508,32 @@ listen_tcp(#{tcp := false}, _Credentials, _State, _MaxConnections) ->
 listen_tcp(
     Opts, Credentials, #state{name = Name, config = Config, counters = Counters}, MaxConnections
 ) ->
-    Qmux = fun(Session) ->
+    %% Each serves a connection whose TLS handshake completed, which counts
+    %% against the server's connections from then on.
+    Serve = fun(Start) ->
         fun(Socket) ->
-            case
-                admit(
-                    fun() -> trevrpc_server_conn:start_qmux(Socket, Session, Config) end,
-                    Config,
-                    Counters,
-                    MaxConnections
-                )
-            of
+            case admit(fun() -> Start(Socket) end, Config, Counters, MaxConnections) of
                 {ok, _Pid} -> ok;
                 {error, _} = Error -> Error
             end
         end
     end,
     Handshake = maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
-    Accept0 =
-        case maps:get(http, Config) of
-            undefined ->
-                #{qmux => Qmux(#{})};
-            _ ->
-                H2 = fun(Socket) ->
-                    case
-                        admit(
-                            fun() -> trevrpc_server_conn:start_h2(Socket, Config) end,
-                            Config,
-                            Counters,
-                            MaxConnections
-                        )
-                    of
-                        {ok, _Pid} -> ok;
-                        {error, _} = Error -> Error
-                    end
-                end,
-                #{qmux => Qmux(#{}), h2 => H2}
-        end,
-    Accept =
-        case maps:get(webtransport, Opts, false) of
-            true ->
-                Http = #{
-                    path => maps:get(http_path, Opts, ?HTTP_PATH),
-                    admission => maps:get(
-                        webtransport_admission, Opts, fun trevrpc_admission:no_origin/1
-                    ),
-                    timeout => Handshake,
-                    room => fun() -> room(Counters, MaxConnections) end
-                },
-                WebSocket = fun(Socket, Received) ->
-                    (Qmux(#{framing => websocket, received => Received}))(Socket)
-                end,
-                Accept0#{http1 => fun(Socket) -> trevrpc_http1:serve(Socket, Http, WebSocket) end};
-            false ->
-                Accept0
-        end,
+    #{http := Mapping, webtransport := Browsers, fallback := Fallback} = Config,
+    %% HTTP/2 carries the HTTP mapping and the fallback, HTTP/1.1 the
+    %% WebSocket sessions and the fallback.
+    Accept = maps:from_list(
+        [{qmux, Serve(fun(Socket) -> trevrpc_server_conn:start_qmux(Socket, #{}, Config) end)}] ++
+            [
+                {h2, Serve(fun(Socket) -> trevrpc_server_conn:start_http(h2, Socket, Config) end)}
+             || Mapping =/= undefined orelse Fallback =/= undefined
+            ] ++
+            [
+                {http1,
+                    Serve(fun(Socket) -> trevrpc_server_conn:start_http(h1, Socket, Config) end)}
+             || Browsers =/= undefined orelse Fallback =/= undefined
+            ]
+    ),
     {ok, UdpPort} = quic:get_server_port(Name),
     Listen = #{
         ip => maps:get(ip, Opts, {0, 0, 0, 0}),
@@ -569,17 +568,47 @@ config(Opts, Compression) ->
         requests => counters:new(1, [write_concurrency]),
         qmux => qmux_options(Opts),
         http => http_options(Opts),
-        webtransport => webtransport_options(Opts)
+        webtransport => webtransport_options(Opts),
+        http_path =>
+            case Opts of
+                #{http := true} -> maps:get(http_path, Opts, ?HTTP_PATH);
+                #{webtransport := true} -> maps:get(http_path, Opts, ?HTTP_PATH);
+                #{} -> undefined
+            end,
+        fallback => maps:get(http_fallback, Opts, undefined),
+        alt_svc => undefined,
+        idle_timeout => maps:get(connection_idle_timeout, Opts, 30000),
+        h1 => h1_options(Opts),
+        %% An HTTP/1.1 client has the TLS handshake timeout to send a
+        %% request's head, after the handshake or the request before, as
+        %% from the Rust server.
+        h1_idle_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT)
     }.
 
 http_options(#{http := true} = Opts) ->
     #{
         path => maps:get(http_path, Opts, ?HTTP_PATH),
-        admission => maps:get(http_admission, Opts, undefined),
-        idle_timeout => maps:get(connection_idle_timeout, Opts, 30000)
+        admission => maps:get(http_admission, Opts, undefined)
     };
 http_options(#{}) ->
     undefined.
+
+%% Request bodies are held to a stream window ahead of the fallback handler
+%% that reads them; a body the handler does not read is drained for at
+%% most a second after its response. erlang_h1's own timers are off: its
+%% idle timer runs while a response goes out to a client that sends
+%% nothing, and its request timer while a body pauses, so the connection's
+%% process closes an idle connection itself (see h1_idle_timeout).
+h1_options(Opts) ->
+    MaxFrame = maps:get(max_frame_size, Opts, trevrpc:default_max_frame_size()),
+    #{
+        request_timeout => infinity,
+        idle_timeout => infinity,
+        flow_control => manual,
+        recv_window => trevrpc_quic:stream_window(MaxFrame),
+        max_body_size => infinity,
+        early_response_drain => {65536, 1000}
+    }.
 
 %% WebTransport sessions grant their clients what QUIC connections do,
 %% where their draft has flow control of its own (Safari's, and the latest

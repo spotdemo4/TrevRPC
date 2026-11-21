@@ -21,12 +21,11 @@
 %% {@link trevrpc_interop_bench}).
 %%
 %% The runtime serves native QUIC, QMux over TLS, WebTransport, QMux over
-%% WebSocket and the HTTP mapping over HTTP/3 and HTTP/2, and calls native
-%% QUIC and QMux over TLS; it has no HTTP fallback yet. The server reports
-%% only the ports of what it serves and the scenarios it supports; the client
-%% reports the scenarios it does not implement as skipped. It leaves out the
-%% `http3' and `http2' ports even so: the only clients of them in `run.py',
-%% the browser app lanes, load their page through the HTTP fallback.
+%% WebSocket and the HTTP mapping over HTTP/3 and HTTP/2, with the files of
+%% `--web-root' through its HTTP fallback (see {@link trevrpc_interop_web}),
+%% and calls native QUIC and QMux over TLS. The server reports the
+%% scenarios it supports; the client reports the scenarios it does not
+%% implement as skipped.
 -module(trevrpc_interop).
 
 -export([main/0, server_scenarios/0, compression/1, start_server/1]).
@@ -142,8 +141,10 @@ server(#{"cert" := _, "key" := _} = Flags) ->
     {ok, TcpPort} = trevrpc_server:tcp_port(Server),
     Ready = #{
         native => Port,
-        qmux => TcpPort,
+        http3 => Port,
         webtransport => Port,
+        qmux => TcpPort,
+        http2 => TcpPort,
         websocket => TcpPort,
         scenarios => server_scenarios()
     },
@@ -161,11 +162,14 @@ server(_Flags) ->
 -spec start_server(#{string() => string()}) -> {ok, pid()} | ignore | {error, term()}.
 start_server(#{"cert" := Cert, "key" := Key} = Flags) ->
     {ok, Host} = inet:parse_address(maps:get("host", Flags, "127.0.0.1")),
-    %% With no HTTP fallback, --web-root is accepted and unused. The browser
-    %% runner's page comes from an origin of its own, so every origin is
-    %% admitted. HTTP is served, so that the WebSocket lanes run while the
-    %% TCP listener offers h2 as well.
-    trevrpc_server:start(#{
+    %% The browser runner's page comes from an origin of its own, or from
+    %% --web-root through the fallback, so every origin is admitted.
+    Fallback =
+        case Flags of
+            #{"web-root" := Root} -> #{http_fallback => trevrpc_interop_web:handler(Root)};
+            #{} -> #{}
+        end,
+    trevrpc_server:start(Fallback#{
         ip => Host,
         port => list_to_integer(maps:get("port", Flags, "0")),
         certfile => Cert,

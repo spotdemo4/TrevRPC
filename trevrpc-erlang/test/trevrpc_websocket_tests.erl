@@ -27,10 +27,10 @@ websocket_test_() ->
                 {"messages over max_record_size close the session", fun too_big_test/1},
                 {"the peer's Close is answered", fun close_test/1},
                 {"browsers are refused without an admission", fun default_admission_test/1},
-                {"a connection closes after a refused request", fun one_request_test/1},
+                {"a refused request keeps the connection open", fun keep_alive_test/1},
                 {"an upgrade must be a GET", fun method_test/1},
                 {"an idle connection is closed", fun idle_test/1},
-                {"a full server refuses upgrades", fun full_test/1},
+                {"a full server refuses connections", fun full_test/1},
                 {"HTTP/1.1 is not offered without webtransport", fun disabled_test/1}
             ]
         ]
@@ -194,18 +194,24 @@ default_admission_test(#{credentials := Credentials}) ->
         trevrpc_server:stop(Server)
     end.
 
-%% A client cannot hold its handshake slot by sending request after request.
-one_request_test(#{port := Port}) ->
+%% An HTTP/1.1 connection counts against the server's connections, as an
+%% HTTP/2 one does, and serves request after request.
+keep_alive_test(#{port := Port}) ->
     Head = <<"GET / HTTP/1.1\r\nhost: x\r\n\r\n">>,
-    {404, Headers, <<"not found\n">>, Socket} = request(Port, [<<"http/1.1">>], Head),
-    ?assertEqual(<<"close">>, header(<<"connection">>, Headers)),
-    _ = ssl:send(Socket, Head),
-    ?assertEqual({error, closed}, ssl:recv(Socket, 0, 5000)).
+    {404, Headers, Rest, Socket} = request(Port, [<<"http/1.1">>], Head),
+    ?assertEqual(undefined, header(<<"connection">>, Headers)),
+    ?assertEqual(<<"10">>, header(<<"content-length">>, Headers)),
+    {ok, Body} = recv_exactly(Socket, Rest, 10),
+    ?assertEqual(<<"not found\n">>, Body),
+    ok = ssl:send(Socket, Head),
+    ?assertMatch({404, _, _}, read_head(Socket, <<>>)).
 
 method_test(#{port := Port}) ->
     {505, _, _, _} = upgrade(Port, <<"/trevrpc">>, [], [<<"http/1.1">>], <<"POST">>),
     ?assertMatch({101, _, _, _}, upgrade(Port, <<"/trevrpc">>, [], [<<"http/1.1">>], <<"GET">>)).
 
+%% A connection that sends no request within the TLS handshake timeout is
+%% closed.
 idle_test(#{credentials := Credentials}) ->
     Server = start_server(Credentials, #{tls_handshake_timeout => 200}),
     try
@@ -220,9 +226,13 @@ full_test(#{credentials := Credentials}) ->
     try
         Port = tcp_port(Server),
         {101, _, Received, First} = upgrade(Port, <<"/trevrpc">>, []),
-        %% The server sends its QMux parameters once it counted the session.
+        %% The session is the connection the server counted.
         ?assertMatch([{binary, _} | _], first_messages(First, Received)),
-        ?assertMatch({503, _, _, _}, upgrade(Port, <<"/trevrpc">>, []))
+        %% The next connection is closed after its handshake, as by the Go
+        %% and Rust servers.
+        {ok, Second} = connect(Port, [<<"http/1.1">>]),
+        _ = ssl:send(Second, <<"GET / HTTP/1.1\r\nhost: x\r\n\r\n">>),
+        ?assertEqual({error, closed}, ssl:recv(Second, 0, 5000))
     after
         trevrpc_server:stop(Server)
     end.
@@ -310,6 +320,14 @@ read_head(Socket, Acc) ->
 
 header(Name, Headers) ->
     proplists:get_value(Name, Headers).
+
+recv_exactly(_Socket, Bin, Size) when byte_size(Bin) >= Size ->
+    {ok, binary:part(Bin, 0, Size)};
+recv_exactly(Socket, Bin, Size) ->
+    case ssl:recv(Socket, 0, 5000) of
+        {ok, More} -> recv_exactly(Socket, <<Bin/binary, More/binary>>, Size);
+        Error -> Error
+    end.
 
 %% The server's messages until Wanted arrives.
 read_until(Socket, Received, Wanted) ->

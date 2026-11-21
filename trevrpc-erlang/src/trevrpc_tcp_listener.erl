@@ -1,15 +1,15 @@
 %% @private The server's TCP listener: TLS connections, dispatched on the
 %% negotiated ALPN. `qmux-02.trevrpc-1' carries TrevRPC over QMux. When the
-%% server serves the HTTP mapping, `h2' is HTTP/2. When it serves browsers,
-%% `http/1.1' (or no ALPN at all) is HTTP/1.1, where a WebSocket upgrade
-%% carries QMux.
+%% server serves the HTTP mapping or an HTTP fallback, `h2' is HTTP/2. When
+%% it serves browsers or an HTTP fallback, `http/1.1' (or no ALPN at all) is
+%% HTTP/1.1, where a WebSocket upgrade carries QMux.
 %%
 %% Each connection's handshake runs in a process of its own, bounded by the
 %% handshake timeout, so a slow client holds up no other. At most
 %% `max_handshakes' run at once: past that, connections wait in the kernel's
-%% backlog, so half-open handshakes cannot take every file descriptor. An
-%% HTTP/1.1 connection counts as one until it upgrades to a WebSocket, its
-%% requests bounded by the same timeout.
+%% backlog, so half-open handshakes cannot take every file descriptor. Once
+%% its handshake completed, a connection counts against the server's
+%% connections instead.
 -module(trevrpc_tcp_listener).
 
 -export([start_link/3, port/1, stop/1]).
