@@ -12,7 +12,7 @@ client also has a TCP fallback for networks that block UDP.
 | JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
 | JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
 | Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust         |
-| JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust         |
+| JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
 
 The Erlang runtime ([#477](https://trev.zip/llc/TrevRPC/issues/477)) serves native QUIC, QMux
 over TLS, WebTransport, QMux over WebSocket and the HTTP mapping over HTTP/3 and HTTP/2, and calls
@@ -27,7 +27,8 @@ unless the command line names any `--server`, `--client`, or `--browser`, which
 then replace all three. `nix flake check` runs that default matrix. CI runs the Android client on an emulator because it needs
 KVM (once over HTTP/3 and once over HTTP/2 with QUIC disabled), and runs Safari
 on macOS through `safaridriver` (not Playwright's WebKit, whose builds decide on
-their own whether to expose WebTransport). Every Safari lane must pass against both servers.
+their own whether to expose WebTransport). Every Safari lane must pass against every server, except
+that Erlang's cells may skip the scenarios it does not implement yet (`--may-skip erlang`).
 
 Each cell's output is printed as it finishes and kept in `CELL.log` under
 `--out`. A run that fails ends with a summary of every failed cell and the lines
@@ -51,8 +52,8 @@ what it does, and what it skips is reported, never counted as passed:
 
 Only the cells of runtimes named with `--may-skip` (a client, browser or server
 name) may skip; a skipped cell or scenario anywhere else fails the run, so a
-regression in a complete runtime cannot pass as a skip. The packaged matrix
-passes `--may-skip erlang`. Every run that skipped anything ends with a summary
+regression in a complete runtime cannot pass as a skip. The packaged matrix and
+the `safari` workflow pass `--may-skip erlang`. Every run that skipped anything ends with a summary
 of the skipped cells and of the passing cells that skipped scenarios, and says
 which runtimes those skips were allowed for instead of that every cell passed.
 

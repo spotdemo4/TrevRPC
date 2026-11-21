@@ -74,7 +74,7 @@ browsers without WebTransport.
 | [JavaScript](trevrpc-js) (browser) | —                                                         | WebTransport | QMux over WebSocket                 |
 | [Kotlin](trevrpc-kotlin) (Android) | —                                                         | HTTP/3       | HTTP/2 (Cronet's built-in fallback) |
 
-The browser client is supported on Chromium, Firefox, and Safari with both servers. See
+The browser client is supported on Chromium, Firefox, and Safari with the Go, Rust, and Erlang servers. See
 [TCP fallback](https://trev.zip/llc/TrevRPC/wiki/TCP-Fallback) for how the fallbacks are served and chosen.
 
 ## example

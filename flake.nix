@@ -139,9 +139,10 @@
             meta.platforms = self.packages.${system}.trevrpc-kotlin.interopAndroid.meta.platforms;
           };
 
-          # The interop runner and both servers, for the safari workflow.
+          # The interop runner and every server, for the safari workflow.
           safari = pkgs.mkShell {
             packages = with self.packages.${system}; [
+              trevrpc-erlang-interop
               trevrpc-go-interop
               trevrpc-interop
               trevrpc-rust

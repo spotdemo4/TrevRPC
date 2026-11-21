@@ -2,7 +2,8 @@ name: safari
 
 # Runs the browser interop suite in Safari itself, driven through safaridriver. Playwright's WebKit
 # is not used: its builds decide on their own whether to expose WebTransport. Every lane must pass
-# against both servers.
+# against every server, except the scenarios the Erlang server does not implement yet (#641), which
+# its cells may skip.
 
 # The emulator and browser runs are the slowest and most expensive jobs, so they run weekly and on
 # demand rather than on every push.
@@ -27,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        server: [go, rust]
+        server: [go, rust, erlang]
     env:
       SERVER: ${{ matrix.server }}
       CELL: safari-to-${{ matrix.server }}
@@ -47,6 +48,7 @@ jobs:
           safaridriver --version
 
       # Every browser lane: WebTransport, WebSocket, the fallback to WebSocket and the app lanes.
+      # Only Erlang's cells may skip scenarios, as in the packaged matrix.
       - name: Run Safari interop
         env:
           OUTPUT: ${{ runner.temp }}/${{ env.CELL }}
@@ -54,7 +56,8 @@ jobs:
           trevrpc-interop \
             --out "$OUTPUT" \
             --server "$SERVER=trevrpc-interop-$SERVER" \
-            --browser safari
+            --browser safari \
+            --may-skip erlang
 
       - name: Upload failure diagnostics
         if: ${{ failure() }}
