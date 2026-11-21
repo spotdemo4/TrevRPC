@@ -42,6 +42,26 @@ let
   # Every application the executable loads.
   closure = deps: lib.unique (lib.concatMap (dep: [ dep ] ++ closure (dep.beamDeps or [ ])) deps);
   libs = closure [ app ];
+  # The executable's ERL_LIBS, which the install check loads too.
+  erlLibs = lib.concatMapStringsSep ":" (dep: "${dep}/lib/erlang/lib") libs;
+
+  # erlang_quic's crypto NIF loads, and shares OTP's libcrypto: once crypto and the NIF are both
+  # loaded, the VM maps one libcrypto. Platforms without /proc/self/maps check only the first.
+  nifCheck = ''
+    true = quic_crypto_nif:is_loaded(),
+    _ = crypto:info_lib(),
+    case file:read_file("/proc/self/maps") of
+        {ok, Maps} ->
+            [_] = lists:usort([
+                lists:last(string:lexemes(Line, " "))
+             || Line <- string:lexemes(binary_to_list(Maps), "\n"),
+                string:find(Line, "libcrypto") =/= nomatch
+            ]);
+        {error, _} ->
+            ok
+    end,
+    halt().
+  '';
 in
 stdenvNoCC.mkDerivation {
   pname = "trevrpc-interop-erlang";
@@ -53,12 +73,14 @@ stdenvNoCC.mkDerivation {
   installPhase = ''
     runHook preInstall
     makeWrapper ${erlang}/bin/erl $out/bin/trevrpc-interop-erlang \
-      --set ERL_LIBS ${lib.concatMapStringsSep ":" (dep: "${dep}/lib/erlang/lib") libs} \
+      --set ERL_LIBS ${erlLibs} \
       --add-flags "-noshell -s trevrpc_interop main -extra"
     runHook postInstall
   '';
 
-  # The VM boots and loads the executable: a bad command line is a usage error.
+  # The VM boots and loads the executable: a bad command line is a usage error. erlang_quic's crypto
+  # NIF loads too (nifCheck); without it, erlang_quic falls back to OTP's crypto, which works but is
+  # slower.
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
@@ -66,6 +88,7 @@ stdenvNoCC.mkDerivation {
     status=0
     $out/bin/trevrpc-interop-erlang nope 2>/dev/null || status=$?
     test "$status" = 2
+    ERL_LIBS=${erlLibs} ${erlang}/bin/erl -noshell -eval ${lib.escapeShellArg nifCheck}
     runHook postInstallCheck
   '';
 

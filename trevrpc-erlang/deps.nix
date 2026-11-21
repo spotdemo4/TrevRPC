@@ -4,6 +4,7 @@
 {
   lib,
   beamMinimal29Packages,
+  cmake,
 }:
 lockFile:
 let
@@ -37,18 +38,38 @@ let
     ) locked
   );
 
+  # Build settings some dependencies need beyond buildRebar3's, by name.
+  builds = {
+    # erlang_quic's crypto NIF keeps an OpenSSL cipher context per key and seals a run of packets
+    # in one call, where OTP's crypto sets the key up again for every packet. erlang_quic builds it
+    # only when QUIC_BUILD_NIF=1 is set at compile time, and runs on OTP's crypto without it: an
+    # Erlang server streaming 4 KiB messages ran 15-36% faster with it (#629). buildRebar3 already
+    # links the OpenSSL OTP's crypto uses, which the NIF must share.
+    quic = {
+      env.QUIC_BUILD_NIF = "1";
+      nativeBuildInputs = [ cmake ];
+      # rebar3's pre-compile hook runs CMake (c_src/build_nif.sh), not a configure phase.
+      dontUseCmakeConfigure = true;
+    };
+  };
+
   # rebar.lock records how deep each dependency sits, not what depends on what, so each one gets
   # the deeper ones as its dependencies.
   deps = lib.listToAttrs (
     map (
       dep:
-      lib.nameValuePair dep.name (buildRebar3 {
-        inherit (dep) name version;
-        src = sources.${dep.name};
-        beamDeps = map (deeper: deps.${deeper.name}) (
-          builtins.filter (other: other.level > dep.level) locked
-        );
-      })
+      lib.nameValuePair dep.name (
+        buildRebar3 (
+          {
+            inherit (dep) name version;
+            src = sources.${dep.name};
+            beamDeps = map (deeper: deps.${deeper.name}) (
+              builtins.filter (other: other.level > dep.level) locked
+            );
+          }
+          // builds.${dep.name} or { }
+        )
+      )
     ) locked
   );
 in
