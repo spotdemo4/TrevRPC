@@ -7,18 +7,19 @@ import contextlib
 import math
 from collections import deque
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol, Self, TypedDict
 
 from protobuf import Message
 
+from ._compression import CallCompression, Compression, StreamBudget
 from ._frames import FrameType, encode_frame
 from ._metadata import Metadata, MetadataInput, normalize_metadata, validate_metadata
 from ._method import Method, MethodKind
 from ._status import Code, TrevRpcError
 from ._varint import decode_varint
-from ._wire import RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, WireError
+from ._wire import RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, StreamCompression, WireError
 
 if TYPE_CHECKING:
     from ._stream import Stream
@@ -62,12 +63,17 @@ class StreamOpener(Protocol):
     """What a call needs of a channel."""
 
     max_frame_size: int
+    compression: Compression
+    stream_budget: StreamBudget | None
 
     async def open_stream(self, max_frame_size: int) -> Stream: ...
 
 
-def _prepare(method: Method[Message, Message], options: CallOptions) -> tuple[bytes, float | None]:
-    """The call's REQUEST frame and deadline (on the event loop's clock)."""
+def _prepare(
+    method: Method[Message, Message], options: CallOptions
+) -> tuple[RpcRequest, float | None]:
+    """The call's REQUEST, before its negotiation fields, and its deadline (on the event loop's
+    clock)."""
     metadata = normalize_metadata(options.get("metadata"))
     timeout = options.get("timeout")
     timeout_nanos = 0
@@ -83,8 +89,28 @@ def _prepare(method: Method[Message, Message], options: CallOptions) -> tuple[by
                 Code.INVALID_ARGUMENT, "RPC timeout does not fit in 64-bit nanoseconds"
             )
         deadline = asyncio.get_running_loop().time() + timeout
-    request = RpcRequest(method.path, metadata, method.kind, timeout_nanos)
-    return encode_frame(FrameType.REQUEST, request.encode()), deadline
+    return RpcRequest(method.path, metadata, method.kind, timeout_nanos), deadline
+
+
+def _negotiate(
+    channel: StreamOpener, stream: Stream, method: Method[Message, Message], request: RpcRequest
+) -> tuple[CallCompression, RpcRequest]:
+    """The call's compression on the stream's connection, and its REQUEST with the negotiation
+    fields."""
+    compression = CallCompression(
+        channel.compression, stream.compression, channel.stream_budget, method
+    )
+    request = replace(
+        request,
+        accept_dictionaries=compression.accept_dictionaries,
+        dictionary_query=compression.dictionary_query,
+        stream_compression=compression.stream_compression,
+    )
+    return compression, request
+
+
+def _request_frame(request: RpcRequest) -> bytes:
+    return encode_frame(FrameType.REQUEST, request.encode())
 
 
 def _frame_limit(channel: StreamOpener, options: CallOptions) -> int:
@@ -101,7 +127,8 @@ def _frame_limit(channel: StreamOpener, options: CallOptions) -> int:
     return limit
 
 
-def _encode_message(message: Message, max_frame_size: int) -> bytes:
+def _serialize(message: Message, max_frame_size: int) -> bytes:
+    """A request message's bytes, which its frame then carries, compressed or not."""
     try:
         payload = message.to_binary()
     except Exception as error:
@@ -113,7 +140,7 @@ def _encode_message(message: Message, max_frame_size: int) -> bytes:
             Code.RESOURCE_EXHAUSTED,
             f"request message of {len(payload)} bytes exceeds the {max_frame_size}-byte limit",
         )
-    return encode_frame(FrameType.MESSAGE, payload)
+    return payload
 
 
 def _deadline_exceeded() -> TrevRpcError:
@@ -129,18 +156,26 @@ class _Response:
 
     __slots__ = (
         "_answered",
+        "_compression",
         "_counted",
         "_kind",
+        "_max_size",
         "_on_headers",
         "_on_metadata",
         "_seen",
+        "answer",
         "headers",
         "messages",
         "status",
     )
 
-    def __init__(self, kind: MethodKind, options: CallOptions) -> None:
+    def __init__(
+        self, kind: MethodKind, options: CallOptions, compression: CallCompression, max_size: int
+    ) -> None:
         self._kind = kind
+        self._compression = compression
+        self._max_size = max_size
+        self.answer: RpcAnswer | None = None
         self._on_headers = options.get("on_response_headers")
         self._on_metadata = options.get("on_response_metadata")
         self._seen = False
@@ -151,13 +186,13 @@ class _Response:
         self.status: RpcStatus | None = None
 
     def handle(self, frame_type: int, payload: bytes) -> bytes | None:
-        """Takes one known frame; returns a message's payload. Raises an `INTERNAL`
+        """Takes one known frame; returns a message's payload, decompressed. Raises an `INTERNAL`
         `TrevRpcError` for a frame the grammar does not allow."""
         if self.status is not None:
             raise TrevRpcError(Code.INTERNAL, f"frame of type {frame_type} after STATUS")
         try:
             match frame_type:
-                case FrameType.MESSAGE:
+                case FrameType.MESSAGE | FrameType.ZSTD_MESSAGE | FrameType.ZSTD_STREAM_MESSAGE:
                     if self._counted:
                         raise TrevRpcError(Code.INTERNAL, "MESSAGE after DATAGRAM_COUNT")
                     self._set_headers({})
@@ -168,7 +203,7 @@ class _Response:
                     ):
                         raise TrevRpcError(Code.INTERNAL, "more than one response message")
                     self._seen = True
-                    return payload
+                    return self._compression.decode(frame_type, payload, self._max_size)
                 case FrameType.STATUS:
                     status = RpcStatus.decode(payload)
                     validate_metadata(status.metadata, Code.INTERNAL)
@@ -184,8 +219,10 @@ class _Response:
                 case FrameType.ANSWER:
                     if self._seen or self._answered:
                         raise TrevRpcError(Code.INTERNAL, "ANSWER after another frame")
-                    RpcAnswer.decode(payload)
+                    answer = RpcAnswer.decode(payload)
                     self._answered = True
+                    self.answer = answer
+                    self._compression.learn(answer)
                 case FrameType.DATAGRAM_COUNT:
                     if self._counted:
                         raise TrevRpcError(Code.INTERNAL, "second DATAGRAM_COUNT")
@@ -194,10 +231,6 @@ class _Response:
                         raise TrevRpcError(Code.INTERNAL, "malformed DATAGRAM_COUNT")
                     self._counted = True
                     self._seen = True
-                case FrameType.ZSTD_MESSAGE | FrameType.ZSTD_STREAM_MESSAGE:
-                    raise TrevRpcError(
-                        Code.INTERNAL, "compressed response message on a call that accepts none"
-                    )
                 case _:
                     raise TrevRpcError(Code.INTERNAL, f"frame of type {frame_type} on a response")
         except WireError as error:
@@ -225,6 +258,42 @@ class _Response:
         return Status(Code.OK, status.message, status.metadata)
 
 
+def _call_error(error: BaseException) -> TrevRpcError:
+    """The call's error for an exception that ended a step of it."""
+    if isinstance(error, TrevRpcError):
+        return error
+    if isinstance(error, asyncio.CancelledError):
+        return _cancelled()
+    return TrevRpcError.wrap(error)
+
+
+def _refused(frame_type: int, payload: bytes) -> bool:
+    """Whether the first frame of an optimistic call's response refuses it."""
+    if frame_type != FrameType.STATUS:
+        return False
+    try:
+        return RpcStatus.decode(payload).refused_stream_compression
+    except WireError:
+        return False
+
+
+def _check_optimistic_answer(frame_type: int, payload: bytes) -> None:
+    """An optimistic call's response starts with a STATUS, or an ANSWER accepting it."""
+    if frame_type == FrameType.STATUS:
+        return
+    if frame_type == FrameType.ANSWER:
+        try:
+            if RpcAnswer.decode(payload).stream_compression:
+                return
+        except WireError:
+            pass
+    raise TrevRpcError(
+        Code.INTERNAL,
+        f"response to an optimistic call started with a frame of type {frame_type}, "
+        "not an ANSWER accepting it",
+    )
+
+
 def _decode[T: Message](message_type: type[T], payload: bytes) -> T:
     try:
         return message_type.from_binary(payload)
@@ -236,13 +305,16 @@ async def unary_call[Req: Message, Resp: Message](
     channel: StreamOpener, method: Method[Req, Resp], request: Req, options: CallOptions
 ) -> Resp:
     """Sends one request and returns the response."""
-    frame, deadline = _prepare(method, options)  # pyright: ignore[reportArgumentType]
+    base, deadline = _prepare(method, options)  # pyright: ignore[reportArgumentType]
     max_frame_size = _frame_limit(channel, options)
-    frame += _encode_message(request, max_frame_size)
+    payload = _serialize(request, max_frame_size)
     stream: Stream | None = None
+    compression: CallCompression | None = None
     try:
         async with asyncio.timeout_at(deadline):
             stream = await channel.open_stream(max_frame_size)
+            compression, full = _negotiate(channel, stream, method, base)  # pyright: ignore[reportArgumentType]
+            frame = _request_frame(full) + compression.encode(payload)
             try:
                 await stream.write(frame, end=True)
             except TrevRpcError:
@@ -250,7 +322,7 @@ async def unary_call[Req: Message, Resp: Message](
                 # the response then reports.
                 if not stream.stopped_by_peer:
                     raise
-            response = _Response(method.kind, options)
+            response = _Response(method.kind, options, compression, max_frame_size)
             payload = b""
             while response.status is None:
                 received = await stream.read_frame()
@@ -280,6 +352,9 @@ async def unary_call[Req: Message, Resp: Message](
         if stream is not None:
             stream.fail(wrapped)
         raise
+    finally:
+        if compression is not None:
+            compression.close()
 
 
 class _StreamingCall[Req: Message, Resp: Message]:
@@ -289,6 +364,11 @@ class _StreamingCall[Req: Message, Resp: Message]:
     are read ahead into a bounded queue, so that the final status is seen even while nobody calls
     `recv()`; the queue pauses reading once it holds `_READ_AHEAD_MESSAGES` messages or
     `_READ_AHEAD_BYTES` bytes, which holds back the server through flow control.
+
+    An optimistic call (see `CallCompression`) keeps its requests until the server answers. If the
+    server refuses it, the call is replayed once on a new stream without optimism: the REQUEST,
+    with the time left of the deadline, then the kept requests. Sends made meanwhile succeed, since
+    the replay carries them.
     """
 
     def __init__(
@@ -300,12 +380,14 @@ class _StreamingCall[Req: Message, Resp: Message]:
     ) -> None:
         loop = asyncio.get_running_loop()
         self._loop = loop
+        self._channel = channel
         self._method = method
+        self._options = options
         self._max_frame_size = _frame_limit(channel, options)
-        frame, deadline = _prepare(method, options)  # pyright: ignore[reportArgumentType]
-        if first is not None:
-            frame += _encode_message(first, self._max_frame_size)
-        self._response = _Response(method.kind, options)
+        self._request, self._deadline = _prepare(method, options)  # pyright: ignore[reportArgumentType]
+        first_payload = _serialize(first, self._max_frame_size) if first is not None else None
+        self._compression: CallCompression | None = None
+        self._response: _Response | None = None
         self._stream: Stream | None = None
         self._error: TrevRpcError | None = None
         self._queue: deque[tuple[Resp, int]] = deque()
@@ -319,19 +401,27 @@ class _StreamingCall[Req: Message, Resp: Message]:
         self._readable: asyncio.Future[None] | None = None
         self._room: asyncio.Future[None] | None = None
         self._stall_waiters: list[asyncio.Future[None]] = []
+        self._settled = asyncio.Event()
+        """Set once an optimistic call was accepted or refused, or the call ended."""
+        self._replaying: asyncio.Future[None] | None = None
+        self._replay_task: asyncio.Task[None] | None = None
+        self._generation = 0
+        """Counts replays: a write to an older generation's stream was replayed."""
         self._deadline_timer = (
-            loop.call_at(deadline, self._fail, _deadline_exceeded()) if deadline else None
+            loop.call_at(self._deadline, self._fail, _deadline_exceeded())
+            if self._deadline
+            else None
         )
         self._upload_ended = first is not None
         self._send_lock = asyncio.Lock()
         self._pump_task: asyncio.Task[None] | None = None
-        self._started = loop.create_task(self._start(channel, frame, end=first is not None))
+        self._started = loop.create_task(self._start(first_payload))
         # Its failure is the call's, which every operation reports.
         self._started.add_done_callback(_retrieve)
 
-    async def _start(self, channel: StreamOpener, frame: bytes, *, end: bool) -> Stream:
+    async def _start(self, first: bytes | None) -> Stream:
         try:
-            stream = await channel.open_stream(self._max_frame_size)
+            stream = await self._channel.open_stream(self._max_frame_size)
         except TrevRpcError as error:
             self._fail(error)
             raise
@@ -339,8 +429,19 @@ class _StreamingCall[Req: Message, Resp: Message]:
             stream.fail(self._error)
             raise self._error
         self._stream = stream
+        compression, self._request = _negotiate(self._channel, stream, self._method, self._request)  # pyright: ignore[reportArgumentType]
+        self._compression = compression
+        if compression.settled:
+            self._settled.set()
+        self._response = _Response(
+            self._method.kind, self._options, compression, self._max_frame_size
+        )
+        frame = _request_frame(self._request)
+        if first is not None:
+            # Only server-streaming calls have a first request, and they are never optimistic.
+            frame += compression.encode(first)
         try:
-            await stream.write(frame, end=end)
+            await stream.write(frame, end=first is not None)
         except TrevRpcError as error:
             self._fail(self._upload_error(error))
             raise
@@ -349,17 +450,32 @@ class _StreamingCall[Req: Message, Resp: Message]:
 
     async def _stream_ready(self) -> Stream:
         try:
-            return await asyncio.shield(self._started)
+            await asyncio.shield(self._started)
         except TrevRpcError:
             raise self._error or _cancelled() from None
+        replaying = self._replaying
+        if replaying is not None:
+            await asyncio.shield(replaying)
+        stream = self._stream
+        assert stream is not None
+        return stream
 
     async def _pump(self, stream: Stream) -> None:
-        response = self._response
+        compression = self._compression
+        assert compression is not None
         try:
             while True:
                 received = await stream.read_frame()
                 if received is None:
                     raise TrevRpcError(Code.INTERNAL, "response stream ended before STATUS")
+                if not compression.settled:
+                    if _refused(*received):
+                        stream = await self._replay(stream)
+                        continue
+                    self._settle()
+                    _check_optimistic_answer(*received)
+                response = self._response
+                assert response is not None
                 payload = response.handle(*received)
                 if self._headers.done() is False and response.headers is not None:
                     self._headers.set_result(response.headers)
@@ -400,12 +516,103 @@ class _StreamingCall[Req: Message, Resp: Message]:
         except Exception as error:
             self._fail(TrevRpcError.wrap(error))
 
+    def _settle(self) -> None:
+        compression = self._compression
+        if compression is not None:
+            compression.settle()
+        self._settled.set()
+
+    async def _replay(self, refused: Stream) -> Stream:
+        """Replays a refused optimistic call on a new stream of the same connection, once: the
+        REQUEST without optimism, with the time left of the deadline, then the kept requests and
+        the end of the request stream if it ended. Writes waiting on the refused stream fail, and
+        their sends succeed once the replay is written.
+
+        The replay is written beside the response reader, which returns the new stream at once: a
+        server that echoes, and stops reading requests while its responses are not read, would
+        otherwise stall the write until the deadline. A call never moves between connections, so
+        one whose connection ended meanwhile fails with `UNAVAILABLE`."""
+        compression = self._compression
+        assert compression is not None
+        replaying = self._loop.create_future()
+        replaying.add_done_callback(_retrieve)
+        self._replaying = replaying
+        self._generation += 1
+        kept = compression.refused()
+        self._settled.set()
+        refused.fail(_cancelled())
+        try:
+            stream = await self._channel.open_stream(self._max_frame_size)
+            if self._error is not None:
+                stream.fail(self._error)
+                raise self._error
+            if stream.compression is not compression.connection:
+                error = TrevRpcError(
+                    Code.UNAVAILABLE,
+                    "transport unavailable: "
+                    "the connection ended before a refused call was replayed",
+                )
+                stream.fail(error)
+                raise error
+            self._stream = stream
+            request = replace(self._request, stream_compression=StreamCompression.ENABLED)
+            if self._deadline is not None:
+                remaining = self._deadline - self._loop.time()
+                request = replace(request, timeout_nanos=max(1, math.ceil(remaining * 1e9)))
+            self._request = request
+            self._response = _Response(
+                self._method.kind, self._options, compression, self._max_frame_size
+            )
+            frame = _request_frame(request) + b"".join(compression.encode_message(p) for p in kept)
+        except BaseException as error:
+            self._replayed(replaying, self._error or _call_error(error))
+            raise
+        self._replay_task = self._loop.create_task(self._write_replay(stream, frame, replaying))
+        return stream
+
+    async def _write_replay(
+        self, stream: Stream, frame: bytes, replaying: asyncio.Future[None]
+    ) -> None:
+        try:
+            await stream.write(frame, end=self._upload_ended)
+        except BaseException as error:
+            if isinstance(error, asyncio.CancelledError):
+                failure = self._error or _cancelled()
+                self._replayed(replaying, failure)
+                self._fail(failure)
+                raise
+            if self._error is None and self._end is None and stream.stopped_by_peer:
+                # The server stops reading requests after writing its status.
+                await self._outcome_or_stall()
+            if self._error is None and (self._end is not None or stream.stopped_by_peer):
+                # The server ended the call, or stopped reading its requests: the responses
+                # report how the call ended, after the ones already queued.
+                self._replayed(replaying, self._upload_error(_call_error(error)))
+                return
+            failure = self._error or _call_error(error)
+            self._replayed(replaying, failure)
+            self._fail(failure)
+            return
+        self._replayed(replaying, None)
+
+    def _replayed(self, replaying: asyncio.Future[None], error: TrevRpcError | None) -> None:
+        """Ends a replay, waking the sends that wait for it."""
+        if self._replaying is replaying:
+            self._replaying = None
+        if replaying.done():
+            return
+        if error is None:
+            replaying.set_result(None)
+        else:
+            replaying.set_exception(error)
+
     def _finish(self, end: TrevRpcError | Status) -> None:
         """Ends the call with its final status, after the queued messages."""
         if self._error is not None or self._end is not None:
             return
         self._end = end
         self._cancel_timer()
+        self._release()
         if isinstance(end, Status):
             self._outcome.set_result(end)
             upload_error = _upload_after_ok()
@@ -415,8 +622,9 @@ class _StreamingCall[Req: Message, Resp: Message]:
         if not self._headers.done():
             self._headers.set_exception(upload_error)
         stream = self._stream
-        if stream is not None and not stream.send_done:
-            stream.reset_send(upload_error)
+        if stream is not None and (not stream.send_done or self._replaying is not None):
+            # A replay still being written is abandoned too: nobody needs its requests now.
+            stream.reset_send(upload_error, abandon=True)
         self._wake_reader()
 
     def _fail(self, error: TrevRpcError) -> None:
@@ -426,6 +634,9 @@ class _StreamingCall[Req: Message, Resp: Message]:
             return
         self._error = error
         self._cancel_timer()
+        self._release()
+        if self._replaying is not None:
+            self._replayed(self._replaying, error)
         self._queue.clear()
         self._queued_bytes = 0
         if self._end is None:
@@ -438,6 +649,13 @@ class _StreamingCall[Req: Message, Resp: Message]:
         self._wake_reader()
         if self._room is not None and not self._room.done():
             self._room.set_result(None)
+
+    def _release(self) -> None:
+        """Gives back what the call holds of the stream compression budget, and wakes sends
+        waiting for room."""
+        if self._compression is not None:
+            self._compression.close()
+        self._settled.set()
 
     def _cancel_timer(self) -> None:
         if self._deadline_timer is not None:
@@ -517,16 +735,30 @@ class _StreamingCall[Req: Message, Resp: Message]:
                 raise self._upload_error(
                     TrevRpcError(Code.FAILED_PRECONDITION, "the request stream is closed")
                 )
-            frame = _encode_message(request, self._max_frame_size)
-            stream = await self._stream_ready()
-            if self._end is not None or self._error is not None:
-                raise self._upload_error(_cancelled())
-            try:
-                await stream.write(frame)
-            except TrevRpcError as error:
-                if stream.stopped_by_peer:
-                    await self._outcome_or_stall()
-                raise self._upload_error(error) from None
+            payload = _serialize(request, self._max_frame_size)
+            while True:
+                stream = await self._stream_ready()
+                if self._end is not None or self._error is not None:
+                    raise self._upload_error(_cancelled())
+                compression = self._compression
+                assert compression is not None
+                if not compression.settled and not compression.keep(payload):
+                    # No room to keep it for a replay: wait for the server's answer.
+                    await self._settled.wait()
+                    continue
+                generation = self._generation
+                frame = compression.encode(payload)
+                try:
+                    await stream.write(frame)
+                except TrevRpcError as error:
+                    if self._generation != generation:
+                        # The refused call's stream: the replay carries this request.
+                        await self._stream_ready()
+                        return
+                    if stream.stopped_by_peer:
+                        await self._outcome_or_stall()
+                    raise self._upload_error(error) from None
+                return
 
     async def send_all(self, requests: Iterable[Req] | AsyncIterable[Req]) -> None:
         """Sends every message of `requests`, then closes the request stream. If the server ended
@@ -569,11 +801,16 @@ class _StreamingCall[Req: Message, Resp: Message]:
                 stream = await self._stream_ready()
             except TrevRpcError:
                 return
-            if self._end is not None or self._error is not None:
+            if self._end is not None or self._error is not None or stream.send_done:
                 return
+            generation = self._generation
             try:
                 await stream.write(b"", end=True)
             except TrevRpcError:
+                if self._generation != generation:
+                    # The replay ends the new stream's requests.
+                    with contextlib.suppress(TrevRpcError):
+                        await self._stream_ready()
                 return
 
     # Cancellation

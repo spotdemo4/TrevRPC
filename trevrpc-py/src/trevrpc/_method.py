@@ -13,9 +13,10 @@ MethodKind = RpcKind
 """How many messages a method takes and returns: unary, client, server or bidi streaming."""
 
 
-class Compression(IntEnum):
+class MethodCompression(IntEnum):
     """How a method's messages may be compressed without a dictionary, from its
-    `(trevrpc.method).compression` option."""
+    `(trevrpc.method).compression` option: per message (`MESSAGE`), or also against the call's
+    earlier messages (`STREAM`)."""
 
     UNSPECIFIED = 0
     MESSAGE = 1
@@ -33,4 +34,4 @@ class Method[Req: Message, Resp: Message]:
     response: type[Resp]
     unreliable_requests: bool = False
     unreliable_responses: bool = False
-    compression: Compression = Compression.UNSPECIFIED
+    compression: MethodCompression = MethodCompression.UNSPECIFIED

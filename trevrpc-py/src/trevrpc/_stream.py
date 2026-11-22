@@ -4,10 +4,13 @@ cancel semantics of the protocol, whatever the transport (native QUIC or QMux)."
 from __future__ import annotations
 
 import asyncio
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from ._frames import FrameReader
 from ._status import Code, TrevRpcError
+
+if TYPE_CHECKING:
+    from ._compression import ConnectionCompression
 
 CANCEL_CODE = 1
 """The stream error code of a cancelled call."""
@@ -16,6 +19,9 @@ CANCEL_CODE = 1
 class StreamTransport(Protocol):
     """What a `Stream` needs of the connection it belongs to. The connection feeds the stream
     with `on_data`, `on_reset`, `on_stop_sending`, `on_connection_error` and `on_drained`."""
+
+    compression: ConnectionCompression
+    """What the connection has negotiated for compressed messages."""
 
     def write(self, stream: Stream, data: bytes, end: bool) -> bool:
         """Queues data, and the end of the stream with `end`; returns whether the stream has
@@ -214,6 +220,11 @@ class Stream:
         return self._send_done
 
     @property
+    def compression(self) -> ConnectionCompression:
+        """What the stream's connection has negotiated for compressed messages."""
+        return self._connection.compression
+
+    @property
     def stopped_by_peer(self) -> bool:
         """Whether the peer stopped the send side (STOP_SENDING) while the stream is still read."""
         return self._write_error is not None and self._error is None
@@ -233,13 +244,14 @@ class Stream:
         self._wake_reader()
         self._wake_writer()
 
-    def reset_send(self, error: TrevRpcError) -> None:
+    def reset_send(self, error: TrevRpcError, *, abandon: bool = False) -> None:
         """Resets the send side with the cancel code and keeps reading; a pending write raises
-        `error`. A send side that already sent its end is left alone."""
+        `error`. A send side whose end was written is left alone, unless `abandon` says to drop
+        what of it is still unsent; the connection leaves one that sent everything alone."""
         if self._error is not None or self._write_error is not None:
             return
         self._write_error = error
-        if not self._send_done:
+        if not self._send_done or abandon:
             self._send_done = True
             self._connection.reset_send(self)
         self._wake_writer()

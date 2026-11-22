@@ -16,11 +16,28 @@ import argparse
 import asyncio
 import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 
 import trevrpc
-from gen.interop_pb import EchoRequest
+from gen.compressed_pb import PlainMessage
+from gen.compressed_trevrpc import CompressedEchoClient, RefusingEchoClient
+from gen.interop_pb import EchoRequest, EchoResponse
 from gen.interop_trevrpc import EchoClient
 from trevrpc import Code, TrevRpcError
+
+# The message types the interop dictionary compresses.
+INTEROP_MESSAGE_TYPES = ("trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse")
+
+STREAM_COMPRESSED_RECEIVED = "interop-stream-compressed-received"
+PLAIN_COMPRESSED_RECEIVED = "interop-plain-compressed-received"
+
+
+@dataclass(frozen=True)
+class Clients:
+    echo: EchoClient
+    compressed: CompressedEchoClient
+    refusing: RefusingEchoClient
 
 
 class ScenarioError(Exception):
@@ -158,27 +175,178 @@ async def server_stream_headers(echo: EchoClient) -> None:
     expect([{"interop-trailer": b"h"}], trailers, "trailers")
 
 
-type Scenario = Callable[[EchoClient], Awaitable[None]] | str
+# Compression scenarios
+
+
+# The message of the plain.records compression golden vector: a JSON record that compresses without
+# a dictionary.
+PLAIN_RECORD = (
+    '{"service":"search","region":"us-east-1","status":200,"latency_ms":118,"path":"/v1/search",'
+    '"query":"wireless headphones","results":[{"id":"p-1001","title":"Wireless headphones",'
+    '"price":59.99},{"id":"p-1002","title":"Wireless earbuds","price":39.99},{"id":"p-1003",'
+    '"title":"Wireless headphones pro","price":129.99}]}'
+)
+
+COMPRESSED_MESSAGES = 3
+COMPRESSED_STREAM_MESSAGES = 8
+OPTIMISTIC_STREAM_COMPRESSED = COMPRESSED_STREAM_MESSAGES - 2
+"""The compressed-stream messages a server receives stream-compressed from an optimistic client:
+the third and every later one."""
+
+
+def compressed_message(i: int) -> str:
+    """Like the documents the interop dictionary was trained on, so it compresses."""
+    return f'{{"service":"search","region":"us-east-1","status":404,"latency_ms":{100 + i}}}'
+
+
+def metadata_count(metadata: trevrpc.Metadata, key: str) -> int:
+    value = metadata.get(key)
+    if value is None or not value.isdigit():
+        raise ScenarioError(f"trailing metadata {key} = {value!r}, want a count")
+    return int(value)
+
+
+async def compressed(clients: Clients) -> None:
+    """Messages that compress, in unary calls and on a bidirectional stream: with the interop
+    dictionary on both sides they travel as ZSTD_MESSAGE frames."""
+    for i in range(2):
+        response = await clients.echo.unary(EchoRequest(message=compressed_message(i)))
+        expect(compressed_message(i), response.message, f"unary {i}")
+    async with clients.echo.bidi() as call:
+        for i in range(COMPRESSED_MESSAGES):
+            await call.send(EchoRequest(message=compressed_message(i)))
+        await call.close_send()
+        for i in range(COMPRESSED_MESSAGES):
+            response = await call.recv()
+            if response is None:
+                raise ScenarioError(f"responses ended before response {i}")
+            expect_response(response, compressed_message(i), i)
+        expect(None, await call.recv(), "end of the responses")
+
+
+async def compressed_bidi(clients: Clients, min_compressed: int) -> None:
+    """The compressed-stream messages echoed one at a time, with response headers read before the
+    first echo; the server must have received at least `min_compressed` stream-compressed."""
+    async with clients.compressed.bidi(metadata={"interop-header": "h"}) as call:
+        for i in range(COMPRESSED_STREAM_MESSAGES):
+            await call.send(EchoRequest(message=compressed_message(i)))
+            if i == 0:
+                expect({"interop-header": b"h"}, await call.headers(), "headers")
+            response = await call.recv()
+            if response is None:
+                raise ScenarioError(f"responses ended before response {i}")
+            expect_response(response, compressed_message(i), i)
+        await call.close_send()
+        expect(None, await call.recv(), "end of the responses")
+        status = await call.status()
+    expect(b"h", status.metadata.get("interop-trailer"), "trailing metadata interop-trailer")
+    received = metadata_count(status.metadata, STREAM_COMPRESSED_RECEIVED)
+    if received < min_compressed:
+        raise ScenarioError(
+            f"{STREAM_COMPRESSED_RECEIVED} = {received}: expected at least {min_compressed} "
+            "requests to arrive stream-compressed"
+        )
+
+
+async def compressed_client_stream(
+    start: Callable[..., trevrpc.ClientStreamingCall[EchoRequest, EchoResponse]],
+    min_compressed: int,
+) -> None:
+    """The compressed-stream messages sent at once, their concatenation echoed, each received once;
+    with `min_compressed` above zero, at least that many arrived stream-compressed."""
+    trailers: list[trevrpc.Metadata] = []
+    async with start(on_response_metadata=trailers.append) as call:
+        for i in range(COMPRESSED_STREAM_MESSAGES):
+            await call.send(EchoRequest(message=compressed_message(i)))
+        response = await call.close_and_recv()
+    want = "".join(compressed_message(i) for i in range(COMPRESSED_STREAM_MESSAGES))
+    expect_response(response, want, COMPRESSED_STREAM_MESSAGES)
+    if min_compressed:
+        received = metadata_count(trailers[0], STREAM_COMPRESSED_RECEIVED)
+        if received < min_compressed:
+            raise ScenarioError(
+                f"{STREAM_COMPRESSED_RECEIVED} = {received}: expected at least {min_compressed} "
+                "requests to arrive stream-compressed"
+            )
+
+
+async def compressed_stream(clients: Clients) -> None:
+    """Optimistic stream compression: the server receives the third message and every later one
+    stream-compressed, without the client waiting for its answer."""
+    try:
+        await compressed_bidi(clients, OPTIMISTIC_STREAM_COMPRESSED)
+    except ScenarioError as error:
+        raise ScenarioError(f"bidi: {error}") from None
+    try:
+        await compressed_client_stream(
+            clients.compressed.client_stream, OPTIMISTIC_STREAM_COMPRESSED
+        )
+    except ScenarioError as error:
+        raise ScenarioError(f"client stream: {error}") from None
+
+
+async def refused_stream(clients: Clients) -> None:
+    """The server refuses an optimistic call, which the client replays; the next call waits for its
+    answer, which makes the one after it optimistic again."""
+    try:
+        await compressed_client_stream(clients.refusing.client_stream, 0)
+    except ScenarioError as error:
+        raise ScenarioError(f"refused client stream: {error}") from None
+    try:
+        await compressed_bidi(clients, 1)
+    except ScenarioError as error:
+        raise ScenarioError(f"bidi: {error}") from None
+    try:
+        await compressed_client_stream(
+            clients.compressed.client_stream, OPTIMISTIC_STREAM_COMPRESSED
+        )
+    except ScenarioError as error:
+        raise ScenarioError(f"client stream: {error}") from None
+
+
+async def compressed_plain(clients: Clients) -> None:
+    """A record that compresses without a dictionary, twice: the first call's answer lets the
+    second compress its request."""
+    text = PLAIN_RECORD * 2
+    for call in range(2):
+        trailers: list[trevrpc.Metadata] = []
+        response = await clients.compressed.plain(
+            PlainMessage(text=text), on_response_metadata=trailers.append
+        )
+        expect(text, response.text, f"call {call} echo")
+        received = trailers[0].get(PLAIN_COMPRESSED_RECEIVED)
+        expect(True, received in (b"0", b"1"), f"call {call} {PLAIN_COMPRESSED_RECEIVED}")
+        if call == 1:
+            expect(b"1", received, f"call {call} {PLAIN_COMPRESSED_RECEIVED}")
+
+
+def on_echo(
+    scenario: Callable[[EchoClient], Awaitable[None]],
+) -> Callable[[Clients], Awaitable[None]]:
+    return lambda clients: scenario(clients.echo)
+
+
+type Scenario = Callable[[Clients], Awaitable[None]] | str
 
 # Every scenario of interop/README.md, in order; those this client cannot run yet name why.
 SCENARIOS: dict[str, Scenario] = {
-    "unary": unary,
-    "unary-metadata": unary_metadata,
-    "unary-error": unary_error,
-    "unary-retry-delay": unary_retry_delay,
-    "unary-large": unary_large,
-    "client-stream": client_stream,
-    "server-stream": server_stream,
-    "server-stream-error": server_stream_error,
-    "bidi": bidi,
-    "bidi-error": bidi_error,
-    "unary-headers": unary_headers,
-    "server-stream-headers": server_stream_headers,
+    "unary": on_echo(unary),
+    "unary-metadata": on_echo(unary_metadata),
+    "unary-error": on_echo(unary_error),
+    "unary-retry-delay": on_echo(unary_retry_delay),
+    "unary-large": on_echo(unary_large),
+    "client-stream": on_echo(client_stream),
+    "server-stream": on_echo(server_stream),
+    "server-stream-error": on_echo(server_stream_error),
+    "bidi": on_echo(bidi),
+    "bidi-error": on_echo(bidi_error),
+    "unary-headers": on_echo(unary_headers),
+    "server-stream-headers": on_echo(server_stream_headers),
     "unreliable": "datagram messages are not implemented",
-    "compressed": "compression is not implemented",
-    "compressed-stream": "compression is not implemented",
-    "refused-stream": "compression is not implemented",
-    "compressed-plain": "compression is not implemented",
+    "compressed": compressed,
+    "compressed-stream": compressed_stream,
+    "refused-stream": refused_stream,
+    "compressed-plain": compressed_plain,
     "connection-metadata": "connection metadata is not implemented",
     "validation": "buf.validate.Violations details are not decoded",
 }
@@ -193,12 +361,17 @@ async def run(args: argparse.Namespace) -> int:
         if unknown := selected - SCENARIOS.keys():
             print(f"client: unknown scenarios: {', '.join(sorted(unknown))}", file=sys.stderr)
             return 2
+    dictionaries = ()
+    if args.dictionary is not None:
+        data = Path(args.dictionary).read_bytes()
+        dictionaries = (trevrpc.Dictionary(data, INTEROP_MESSAGE_TYPES),)
     channel = trevrpc.Channel(
         args.addr,
         ca=args.ca,
         server_name=args.server_name,
         transport=args.transport,
         tcp_address=args.tcp_addr or args.addr,
+        compression=trevrpc.Compression(dictionaries),
     )
     try:
         try:
@@ -212,7 +385,9 @@ async def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        echo = EchoClient(channel)
+        clients = Clients(
+            EchoClient(channel), CompressedEchoClient(channel), RefusingEchoClient(channel)
+        )
         passed = True
         for name, scenario in SCENARIOS.items():
             if selected is not None and name not in selected:
@@ -222,7 +397,7 @@ async def run(args: argparse.Namespace) -> int:
             else:
                 try:
                     async with asyncio.timeout(DEADLINE):
-                        await scenario(echo)
+                        await scenario(clients)
                 except TimeoutError:
                     passed = False
                     print(f"fail {name}: no result within {DEADLINE:g}s", flush=True)

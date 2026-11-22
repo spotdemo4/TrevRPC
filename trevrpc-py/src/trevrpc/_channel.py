@@ -17,6 +17,7 @@ from ._call import (
     _StreamingCall,  # pyright: ignore[reportPrivateUsage]
     unary_call,
 )
+from ._compression import DEFAULT_STREAM_COMPRESSION_MEMORY, Compression, StreamBudget
 from ._frames import DEFAULT_MAX_FRAME_SIZE
 from ._method import Method, MethodKind
 from ._qmux import QMuxSession
@@ -82,6 +83,15 @@ class ChannelOptions(TypedDict, total=False):
     reprobe_interval: float
     """How long reconnects keep using QMux over TLS after it won a race, in seconds, before QUIC
     is tried again; 300 by default."""
+    compression: Compression
+    """Dictionaries to compress messages with, and the zstd level (1 by default). Compression
+    without a dictionary and stream compression, on the methods whose schema allows them, need no
+    settings."""
+    stream_compression_memory: int
+    """The memory, in bytes, that stream compression may hold for the channel's calls: about 350
+    KiB for a direction it decodes and 585 KiB for one it compresses, and the requests an
+    optimistic call keeps until the server answers, up to 1 MiB per call. Calls beyond it compress
+    per message. 64 MiB by default; a negative value turns stream compression off."""
 
 
 def parse_address(address: str) -> tuple[str, int]:
@@ -129,6 +139,9 @@ class Channel:
         )
         self._fallback_delay = options.get("fallback_delay", DEFAULT_FALLBACK_DELAY)
         self._reprobe_interval = options.get("reprobe_interval", DEFAULT_REPROBE_INTERVAL)
+        self.compression = options.get("compression") or Compression()
+        memory = options.get("stream_compression_memory", 0) or DEFAULT_STREAM_COMPRESSION_MEMORY
+        self.stream_budget = StreamBudget(memory) if memory > 0 else None
         self._quic_failed_at: float | None = None
         """When QMux last won a race, while reconnects skip QUIC."""
         self._connection: _Connection | None = None

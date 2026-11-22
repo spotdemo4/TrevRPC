@@ -1,11 +1,12 @@
-# The Python client, which pytest checks against the wire and QMux golden vectors and a test server
-# over loopback QUIC and QMux over TLS.
+# The Python client, which pytest checks against the wire, QMux and zstd golden vectors and a test
+# server over loopback QUIC and QMux over TLS.
 {
   lib,
   mkUvPackage,
   python314,
   qmuxGolden,
   wireGolden,
+  zstdGolden,
 }:
 mkUvPackage (finalAttrs: {
   src = lib.fileset.toSource {
@@ -25,6 +26,7 @@ mkUvPackage (finalAttrs: {
   env = {
     TREVRPC_WIRE_GOLDEN = "${wireGolden}";
     TREVRPC_QMUX_GOLDEN = "${qmuxGolden}";
+    TREVRPC_ZSTD_GOLDEN = "${zstdGolden}";
   };
 
   meta = {

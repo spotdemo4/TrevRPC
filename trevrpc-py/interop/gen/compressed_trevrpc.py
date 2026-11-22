@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Final, TYPE_CHECKING, Unpack
 
-from trevrpc import Compression, Method, MethodKind
+from trevrpc import Method, MethodCompression, MethodKind
 
 from .compressed_pb import PlainMessage
 from .interop_pb import EchoRequest, EchoResponse
@@ -26,7 +26,7 @@ COMPRESSED_ECHO_BIDI: Final = Method(
     MethodKind.BIDI_STREAMING,
     EchoRequest,
     EchoResponse,
-    compression=Compression.STREAM,
+    compression=MethodCompression.STREAM,
 )
 """
 The trevrpc.interop.v1.CompressedEcho.Bidi method.
@@ -36,7 +36,7 @@ COMPRESSED_ECHO_CLIENT_STREAM: Final = Method(
     MethodKind.CLIENT_STREAMING,
     EchoRequest,
     EchoResponse,
-    compression=Compression.STREAM,
+    compression=MethodCompression.STREAM,
 )
 """
 The trevrpc.interop.v1.CompressedEcho.ClientStream method.
@@ -46,7 +46,7 @@ COMPRESSED_ECHO_UNARY: Final = Method(
     MethodKind.UNARY,
     EchoRequest,
     EchoResponse,
-    compression=Compression.MESSAGE,
+    compression=MethodCompression.MESSAGE,
 )
 """
 The trevrpc.interop.v1.CompressedEcho.Unary method.
@@ -56,7 +56,7 @@ COMPRESSED_ECHO_PLAIN: Final = Method(
     MethodKind.UNARY,
     PlainMessage,
     PlainMessage,
-    compression=Compression.MESSAGE,
+    compression=MethodCompression.MESSAGE,
 )
 """
 The trevrpc.interop.v1.CompressedEcho.Plain method.
@@ -102,7 +102,7 @@ REFUSING_ECHO_CLIENT_STREAM: Final = Method(
     MethodKind.CLIENT_STREAMING,
     EchoRequest,
     EchoResponse,
-    compression=Compression.STREAM,
+    compression=MethodCompression.STREAM,
 )
 """
 The trevrpc.interop.v1.RefusingEcho.ClientStream method.

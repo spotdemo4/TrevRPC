@@ -7,8 +7,8 @@ QMux over TLS on the server's TCP listener where UDP is blocked, on messages gen
 [protobuf-py](https://github.com/bufbuild/protobuf-py). It is a client only, asyncio only, and requires
 Python 3.14.
 
-This package is an early work in progress: it does not compress messages, send datagrams or share
-connection metadata yet. See [#666](https://trev.zip/llc/TrevRPC/issues/666).
+This package is an early work in progress: it does not send datagrams or share connection metadata
+yet. See [#666](https://trev.zip/llc/TrevRPC/issues/666).
 
 ## Generating a client
 
@@ -78,6 +78,35 @@ channel = trevrpc.Channel(
 ```
 
 `channel.transport` says which one the current connection uses (`"quic"` or `"qmux"`).
+
+## Compression
+
+Messages travel compressed with zstd where the server agrees, negotiated per connection; see
+[Compression](https://trev.zip/llc/TrevRPC/wiki/Compression). The codec is the standard library's
+`compression.zstd`, so it needs no extra dependency; on a Python built without libzstd, nothing is
+compressed.
+
+- **Dictionaries** trained on your messages compress every message of their types:
+
+  ```python
+  compression = trevrpc.Compression(
+      [trevrpc.Dictionary(Path("metrics.dict").read_bytes(), ["example.v1.MetricSample"])],
+      level=1,
+  )
+  channel = trevrpc.Channel("example.com:443", compression=compression)
+  ```
+
+- **Without a dictionary**, messages of 256 bytes or more compress on methods whose schema sets
+  `compression: COMPRESSION_MESSAGE`, with no settings.
+- **Stream compression** compresses each streamed direction of a `COMPRESSION_STREAM` method
+  against the call's earlier messages, from its third message. Requests compress optimistically,
+  without waiting for the server's answer; a server that refuses gets the call replayed without
+  it, which the caller never sees. Each channel holds at most `stream_compression_memory` bytes
+  for it (64 MiB by default; negative turns it off), about 350 KiB per direction it decodes and
+  585 KiB per direction it compresses.
+
+Message types with a field marked `debug_redact` never compress without a dictionary or with
+stream compression.
 
 ## Flow control
 

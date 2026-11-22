@@ -20,6 +20,32 @@ Its methods take and return `google.protobuf.StringValue`:
 - `/test.Echo/Flood` sends 64 KiB responses for as long as the client lets it.
 - `/test.Echo/Hang` never responds.
 
+Compression follows the server side of the protocol: it answers dictionary queries from its own
+dictionaries (which compress `google.protobuf.StringValue`), decodes every compressed request,
+compresses responses as the call accepts, accepts optimistic calls at dispatch, and records each
+message's frame type. Methods for compression:
+
+- `/test.Echo/Refuse` is `ClientStream` registered without stream compression: it refuses
+  optimistic calls.
+- `/test.Echo/AnswerLater` is `ClientStream`, holding its ANSWER until `TestServer.answer_later`
+  is set.
+- `/test.Echo/NoAnswer` is `ClientStream` that sends HEADERS first and never answers.
+- `/test.Echo/BadZstd` and `/test.Echo/TooLarge` respond with an invalid ZSTD_MESSAGE, and one
+  declaring more than 4 MiB.
+- `/test.Echo/UnaskedStream` sends a ZSTD_STREAM_MESSAGE on a call that did not enable it.
+- `/test.Echo/RefuseLater` is `ClientStream` registered without stream compression. Over QMux, it
+  reads nothing of an optimistic call until `TestServer.refuse_now` is set, then refuses it and
+  discards its requests.
+- `/test.Echo/AnswerEarly` and `/test.Echo/StopEarly` are streaming methods registered
+  without stream compression that refuse an optimistic call once `TestServer.refuse_after`
+  requests arrived. Over QMux, on the replay, they stop reading requests after the first:
+  `AnswerEarly` responds `early` and OK, and `StopEarly` stops the request stream, then fails
+  with `FAILED_PRECONDITION` "stopped".
+- `/test.Echo/BoundedEcho` is `Bidi` registered without stream compression. It refuses an
+  optimistic call only once `TestServer.refuse_after` requests have arrived, so the replay carries
+  them all, and over QMux it stops reading requests while more than 4 KiB of its echoes are unsent,
+  as a server applying backpressure does.
+
 Tests wait on what the server saw through `Signal`s, never by sleeping.
 """
 
@@ -58,9 +84,29 @@ from trevrpc._qmux import (
     stop_sending_frame,
 )
 from trevrpc._stream import Stream
+from trevrpc._varint import decode_varint
 from trevrpc._wire import RpcHeaders, _len_field, _map_field, _varint_field, read_fields
+from trevrpc._zstd import (
+    CompressionError,
+    LoadedDictionary,
+    MessageCompressor,
+    StreamCompressor,
+    StreamDecompressor,
+    decompress_message,
+)
 
 FLOOD_MESSAGE = 64 * 1024
+MAX_FRAME = 4 * 1024 * 1024
+BAD_ZSTD = bytes.fromhex("2101478d0000203238397d047c00cac4a5bd2f4f41")  # truncated
+TOO_LARGE_ZSTD = bytes.fromhex("e0010040000001000000")  # declares 4 MiB + 1 bytes
+UNASKED_STREAM = bytes.fromhex(
+    "404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400"
+)
+_REFUSE_LATER = ("BoundedEcho", "RefuseLater", "AnswerEarly", "StopEarly")
+_EARLY = ("AnswerEarly", "StopEarly")
+REFUSAL = encode_frame(FrameType.STATUS, _varint_field(1, 8) + _varint_field(4, 1))
+ECHO_UNSENT_LIMIT = 4 * 1024
+_MESSAGE_KINDS = (FrameType.MESSAGE, FrameType.ZSTD_MESSAGE, FrameType.ZSTD_STREAM_MESSAGE)
 WAIT = 5.0
 """How long a test waits for the server to see something."""
 
@@ -96,10 +142,6 @@ def _status_frame(
     return encode_frame(FrameType.STATUS, payload)
 
 
-def _message_frame(value: str) -> bytes:
-    return encode_frame(FrameType.MESSAGE, StringValue(value=value).to_binary())
-
-
 def _headers_frame(metadata: dict[str, bytes]) -> bytes:
     return encode_frame(FrameType.HEADERS, _map_field(1, metadata))
 
@@ -116,22 +158,145 @@ class ServerCall:
     stop_code: int | None = None
     blocked_at: int | None = None
     """For `Flood`: the bytes sent when the client's credit ran out."""
+    kind: int = 0
+    accept: list[int] = field(default_factory=list[int])
+    query: list[tuple[int, bytes]] = field(default_factory=list[tuple[int, bytes]])
+    """The REQUEST's dictionary_query, as (ID, fingerprint)."""
+    stream_compression: int = 0
+    request_frames: list[int] = field(default_factory=list[int])
+    """The frame type of each request message."""
+    response_frames: list[int] = field(default_factory=list[int])
+    refused: bool = False
+    refusing: bool = False
+    """Refuses once enough requests arrived (`BoundedEcho`)."""
+    dictionaries: dict[int, LoadedDictionary] = field(default_factory=dict[int, LoadedDictionary])
+    _inflater: StreamDecompressor | None = None
+    _deflater: StreamCompressor | None = None
 
     @property
     def ended_by_client(self) -> bool:
         return self.reset_code is not None or self.stop_code is not None
 
+    @property
+    def name(self) -> str:
+        return self.method.rsplit("/", 1)[-1]
+
     @classmethod
-    def from_request(cls, stream_id: int, payload: bytes) -> ServerCall:
-        call = cls(stream_id)
+    def from_request(cls, stream_id: int, payload: bytes, server: TestServer) -> ServerCall:
+        call = cls(stream_id, dictionaries=server.dictionaries)
         for number, _, value in read_fields(payload):
             if number == 1 and isinstance(value, bytes):
                 call.method = value.decode()
             elif number == 2 and isinstance(value, bytes):
                 call.metadata.update(RpcHeaders.decode(_len_field(1, value)).metadata)
+            elif number == 3 and isinstance(value, int):
+                call.kind = value
             elif number == 4 and isinstance(value, int):
                 call.timeout_nanos = value
+            elif number == 6:
+                if isinstance(value, int):
+                    call.accept.append(value)
+                else:
+                    pos = 0
+                    while (decoded := decode_varint(value, pos)) is not None:
+                        call.accept.append(decoded[0])
+                        pos = decoded[1]
+            elif number == 7 and isinstance(value, bytes):
+                info_id, fingerprint = 0, b""
+                for info_number, _, item in read_fields(value):
+                    if info_number == 1 and isinstance(item, int):
+                        info_id = item
+                    elif info_number == 2 and isinstance(item, bytes):
+                        fingerprint = item
+                call.query.append((info_id, fingerprint))
+            elif number == 8 and isinstance(value, int):
+                call.stream_compression = value
         return call
+
+    # The server side of compression
+
+    def _confirmed(self) -> dict[int, LoadedDictionary | None]:
+        """The queried dictionaries the server holds with the same fingerprint, and 0."""
+        confirmed: dict[int, LoadedDictionary | None] = {}
+        for info_id, fingerprint in self.query:
+            if info_id == 0 and not fingerprint:
+                confirmed[0] = None
+            elif (d := self.dictionaries.get(info_id)) is not None and d.fingerprint == fingerprint:
+                confirmed[info_id] = d
+        return confirmed
+
+    @property
+    def _stream_requests(self) -> bool:
+        return (
+            self.stream_compression != 0
+            and self.kind in (1, 3)
+            and self.name != "Refuse"
+            and self.name not in _REFUSE_LATER
+        )
+
+    def opening(self) -> bytes:
+        """What the server sends at dispatch: a refusal, an ANSWER, or nothing."""
+        if self.stream_compression == 2 and self.name == "Refuse":
+            self.refused = True
+            return REFUSAL
+        if self.stream_compression == 2 and self.name in _REFUSE_LATER:
+            self.refusing = True
+            return b""
+        if self.name in ("AnswerLater", "NoAnswer"):
+            return b""
+        return self.answer()
+
+    def answer(self) -> bytes:
+        if not self.query and not self._stream_requests:
+            return b""
+        payload = b"".join(
+            _len_field(1, _varint_field(1, i) + (_len_field(2, d.fingerprint) if d else b""))
+            for i, d in self._confirmed().items()
+        )
+        if self._stream_requests:
+            payload += _varint_field(2, 1)
+        return encode_frame(FrameType.ANSWER, payload)
+
+    def _lookup(self, dictionary_id: int) -> LoadedDictionary | bool | None:
+        if dictionary_id == 0:
+            return None
+        return self.dictionaries.get(dictionary_id, False)
+
+    def receive(self, frame_type: int, payload: bytes) -> str:
+        """A request message's value; raises `CompressionError`."""
+        self.request_frames.append(frame_type)
+        if frame_type == FrameType.ZSTD_MESSAGE:
+            payload = decompress_message(payload, self._lookup, MAX_FRAME)  # pyright: ignore[reportArgumentType]
+        elif frame_type == FrameType.ZSTD_STREAM_MESSAGE:
+            if not self._stream_requests:
+                raise CompressionError("invalid", "stream compression not enabled")
+            if self._inflater is None:
+                self._inflater = StreamDecompressor(self._lookup)  # pyright: ignore[reportArgumentType]
+            payload = self._inflater.decompress(payload, MAX_FRAME)
+        return StringValue.from_binary(payload).value
+
+    def message(self, value: str) -> bytes:
+        """A response message's frame, compressed as the call accepts."""
+        payload = StringValue(value=value).to_binary()
+        frame = encode_frame(FrameType.MESSAGE, payload)
+        usable = self._confirmed() if self.query else {0: None, **self.dictionaries}
+        accepted = [i for i in self.accept if i in usable]
+        streams = self.stream_compression != 0 and self.kind in (2, 3)
+        if streams and len(self.response_frames) >= 2:
+            if self._deflater is None:
+                seed = next((usable[i] for i in accepted if i), None)
+                self._deflater = StreamCompressor(seed, 1)
+            frame = encode_frame(FrameType.ZSTD_STREAM_MESSAGE, self._deflater.compress(payload))
+        elif dictionary := next((usable[i] for i in accepted if i), None):
+            compressed = MessageCompressor(dictionary, 1).compress(payload)
+            if compressed is not None:
+                frame = encode_frame(FrameType.ZSTD_MESSAGE, compressed)
+        elif 0 in accepted and len(payload) >= 256:
+            compressed = MessageCompressor(None, 1).compress(payload)
+            if compressed is not None:
+                frame = encode_frame(FrameType.ZSTD_MESSAGE, compressed)
+        self.response_frames.append(frame[0])
+        return frame
 
 
 class _Wire(Protocol):
@@ -149,6 +314,10 @@ class _Wire(Protocol):
 
     def flow(self) -> tuple[int, int, int] | None:
         """The stream's unsent bytes, sent bytes and send credit, or `None` once it is gone."""
+        ...
+
+    async def flushed(self) -> None:
+        """Waits until what was sent so far has gone out."""
         ...
 
 
@@ -173,23 +342,45 @@ async def _handle(
                     _, code, message = value.split(":", 2)
                     wire.send(_status_frame(int(code), message), end=True)
                 elif value == "headers":
-                    frames = _headers_frame({"h": b"1"}) + _message_frame(value)
+                    frames = _headers_frame({"h": b"1"}) + call.message(value)
                     wire.send(frames + _status_frame(0, "", {"t": b"2"}), end=True)
                 else:
                     suffix = call.metadata.get("suffix", b"").decode()
-                    wire.send(_message_frame(value + suffix) + _status_frame(), end=True)
+                    wire.send(call.message(value + suffix) + _status_frame(), end=True)
             case "ServerStream":
                 value = await queue.get()
                 assert value is not None
                 for i in range(int(value)):
-                    wire.send(_message_frame(str(i)))
+                    wire.send(call.message(str(i)))
                 wire.send(_status_frame(), end=True)
-            case "ClientStream":
+            case "ClientStream" | "Refuse" | "RefuseLater" | "AnswerLater" | "NoAnswer":
+                if call.name == "AnswerLater":
+                    await server.answer_later.wait()
+                    wire.send(call.answer())
+                elif call.name == "NoAnswer":
+                    wire.send(_headers_frame({}))
                 values: list[str] = []
                 while (value := await queue.get()) is not None:
                     values.append(value)
-                wire.send(_message_frame("".join(values)) + _status_frame(), end=True)
-            case "Bidi":
+                wire.send(call.message("".join(values)) + _status_frame(), end=True)
+            case "AnswerEarly":
+                await queue.get()
+                wire.send(call.message("early") + _status_frame(), end=True)
+            case "StopEarly":
+                await queue.get()
+                wire.stop(0)
+                # In a later record: the client sees its requests stopped before the status.
+                await wire.flushed()
+                wire.send(_status_frame(9, "stopped"), end=True)
+            case "BadZstd" | "TooLarge":
+                await queue.get()
+                payload = BAD_ZSTD if call.name == "BadZstd" else TOO_LARGE_ZSTD
+                wire.send(encode_frame(FrameType.ZSTD_MESSAGE, payload) + _status_frame(), end=True)
+            case "UnaskedStream":
+                await queue.get()
+                frame = encode_frame(FrameType.ZSTD_STREAM_MESSAGE, UNASKED_STREAM)
+                wire.send(frame + _status_frame(), end=True)
+            case "Bidi" | "BoundedEcho":
                 while (value := await queue.get()) is not None:
                     if value.startswith("fail:"):
                         _, code, message = value.split(":", 2)
@@ -197,11 +388,11 @@ async def _handle(
                         wire.send(_status_frame(int(code), message), end=True)
                         wire.stop(0)
                         return
-                    wire.send(_message_frame(value))
+                    wire.send(call.message(value))
                 wire.send(_status_frame(), end=True)
             case "FloodFail":
                 await queue.get()
-                frames = b"".join(_message_frame(str(i)) for i in range(40))
+                frames = b"".join(call.message(str(i)) for i in range(40))
                 wire.send(frames + _status_frame(10, "abort"), end=True)
                 wire.stop(0)
             case "StopFirst":
@@ -227,8 +418,50 @@ async def _handle(
         pass
 
 
+def _dispatch(
+    server: TestServer, call: ServerCall, wire: _Wire, queue: asyncio.Queue[str | None]
+) -> None:
+    """Starts a call: its refusal or ANSWER at dispatch, then its handler."""
+    server.calls.append(call)
+    opening = call.opening()
+    if call.refusing:
+        return
+    if call.refused:
+        # A lone STATUS; the rest of the request stream is discarded.
+        wire.send(opening, end=True)
+        return
+    if opening:
+        wire.send(opening)
+    asyncio.get_running_loop().create_task(_handle(server, call, wire, queue))
+
+
+def _receive(
+    server: TestServer,
+    call: ServerCall,
+    frame_type: int,
+    payload: bytes,
+    queue: asyncio.Queue[str | None],
+    wire: _Wire,
+) -> None:
+    if call.refusing:
+        call.request_frames.append(frame_type)
+        if len(call.request_frames) >= server.refuse_after:
+            call.refusing = False
+            call.refused = True
+            wire.send(REFUSAL, end=True)
+        return
+    if call.refused:
+        call.request_frames.append(frame_type)
+        return
+    try:
+        queue.put_nowait(call.receive(frame_type, payload))
+    except CompressionError as error:
+        call.refused = True
+        wire.send(_status_frame(3, str(error)), end=True)
+
+
 async def _flood(server: TestServer, call: ServerCall, wire: _Wire) -> None:
-    payload = _message_frame("x" * FLOOD_MESSAGE)
+    payload = call.message("x" * FLOOD_MESSAGE)
     while not call.ended_by_client and (flow := wire.flow()) is not None:
         unsent, sent, credit = flow
         # Keep a few messages queued past what the client allows.
@@ -278,6 +511,9 @@ class _QuicWire:
     def drop(self) -> None:
         self._protocol.close(error_code=0x101, reason_phrase="dropped")
 
+    async def flushed(self) -> None:
+        self._protocol.transmit()
+
     def flow(self) -> tuple[int, int, int] | None:
         stream = self._protocol._quic._streams.get(self._id)
         if stream is None:
@@ -326,15 +562,20 @@ class _QuicProtocol(QuicConnectionProtocol):
 
     def _frame(self, stream_id: int, frame_type: int, payload: bytes) -> None:
         if frame_type == FrameType.REQUEST:
-            call = ServerCall.from_request(stream_id, payload)
-            self.server.calls.append(call)
-            self._calls[stream_id] = call
+            call = ServerCall.from_request(stream_id, payload, self.server)
             queue: asyncio.Queue[str | None] = asyncio.Queue()
+            self._calls[stream_id] = call
             self._queues[stream_id] = queue
-            wire = _QuicWire(self, stream_id)
-            asyncio.get_running_loop().create_task(_handle(self.server, call, wire, queue))
-        elif frame_type == FrameType.MESSAGE:
-            self._queues[stream_id].put_nowait(StringValue.from_binary(payload).value)
+            _dispatch(self.server, call, _QuicWire(self, stream_id), queue)
+        elif frame_type in _MESSAGE_KINDS:
+            _receive(
+                self.server,
+                self._calls[stream_id],
+                frame_type,
+                payload,
+                self._queues[stream_id],
+                _QuicWire(self, stream_id),
+            )
 
     def sent(self, stream_id: int) -> int:
         stream = self._quic._streams.get(stream_id)
@@ -378,6 +619,10 @@ class _QMuxWire:
             return None
         return len(state.pending), state.sent, state.send_max
 
+    async def flushed(self) -> None:
+        session = self._session
+        await session.server.changed.wait_until(lambda: not session._control)
+
 
 class _QMuxServerSession(QMuxSession):
     """The server role, which notifies the test server of every record and records how the client
@@ -412,13 +657,32 @@ class _QMuxServerSession(QMuxSession):
             while (frame := await stream.read_frame()) is not None:
                 frame_type, payload = frame
                 if frame_type == FrameType.REQUEST:
-                    call = ServerCall.from_request(stream.id, payload)
-                    self.server.calls.append(call)
+                    call = ServerCall.from_request(stream.id, payload, self.server)
                     self.calls[stream.id] = call
                     wire = _QMuxWire(self, stream)
-                    asyncio.get_running_loop().create_task(_handle(self.server, call, wire, queue))
-                elif frame_type == FrameType.MESSAGE:
-                    queue.put_nowait(StringValue.from_binary(payload).value)
+                    _dispatch(self.server, call, wire, queue)
+                    if call.refusing and call.name == "RefuseLater":
+                        # Reads nothing, then refuses when told to, and discards the requests
+                        # instead of reading them: the client's writes wait until it replays.
+                        await self.server.refuse_now.wait()
+                        call.refusing, call.refused = False, True
+                        wire.send(REFUSAL, end=True)
+                        return
+                elif frame_type in _MESSAGE_KINDS:
+                    call = self.calls[stream.id]
+                    wire = _QMuxWire(self, stream)
+                    _receive(self.server, call, frame_type, payload, queue, wire)
+                    if call.name in _EARLY and not (call.refused or call.refusing):
+                        # Reads nothing more: the handler answers the first request.
+                        return
+                    if call.name == "BoundedEcho" and not (call.refused or call.refusing):
+                        # Backpressure: no more requests while the echoes are not taken. The
+                        # handler, another task, echoes the request first.
+                        while not queue.empty():
+                            await asyncio.sleep(0)
+                        await self.server.changed.wait_until(
+                            lambda wire=wire: (wire.flow() or (0,))[0] <= ECHO_UNSENT_LIMIT, 60
+                        )
         except TrevRpcError:
             pass
         queue.put_nowait(None)
@@ -438,6 +702,10 @@ class TestServer:
     ca: str = ""
     calls: list[ServerCall] = field(default_factory=list[ServerCall])
     connections: list[Connection] = field(default_factory=list[Connection])
+    dictionaries: dict[int, LoadedDictionary] = field(default_factory=dict[int, LoadedDictionary])
+    answer_later: asyncio.Event = field(default_factory=asyncio.Event)
+    refuse_after: int = 1
+    refuse_now: asyncio.Event = field(default_factory=asyncio.Event)
     changed: Signal = field(default_factory=Signal)
     close: Callable[[], None] = lambda: None
 
@@ -484,12 +752,18 @@ def _certificate(directory: Path) -> tuple[Path, Path]:
     return cert_path, key_path
 
 
-async def start_server(*, max_streams: int | None = None) -> TestServer:
+async def start_server(
+    *,
+    max_streams: int | None = None,
+    dictionaries: tuple[LoadedDictionary, ...] = (),
+    qmux_stream_window: int = 4 * 1024 * 1024 + 16,
+) -> TestServer:
     """Starts the server on loopback ports; `max_streams` lowers how many bidirectional streams
-    the client may have open at once (128 by default)."""
+    the client may have open at once (128 by default), and `qmux_stream_window` how much of a
+    request stream the QMux server receives before it reads."""
     directory = tempfile.TemporaryDirectory()
     cert, key = _certificate(Path(directory.name))
-    test_server = TestServer(ca=str(cert))
+    test_server = TestServer(ca=str(cert), dictionaries={d.id: d for d in dictionaries})
 
     configuration = QuicConfiguration(is_client=False, alpn_protocols=["trevrpc/1"])
     configuration.load_cert_chain(str(cert), str(key))  # pyright: ignore[reportUnknownMemberType]
@@ -514,7 +788,7 @@ async def start_server(*, max_streams: int | None = None) -> TestServer:
     parameters = Parameters(
         max_idle_timeout=30000,
         initial_max_data=16 * 1024 * 1024,
-        initial_max_stream_data_bidi_remote=4 * 1024 * 1024 + 16,
+        initial_max_stream_data_bidi_remote=qmux_stream_window,
         initial_max_streams_bidi=max_streams if max_streams is not None else 128,
         max_record_size=RECORD_SIZE,
     )

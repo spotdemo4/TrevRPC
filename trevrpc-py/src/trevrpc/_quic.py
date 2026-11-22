@@ -21,6 +21,7 @@ from aioquic.quic import events
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 
+from ._compression import ConnectionCompression
 from ._frames import MAX_FRAME_HEADER_SIZE
 from ._status import Code, TrevRpcError
 from ._stream import CANCEL_CODE, Stream
@@ -126,6 +127,7 @@ class QuicTransport(asyncio.DatagramProtocol):
         self._transmit_scheduled = False
         self._blocked: set[Stream] = set()
         self._closed_locally = False
+        self.compression = ConnectionCompression()
         self.error: TrevRpcError | None = None
         """Why the connection ended, once it has."""
         self.closed: asyncio.Future[None] = loop.create_future()

@@ -1,4 +1,4 @@
-"""TrevRPC for Python: a client for TrevRPC services over native QUIC.
+"""TrevRPC for Python: a client for TrevRPC services over native QUIC and QMux over TLS.
 
 Generate a client for your service with `protoc-gen-py` (protobuf-py's messages) and
 `protoc-gen-trevrpc-py`, then call it on a `Channel`::
@@ -20,9 +20,10 @@ from ._call import (
     Status,
 )
 from ._channel import Channel, ChannelOptions, Transport, TransportPolicy, connect
+from ._compression import Compression, Dictionary
 from ._frames import DEFAULT_MAX_FRAME_SIZE
 from ._metadata import Metadata, MetadataInput
-from ._method import Compression, Method, MethodKind
+from ._method import Method, MethodCompression, MethodKind
 from ._qmux import QMUX_ALPN
 from ._quic import ALPN
 from ._status import Code, StatusDetail, TrevRpcError
@@ -38,9 +39,11 @@ __all__ = [
     "ClientStreamingCall",
     "Code",
     "Compression",
+    "Dictionary",
     "Metadata",
     "MetadataInput",
     "Method",
+    "MethodCompression",
     "MethodKind",
     "ResponseStream",
     "Status",
