@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import socket
 import unittest
 from collections.abc import AsyncIterator, Awaitable
+from typing import Unpack
 from unittest import mock
 
 import trevrpc
 from protobuf.wkt.google.protobuf.wrappers_pb import StringValue
 from trevrpc import Code, Method, MethodKind, TrevRpcError
-from trevrpc._quic import Stream
+from trevrpc._stream import Stream
 
 from .server import FLOOD_MESSAGE, WAIT, TestServer, start_server
 
@@ -39,14 +41,25 @@ def s(value: str) -> StringValue:
 
 
 class QuicTest(unittest.IsolatedAsyncioTestCase):
+    """Runs over native QUIC; the `QMux` subclasses run the same tests over QMux over TLS."""
+
     server: TestServer
     channel: trevrpc.Channel
+    transport: trevrpc.TransportPolicy = "quic"
 
     async def asyncSetUp(self) -> None:
         self.server = await self.start_server()
-        self.channel = trevrpc.Channel(
-            f"127.0.0.1:{self.server.port}", ca=self.server.ca, server_name="localhost"
-        )
+        self.channel = self.new_channel()
+
+    def new_channel(self, **options: Unpack[trevrpc.ChannelOptions]) -> trevrpc.Channel:
+        port = self.server.port if self.transport == "quic" else self.server.tcp_port
+        settings: trevrpc.ChannelOptions = {
+            "ca": self.server.ca,
+            "server_name": "localhost",
+            "transport": self.transport,
+        }
+        settings.update(options)
+        return trevrpc.Channel(f"127.0.0.1:{port}", **settings)
 
     async def start_server(self) -> TestServer:
         return await start_server()
@@ -110,7 +123,7 @@ class CallTest(QuicTest):
     async def test_concurrent_unary_calls_share_the_connection(self) -> None:
         replies = await asyncio.gather(*(self.channel.unary(UNARY, s(str(i))) for i in range(50)))
         self.assertEqual([r.value for r in replies], [str(i) for i in range(50)])
-        self.assertEqual(len(self.server.protocols), 1)
+        self.assertEqual(len(self.server.connections), 1)
 
     async def test_server_stream(self) -> None:
         async with self.channel.server_stream(SERVER_STREAM, s("3")) as stream:
@@ -164,8 +177,8 @@ class FailureTest(QuicTest):
         await self.expect_status(call.recv(), Code.ABORTED)
 
     async def test_peer_stop_before_the_status(self) -> None:
-        """The server stops the request stream, then fails the call in a later packet: a send in
-        between waits for the status."""
+        """The server stops the request stream, then fails the call: a send between the two
+        waits for the status."""
         call = self.channel.bidi_stream(STOP_FIRST)
         sends, patch = self.send_when_stopped(call)
         with patch:
@@ -269,22 +282,25 @@ class FailureTest(QuicTest):
         )
 
     async def test_unreachable_server_is_unavailable(self) -> None:
-        channel = trevrpc.Channel("127.0.0.1:1", ca=self.server.ca, connect_timeout=0.5)
+        channel = trevrpc.Channel(
+            "127.0.0.1:1", ca=self.server.ca, transport=self.transport, connect_timeout=0.5
+        )
         await self.expect_status(channel.unary(UNARY, s("x")), Code.UNAVAILABLE)
 
     async def test_untrusted_certificate_is_unavailable(self) -> None:
-        channel = trevrpc.Channel(f"127.0.0.1:{self.server.port}", connect_timeout=2)
+        port = self.server.port if self.transport == "quic" else self.server.tcp_port
+        channel = trevrpc.Channel(f"127.0.0.1:{port}", transport=self.transport, connect_timeout=2)
         await self.expect_status(channel.unary(UNARY, s("x")), Code.UNAVAILABLE)
 
     async def test_reconnects_after_the_connection_closes(self) -> None:
         await self.channel.unary(UNARY, s("a"))
         connection = self.channel._connection  # pyright: ignore[reportPrivateUsage]
         assert connection is not None
-        self.server.protocols[0].close()
+        self.server.connections[0].close()
         await asyncio.wait_for(connection.closed, WAIT)
         reply = await self.channel.unary(UNARY, s("b"))
         self.assertEqual(reply.value, "b")
-        self.assertEqual(len(self.server.protocols), 2)
+        self.assertEqual(len(self.server.connections), 2)
 
     async def test_closed_channel_cancels_calls(self) -> None:
         task = asyncio.create_task(self.channel.unary(HANG, s("")))
@@ -307,7 +323,7 @@ class FlowControlTest(QuicTest):
             # Reading again releases it.
             for _ in range(64):
                 await stream.recv()
-            protocol = self.server.protocols[0]
+            protocol = self.server.connections[0]
             await self.server.changed.wait_until(lambda: protocol.sent(call.stream_id) > sent)
 
 
@@ -322,7 +338,80 @@ class StreamLimitTest(QuicTest):
             asyncio.gather(*(self.channel.unary(UNARY, s(str(i))) for i in range(40))), WAIT
         )
         self.assertEqual([r.value for r in replies], [str(i) for i in range(40)])
-        self.assertEqual(len(self.server.protocols), 1)
+        self.assertEqual(len(self.server.connections), 1)
+
+
+class QMuxCallTest(CallTest):
+    transport = "tcp"
+
+
+class QMuxFailureTest(FailureTest):
+    transport = "tcp"
+
+
+class QMuxFlowControlTest(FlowControlTest):
+    transport = "tcp"
+
+
+class QMuxStreamLimitTest(StreamLimitTest):
+    transport = "tcp"
+
+
+class RaceTest(QuicTest):
+    """The `auto` policy: QUIC, with QMux over TLS racing it after the fallback delay."""
+
+    def racing_channel(
+        self, udp_port: int, **options: Unpack[trevrpc.ChannelOptions]
+    ) -> trevrpc.Channel:
+        settings: trevrpc.ChannelOptions = {
+            "ca": self.server.ca,
+            "server_name": "localhost",
+            "transport": "auto",
+            "tcp_address": f"127.0.0.1:{self.server.tcp_port}",
+        }
+        settings.update(options)
+        return trevrpc.Channel(f"127.0.0.1:{udp_port}", **settings)
+
+    async def test_quic_wins_when_it_connects(self) -> None:
+        channel = self.racing_channel(self.server.port)
+        self.addAsyncCleanup(channel.close)
+        self.assertEqual((await channel.unary(UNARY, s("a"))).value, "a")
+        self.assertEqual(channel.transport, "quic")
+
+    async def test_falls_back_when_udp_is_blocked(self) -> None:
+        # Nothing answers this UDP port, so QUIC never connects.
+        channel = self.racing_channel(self.unused_udp_port(), fallback_delay=0.05)
+        self.addAsyncCleanup(channel.close)
+        self.assertEqual((await channel.unary(UNARY, s("a"))).value, "a")
+        self.assertEqual(channel.transport, "qmux")
+
+    async def test_reconnects_over_qmux_until_the_reprobe_interval(self) -> None:
+        channel = self.racing_channel(
+            self.unused_udp_port(), fallback_delay=0.05, reprobe_interval=60
+        )
+        self.addAsyncCleanup(channel.close)
+        await channel.unary(UNARY, s("a"))
+        connection = channel._connection  # pyright: ignore[reportPrivateUsage]
+        assert connection is not None
+        self.server.connections[-1].close()
+        await asyncio.wait_for(connection.closed, WAIT)
+        # QUIC would take a fallback delay to give up on; the reconnect skips it.
+        with mock.patch.object(channel, "_dial_quic", side_effect=AssertionError("raced QUIC")):
+            self.assertEqual((await channel.unary(UNARY, s("b"))).value, "b")
+        self.assertEqual(channel.transport, "qmux")
+
+    async def test_both_failing_is_unavailable(self) -> None:
+        channel = trevrpc.Channel(
+            "127.0.0.1:1", ca=self.server.ca, transport="auto", connect_timeout=0.5
+        )
+        error = await self.expect_status(channel.unary(UNARY, s("x")), Code.UNAVAILABLE)
+        self.assertIn(";", error.message)
+
+    @staticmethod
+    def unused_udp_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
 
 
 if __name__ == "__main__":

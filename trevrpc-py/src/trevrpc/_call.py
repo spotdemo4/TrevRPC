@@ -21,7 +21,7 @@ from ._varint import decode_varint
 from ._wire import RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, WireError
 
 if TYPE_CHECKING:
-    from ._quic import Stream
+    from ._stream import Stream
 
 _MAX_TIMEOUT_NANOS = (1 << 64) - 1
 

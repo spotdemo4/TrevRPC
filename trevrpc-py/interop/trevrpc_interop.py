@@ -5,8 +5,9 @@
                               [--expect-transport quic|qmux] [--dictionary <file>]
                               [--scenarios <name,...>]
 
-Prints `ok <name>`, `fail <name>: <reason>` or `skip <name>: <reason>` for each scenario, exits 0
-only if every scenario it ran passed, and 77 for a transport it does not speak (only QUIC yet).
+Prints `ok <name>`, `fail <name>: <reason>` or `skip <name>: <reason>` for each scenario, and exits
+0 only if every scenario it ran passed. `--transport` maps to the channel's transport policy: QUIC
+only, QMux over TLS only (`tcp`), or QUIC with a QMux fallback (`auto`).
 """
 
 from __future__ import annotations
@@ -20,8 +21,6 @@ import trevrpc
 from gen.interop_pb import EchoRequest
 from gen.interop_trevrpc import EchoClient
 from trevrpc import Code, TrevRpcError
-
-UNSUPPORTED_TRANSPORT = 77
 
 
 class ScenarioError(Exception):
@@ -194,11 +193,13 @@ async def run(args: argparse.Namespace) -> int:
         if unknown := selected - SCENARIOS.keys():
             print(f"client: unknown scenarios: {', '.join(sorted(unknown))}", file=sys.stderr)
             return 2
-    if args.transport != "quic":
-        print(f"client: transport {args.transport} is not implemented", file=sys.stderr)
-        return UNSUPPORTED_TRANSPORT
-
-    channel = trevrpc.Channel(args.addr, ca=args.ca, server_name=args.server_name)
+    channel = trevrpc.Channel(
+        args.addr,
+        ca=args.ca,
+        server_name=args.server_name,
+        transport=args.transport,
+        tcp_address=args.tcp_addr or args.addr,
+    )
     try:
         try:
             await channel.connect()

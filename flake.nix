@@ -353,7 +353,7 @@
                 licenseFile
                 ;
             };
-            trevrpc-py = pkgs.callPackage ./trevrpc-py { inherit wireGolden; };
+            trevrpc-py = pkgs.callPackage ./trevrpc-py { inherit wireGolden qmuxGolden; };
             trevrpc-py-protoc-gen = pkgs.callPackage ./trevrpc-py/protoc-gen-trevrpc-py { };
             trevrpc-py-interop = pkgs.callPackage ./trevrpc-py/interop {
               inherit (self.packages.${system}) trevrpc-py;

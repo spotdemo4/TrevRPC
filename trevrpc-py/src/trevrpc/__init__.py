@@ -19,16 +19,18 @@ from ._call import (
     ResponseStream,
     Status,
 )
-from ._channel import Channel, ChannelOptions, Transport, connect
+from ._channel import Channel, ChannelOptions, Transport, TransportPolicy, connect
 from ._frames import DEFAULT_MAX_FRAME_SIZE
 from ._metadata import Metadata, MetadataInput
 from ._method import Compression, Method, MethodKind
+from ._qmux import QMUX_ALPN
 from ._quic import ALPN
 from ._status import Code, StatusDetail, TrevRpcError
 
 __all__ = [
     "ALPN",
     "DEFAULT_MAX_FRAME_SIZE",
+    "QMUX_ALPN",
     "BidiStreamingCall",
     "CallOptions",
     "Channel",
@@ -44,6 +46,7 @@ __all__ = [
     "Status",
     "StatusDetail",
     "Transport",
+    "TransportPolicy",
     "TrevRpcError",
     "connect",
 ]

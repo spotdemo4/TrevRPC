@@ -23,9 +23,9 @@ page coming from its HTTP fallback, and the Android client over HTTP/3 and HTTP/
 not validate requests yet (`validation`, [#641](https://trev.zip/llc/TrevRPC/issues/641)), so
 clients skip that scenario.
 
-The Python client ([#666](https://trev.zip/llc/TrevRPC/issues/666)) calls native QUIC so far, and
-skips the scenarios that need datagrams, compression, connection metadata or decoding
-`buf.validate.Violations`. Its `qmux` and `fallback` cells exit 77 and are skipped.
+The Python client ([#666](https://trev.zip/llc/TrevRPC/issues/666)) calls native QUIC and QMux over
+TLS, falling back from one to the other, so far, and skips the scenarios that need datagrams,
+compression, connection metadata or decoding `buf.validate.Violations`.
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
 packaged Go, Rust and Erlang servers and clients and, on Linux, Chromium and Firefox,
