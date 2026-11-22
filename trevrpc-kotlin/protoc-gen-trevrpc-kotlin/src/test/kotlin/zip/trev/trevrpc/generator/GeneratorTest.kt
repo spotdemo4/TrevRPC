@@ -44,7 +44,7 @@ class GeneratorTest {
         val response = generate(shapesRequest())
 
         assertEquals("", response.error)
-        assertEquals("api/greeter.trevrpc.kt", response.fileList.single().name)
+        assertEquals("example/generated/greeter.trevrpc.kt", response.fileList.single().name)
         val content = response.fileList.single().content
         assertFalse(Regex("fun \\w+(Envelope|Call|Response)\\(").containsMatchIn(content))
         assertEquals(golden("all-shapes.txt"), snapshot(content))
@@ -55,7 +55,7 @@ class GeneratorTest {
         val response = generate(collisionsRequest())
 
         assertEquals("", response.error)
-        assertEquals("api/collision.rpc.kt", response.fileList.single().name)
+        assertEquals("example/class/collision.rpc.kt", response.fileList.single().name)
         assertEquals(golden("collisions.txt"), snapshot(response.fileList.single().content))
     }
 
@@ -340,7 +340,9 @@ class GeneratorTest {
                         .addMethod(method("Call", ".right.RightRequest", ".right.RightReply")),
                 ).build()
 
-        val response = generate(request(first, second))
+        // Under one package's directory the two files would share a name, so give them their own.
+        val request = request(first, second, parameter = "paths=source_relative")
+        val response = generate(request)
 
         assertEquals("", response.error)
         val annotations = response.fileList.map { file -> file.content.lineSequence().first { "@file:JvmName" in it } }
@@ -353,7 +355,7 @@ class GeneratorTest {
         )
         assertEquals(
             annotations,
-            generate(request(first, second)).fileList.map {
+            generate(request).fileList.map {
                 it.content.lineSequence().first { line ->
                     "@file:JvmName" in line
                 }
@@ -386,12 +388,110 @@ class GeneratorTest {
                 javaPackage = "second.generated",
             )
 
+        val request = request(first, second, parameter = "paths=source_relative")
         assertDeterministicCollision(
-            request(first, second),
+            request,
             "output file api/same.trevrpc.kt",
             "protobuf file api/same.proto",
             "protobuf file api/same.rpc",
         )
+        assertFalse(generate(request).error.contains("paths=source_relative"))
+    }
+
+    @Test
+    fun `writes each file under its Kotlin package's directory`() {
+        val file =
+            collisionFile(
+                "cursor/v1/service.proto",
+                ServiceDescriptorProto
+                    .newBuilder()
+                    .setName("Cursor")
+                    .addMethod(method("Call", ".cursor.v1.Request", ".cursor.v1.Reply"))
+                    .build(),
+                protoPackage = "cursor.v1",
+                javaPackage = "zip.trev.template.stack.gen.cursor.v1",
+            )
+
+        val response = generate(request(file))
+        assertEquals("", response.error)
+        assertEquals("zip/trev/template/stack/gen/cursor/v1/service.trevrpc.kt", response.fileList.single().name)
+        assertTrue(
+            response.fileList
+                .single()
+                .content
+                .contains("\npackage zip.trev.template.stack.gen.cursor.v1\n"),
+        )
+
+        val sourceRelative = generate(request(file, parameter = "paths=source_relative"))
+        assertEquals("", sourceRelative.error)
+        assertEquals("cursor/v1/service.trevrpc.kt", sourceRelative.fileList.single().name)
+    }
+
+    @Test
+    fun `writes files without a package at the output root`() {
+        val file =
+            collisionFile(
+                "api/root.proto",
+                ServiceDescriptorProto
+                    .newBuilder()
+                    .setName("Root")
+                    .addMethod(method("Call", ".Request", ".Reply"))
+                    .build(),
+                protoPackage = "",
+                javaPackage = "",
+            )
+
+        val response = generate(request(file))
+
+        assertEquals("", response.error)
+        assertEquals("root.trevrpc.kt", response.fileList.single().name)
+    }
+
+    @Test
+    fun `rejects files of one package that share a name under its directory`() {
+        fun shared(
+            name: String,
+            service: String,
+        ): FileDescriptorProto =
+            collisionFile(
+                name,
+                ServiceDescriptorProto
+                    .newBuilder()
+                    .setName(service)
+                    .addMethod(method("Call", ".collision.Request", ".collision.Reply"))
+                    .build(),
+                javaPackage = "shared.generated",
+            ).toBuilder()
+                .setOptions(javaOptions("shared.generated").toBuilder().setJavaOuterClassname("${service}Descriptor"))
+                .build()
+        val left = shared("left/service.proto", "Left")
+        val right = shared("right/service.proto", "Right")
+
+        assertDeterministicCollision(
+            request(left, right),
+            "output file shared/generated/service.trevrpc.kt",
+            "protobuf file left/service.proto",
+            "protobuf file right/service.proto",
+            "rename one of the files or pass paths=source_relative",
+        )
+
+        val sourceRelative = generate(request(left, right, parameter = "paths=source_relative"))
+        assertEquals("", sourceRelative.error)
+        assertEquals(
+            listOf("left/service.trevrpc.kt", "right/service.trevrpc.kt"),
+            sourceRelative.fileList.map(CodeGeneratorResponse.File::getName),
+        )
+    }
+
+    @Test
+    fun `rejects unknown paths options`() {
+        val response = generate(CodeGeneratorRequest.newBuilder().setParameter("paths=module").build())
+
+        assertEquals(
+            "invalid trevrpc-kotlin paths \"module\"; expected \"import\" or \"source_relative\"",
+            response.error,
+        )
+        assertTrue(response.fileList.isEmpty())
     }
 
     @Test
@@ -781,10 +881,12 @@ class GeneratorTest {
         first: FileDescriptorProto,
         second: FileDescriptorProto? = null,
         additionalFiles: List<FileDescriptorProto> = emptyList(),
+        parameter: String = "",
     ): CodeGeneratorRequest {
         val generated = listOfNotNull(first, second)
         return CodeGeneratorRequest
             .newBuilder()
+            .setParameter(parameter)
             .addAllFileToGenerate(generated.map(FileDescriptorProto::getName))
             .addAllProtoFile(additionalFiles + generated)
             .build()
@@ -1034,7 +1136,10 @@ class GeneratedCodeCompilationTest {
         // GeneratorTest covers the documentation and compression arguments with options it encodes
         // itself; these checks are the ones that tie them to the field numbers and enum values protoc
         // encodes from the real trevrpc/options.proto.
-        val generated = temp.resolve("kotlin/unreliable/unreliable/unreliable.trevrpc.kt").readText()
+        // By default, each client lands in the directory where protoc's Java plugin puts its package.
+        val unreliablePackage = "generator/compat/unreliable"
+        assertTrue(temp.resolve("java/unreliable/$unreliablePackage/Position.java").isRegularFile())
+        val generated = temp.resolve("kotlin/unreliable/$unreliablePackage/unreliable.trevrpc.kt").readText()
         val lines = generated.lines()
 
         fun documented(function: String): Boolean {
@@ -1146,6 +1251,9 @@ class GeneratedCodeCompilationTest {
                     "SharedFixture.kt" to SHARED_FIXTURE,
                     "OverloadsFixture.kt" to OVERLOADS_FIXTURE,
                 ),
+                // left/shared.proto and right/shared.proto share a Java package, so they need their
+                // own directories.
+                parameter = "paths=source_relative",
             ),
             // `(trevrpc.method)` options as protoc encodes them from trevrpc/options.proto.
             Schema(
@@ -1170,6 +1278,7 @@ class GeneratedCodeCompilationTest {
         val protoFiles: List<String>,
         val fixtures: Map<String, String>,
         val extraProtoRoots: List<Path> = emptyList(),
+        val parameter: String = "",
     )
 
     private fun optionsProtoRoot(): Path {
@@ -1212,7 +1321,7 @@ class GeneratedCodeCompilationTest {
                     listOf(
                         "--java_out=${if (lite) "lite:" else ""}$javaOut",
                         "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
-                        "--trevrpc-kotlin_out=$kotlinOut",
+                        "--trevrpc-kotlin_out=${if (schema.parameter.isEmpty()) "" else "${schema.parameter}:"}$kotlinOut",
                     ) + schema.protoFiles,
                 schema.protoRoot,
                 "schema ${schema.name}",

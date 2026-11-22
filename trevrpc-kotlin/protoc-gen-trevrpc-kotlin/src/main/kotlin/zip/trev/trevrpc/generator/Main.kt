@@ -69,7 +69,7 @@ internal fun generate(request: CodeGeneratorRequest): CodeGeneratorResponse {
             response.addFile(
                 CodeGeneratorResponse.File
                     .newBuilder()
-                    .setName(outputFileName(file.name, options.fileSuffix))
+                    .setName(outputFileName(file, options))
                     .setContent(generateFile(file, types, options))
                     .build(),
             )
@@ -88,6 +88,7 @@ private fun responseBuilder(): CodeGeneratorResponse.Builder =
 private data class PluginOptions(
     val runtimePackage: String = DEFAULT_RUNTIME_PACKAGE,
     val fileSuffix: String = DEFAULT_FILE_SUFFIX,
+    val paths: OutputPaths = OutputPaths.IMPORT,
 ) {
     companion object {
         fun parse(parameter: String): PluginOptions {
@@ -111,6 +112,16 @@ private data class PluginOptions(
                             options.copy(fileSuffix = value)
                         }
 
+                        "paths" -> {
+                            val paths =
+                                OutputPaths.entries.firstOrNull { it.option == value }
+                                    ?: throw IllegalArgumentException(
+                                        "invalid trevrpc-kotlin paths ${value.quote()}; expected " +
+                                            OutputPaths.entries.joinToString(" or ") { it.option.quote() },
+                                    )
+                            options.copy(paths = paths)
+                        }
+
                         else -> {
                             throw IllegalArgumentException("unknown trevrpc-kotlin option ${key.quote()}")
                         }
@@ -119,6 +130,17 @@ private data class PluginOptions(
             return options
         }
     }
+}
+
+/** Where each output file goes, named like protoc-gen-go's `paths` option. */
+private enum class OutputPaths(
+    val option: String,
+) {
+    /** Under the directory of the file's Kotlin package, where protoc's Java plugin writes its messages. */
+    IMPORT("import"),
+
+    /** Beside the proto file's path, whatever its package. */
+    SOURCE_RELATIVE("source_relative"),
 }
 
 private data class TypeRef(
@@ -303,7 +325,7 @@ private fun validateDeclarations(
         }
 
         if (file.name !in filesToGenerate || file.serviceCount == 0) continue
-        val outputName = outputFileName(file.name, options.fileSuffix)
+        val outputName = outputFileName(file, options)
         reserve("output:$outputName", "output file $outputName", "protobuf file ${file.name}")
         val fileFacade = kotlinFileFacadeName(file.name)
         reserve(
@@ -342,9 +364,17 @@ private fun validateDeclarations(
     if (conflict != null) {
         val first = conflict[0]
         val second = conflict[1]
+        // Two proto files of one package in different directories share a name only under the
+        // package's directory, so the layout of paths=source_relative tells them apart.
+        val hint =
+            if (first.key.startsWith("output:") && options.paths == OutputPaths.IMPORT) {
+                "; rename one of the files or pass paths=source_relative"
+            } else {
+                ""
+            }
         throw GeneratorException(
             "generated Kotlin declaration ${first.declaration.quote()} conflicts between protobuf symbols " +
-                "${first.symbol.quote()} and ${second.symbol.quote()}",
+                "${first.symbol.quote()} and ${second.symbol.quote()}$hint",
         )
     }
 }
@@ -914,14 +944,29 @@ private fun fullProtoName(
     names: List<String>,
 ): String = "." + (listOf(protoPackage).filter(String::isNotEmpty) + names).joinToString(".")
 
+/**
+ * The output file of [file]: the proto file's name without its extension plus the file suffix,
+ * under its Kotlin package's directory or, with `paths=source_relative`, the proto file's own.
+ */
 private fun outputFileName(
-    input: String,
-    suffix: String,
+    file: FileDescriptorProto,
+    options: PluginOptions,
 ): String {
+    val input = file.name
     val slash = input.lastIndexOf('/')
     val dot = input.lastIndexOf('.')
     val extensionStart = if (dot > slash) dot else input.length
-    return input.substring(0, extensionStart) + suffix
+    val sourceRelative = input.substring(0, extensionStart) + options.fileSuffix
+    return when (options.paths) {
+        OutputPaths.SOURCE_RELATIVE -> {
+            sourceRelative
+        }
+
+        OutputPaths.IMPORT -> {
+            val directory = javaPackage(file).split('.').filter(String::isNotEmpty)
+            (directory + sourceRelative.substring(slash + 1)).joinToString("/")
+        }
+    }
 }
 
 private fun kotlinFileFacadeName(protoFileName: String): String {
