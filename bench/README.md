@@ -400,11 +400,12 @@ non-zero if it could not connect or measure:
   of the same interval. The bytes are sampled at the start and the end of the
   window, which a busy machine can delay, so the messages are those the
   operations delivered between the same two samples, not `msgs`, unless no
-  message was, when `msgs` is the only count there is. The paced scenarios
-  count a message by when it was scheduled, and a worker that falls behind
-  sends the window's last messages after it, so they divide by the messages
-  sent between the samples and echoed in time. It is omitted where the
-  transport stack does not expose connection statistics.
+  message was, when `msgs` is the only count there is. For the paced
+  scenarios, which count `msgs` by when each message was scheduled, they are
+  the echoes that arrived in time between the samples, since a message sent
+  before the end sample, by a worker behind its schedule or a stalled
+  process, can reach the wire after it. It is omitted where the transport
+  stack does not expose connection statistics.
 - `errors` counts failed operations. Workers carry on after an error.
 - `lost` counts messages sent but not delivered, for the `unreliable-*` and
   paced scenarios only (`0` elsewhere). Loss is not an error. For the paced

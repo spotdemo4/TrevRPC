@@ -512,7 +512,8 @@ func (*unreliableClientStreamOperation) close() {}
 // whose requests and echoes may travel as datagrams, for unreliable-paced.
 // Each message scheduled inside the measured window is one operation:
 // delivered, with the time from its send to its echo, if the echo arrives
-// within pacedDeadline of the send, and lost otherwise.
+// within pacedDeadline of the send, and lost otherwise. Every echo that
+// arrives in time, in the window or not, counts in w.delivered as it arrives.
 type pacedWorkload struct {
 	open     openBidi
 	options  []trevrpc.CallOption
@@ -525,7 +526,7 @@ func (p *pacedWorkload) work(ctx context.Context, w *benchWorker, start, end tim
 	// Sending goes on past the window, so the echoes of its last messages
 	// arrive under the same load.
 	total := int(end.Add(pacedDeadline).Sub(base)/p.interval) + 1
-	schedule := pacedSchedule{base: base, sent: make([]atomic.Int64, total), rtts: make([]time.Duration, total)}
+	schedule := pacedSchedule{base: base, sent: make([]atomic.Int64, total), rtts: make([]time.Duration, total), delivered: &w.delivered, sampler: w.sampler}
 	for i := range schedule.rtts {
 		schedule.rtts[i] = -1
 	}
@@ -546,16 +547,11 @@ func (p *pacedWorkload) work(ctx context.Context, w *benchWorker, start, end tim
 		next = max(next, int(time.Since(base)/p.interval)+1)
 	}
 	for i, rtt := range schedule.rtts {
-		delivered := rtt >= 0 && rtt <= pacedDeadline
-		if delivered {
-			// A message is echoed only after its send was recorded.
-			w.deliveredSends = append(w.deliveredSends, base.Add(time.Duration(schedule.sent[i].Load()-1)))
-		}
 		scheduled := base.Add(time.Duration(i) * p.interval)
 		if scheduled.Before(start) || !scheduled.Before(end) {
 			continue
 		}
-		if delivered {
+		if inTime(rtt) {
 			w.latencies = append(w.latencies, rtt)
 			w.messages++
 		} else {
@@ -574,6 +570,17 @@ type pacedSchedule struct {
 	// rtts[i] is how long after its send message i was echoed, or -1 if it
 	// has not been. Only the receiver writes it.
 	rtts []time.Duration
+	// delivered counts the echoes that arrived in time, as they arrive, for
+	// sampler to read at the same instants as the wire bytes.
+	delivered *atomic.Uint64
+	// sampler is told when the sender is about to send a message, or nil.
+	sampler *wireSampler
+}
+
+// inTime reports whether a message echoed rtt after its send was delivered:
+// echoed at all, and within pacedDeadline.
+func inTime(rtt time.Duration) bool {
+	return rtt >= 0 && rtt <= pacedDeadline
 }
 
 // stream opens a stream and sends messages next to the end of the schedule,
@@ -589,6 +596,10 @@ func (p *pacedWorkload) stream(ctx context.Context, schedule *pacedSchedule, nex
 	for ; next < len(schedule.sent) && err == nil; next++ {
 		if err = sleepUntil(ctx, schedule.base.Add(time.Duration(next)*p.interval)); err == nil {
 			request := &interoppb.EchoRequest{Message: pacedMessage(next, p.payload.next()), Count: 1}
+			// A sender that wakes behind its schedule after the window, as
+			// after a stall, sends its overdue messages after the end sample:
+			// their bytes are not in it, as their echoes will not be.
+			schedule.sampler.observe(time.Now())
 			schedule.sent[next].Store(int64(time.Since(schedule.base)) + 1)
 			err = call.Send(request)
 		}
@@ -628,7 +639,11 @@ func receivePaced(call trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest
 			return fmt.Errorf("echo of message %d, which was not sent", sequence)
 		}
 		if schedule.rtts[sequence] < 0 {
-			schedule.rtts[sequence] = time.Duration(arrived - sent)
+			rtt := time.Duration(arrived - sent)
+			schedule.rtts[sequence] = rtt
+			if inTime(rtt) {
+				schedule.delivered.Add(1)
+			}
 		}
 	}
 }
@@ -709,30 +724,14 @@ type benchWorker struct {
 	messages  uint64
 	lost      uint64
 	errors    uint64
-	// deliveredSends holds when each message a paced worker sent was sent,
-	// for every one echoed in time, in the window or not. A worker that falls
-	// behind its schedule sends a window's messages after it, so the wire
-	// bytes are divided by the messages actually sent while they were counted.
-	deliveredSends []time.Time
-	// delivered counts the messages its operations delivered, in the window
-	// or not, for sampler to read at the same instants as the wire bytes.
+	// delivered counts the messages its operations delivered, or the paced
+	// echoes that arrived in time, in the window or not, for sampler to read
+	// at the same instants as the wire bytes. A message counts once it has
+	// arrived, by when its bytes have been, whenever it was scheduled or sent.
 	delivered atomic.Uint64
-	// sampler is told when the worker starts an operation, or nil.
+	// sampler is told when the worker starts an operation or sends a paced
+	// message, or nil.
 	sampler *wireSampler
-}
-
-// deliveredBetween counts the paced messages sent in [from, to) and echoed in
-// time.
-func deliveredBetween(workers []benchWorker, from, to time.Time) uint64 {
-	var count uint64
-	for i := range workers {
-		for _, sent := range workers[i].deliveredSends {
-			if !sent.Before(from) && sent.Before(to) {
-				count++
-			}
-		}
-	}
-	return count
 }
 
 // operationLoop runs its operation back to back until end. It counts only
@@ -929,7 +928,7 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		return err
 	}
 	if sampler != nil {
-		result.WireBytesPerMsg = sampler.sample().perMessage(&config, workers, result.Msgs)
+		result.WireBytesPerMsg = sampler.sample().perMessage(result.Msgs)
 	}
 	return json.NewEncoder(out).Encode(result)
 }
@@ -938,16 +937,18 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 // operations delivered at the start and at the end of the measured window, so
 // the bytes are divided by the messages of the same interval. Whoever first
 // sees a boundary pass takes its sample: the main goroutine when its timer
-// fires, or a worker about to start an operation. A busy machine delays the
-// timer, but every operation the window measures starts after the start
-// sample and ends before the end sample. A nil sampler samples nothing.
+// fires, or a worker about to start an operation or send a paced message. A
+// busy machine delays the timer, but every operation the window measures
+// starts after the start sample and ends before the end sample, and a paced
+// message counts once its echo has arrived, after its bytes. A nil sampler
+// samples nothing.
 type wireSampler struct {
 	wire          *wireCounter
 	workers       []benchWorker
 	start, end    time.Time
 	begin, finish sync.Once
-	// at holds the instant, the wire bytes and the delivered messages of the
-	// start and the end sample.
+	// at holds the wire bytes and the delivered messages of the start and the
+	// end sample.
 	at [2]wireSample
 }
 
@@ -968,7 +969,7 @@ func (s *wireSampler) snapshot() wireSample {
 	for i := range s.workers {
 		delivered += s.workers[i].delivered.Load()
 	}
-	return wireSample{bytes: s.wire.total(), delivered: delivered, from: time.Now()}
+	return wireSample{bytes: s.wire.total(), delivered: delivered}
 }
 
 // sample returns what changed between the two samples, once both are taken.
@@ -976,29 +977,22 @@ func (s *wireSampler) sample() wireSample {
 	return wireSample{
 		bytes:     s.at[1].bytes - s.at[0].bytes,
 		delivered: s.at[1].delivered - s.at[0].delivered,
-		from:      s.at[0].from,
-		to:        s.at[1].from,
 	}
 }
 
 // wireSample is the bytes the client's connections carried between two
-// instants, and the messages its operations delivered between them.
+// instants, and the messages delivered between them.
 type wireSample struct {
 	bytes, delivered uint64
-	from, to         time.Time
 }
 
-// perMessage divides the sample's bytes by the messages of its interval: for
-// paced messages, which count by when they were scheduled, possibly long
-// before they were sent, those sent in it, and for operations those
-// delivered in it. A sampler starved until the window had passed sees none;
-// the window's messages, windowed, are then the only count there is. It is
-// nil when there were none at all.
-func (s wireSample) perMessage(config *benchConfig, workers []benchWorker, windowed uint64) *float64 {
+// perMessage divides the sample's bytes by the messages delivered in its
+// interval. A sampler starved until the window had passed sees none; the
+// window's messages, windowed, are then the only count there is. It is nil
+// when there were none at all.
+func (s wireSample) perMessage(windowed uint64) *float64 {
 	messages := s.delivered
-	if config.paced() {
-		messages = deliveredBetween(workers, s.from, s.to)
-	} else if messages == 0 {
+	if messages == 0 {
 		messages = windowed
 	}
 	if messages == 0 {

@@ -457,19 +457,13 @@ struct WorkerResult {
     lost: u64,
     /// Failures by message, reported on stderr to explain a non-zero error count.
     errors: BTreeMap<String, u64>,
-    /// When a paced worker sent each message echoed in time, in the window or not. A worker that
-    /// falls behind its schedule sends a window's messages after it, so the wire bytes are divided
-    /// by the messages actually sent while they were counted.
-    delivered_sends: Vec<Instant>,
 }
 
-/// The bytes the client's connections carried between two instants, and the messages that
-/// operations delivered between the same two instants.
+/// The bytes the client's connections carried between two instants, and the messages delivered
+/// between the same two instants.
 struct WireSample {
     bytes: u64,
     delivered: u64,
-    from: Instant,
-    to: Instant,
 }
 
 /// Where a worker's request messages come from.
@@ -518,8 +512,10 @@ struct Worker<T> {
     messages: usize,
     interval: Duration,
     bidi: Option<BidirectionalCall<EchoRequest, EchoResponse>>,
-    /// The messages this worker's operations have delivered so far, in the window or not, which
-    /// the wire-byte sampling reads at the same instants as the wire bytes.
+    /// The messages this worker's operations have delivered so far, or its paced echoes that
+    /// arrived in time, in the window or not, which the wire-byte sampling reads at the same
+    /// instants as the wire bytes. A message counts once it has arrived, by when its bytes have
+    /// been, whenever it was scheduled or sent.
     delivered: Arc<AtomicU64>,
 }
 
@@ -704,8 +700,8 @@ where
 
     /// Opens an `Echo.Bidi` stream for `paced`, or an `UnreliableEcho.Bidi` stream for
     /// `unreliable-paced`, and sends the messages of `schedule` from `next`
-    /// on, recording their echoes, until the schedule ends or the stream fails. `next` is left at
-    /// the first message not sent.
+    /// on, recording their echoes and counting those in time as delivered, until the schedule ends
+    /// or the stream fails. `next` is left at the first message not sent.
     async fn paced_stream(
         &mut self,
         schedule: &mut Schedule,
@@ -725,6 +721,7 @@ where
         let Schedule { base, sent, rtts } = schedule;
         let (base, interval, sent) = (*base, self.interval, &*sent);
         let messages = &mut self.messages_source;
+        let delivered = &*self.delivered;
         let sending = async {
             while let Some(sent_at) = sent.get(*next) {
                 tokio::time::sleep_until(scheduled(base, interval, *next)).await;
@@ -752,9 +749,7 @@ where
                             "an echo carries no message number that was sent",
                         ))
                     })?;
-                if rtt.is_none() {
-                    *rtt = Some(Duration::from_nanos(arrived.saturating_sub(sent_at)));
-                }
+                record_echo(rtt, sent_at, arrived, delivered);
             }
             Ok(())
         };
@@ -804,6 +799,20 @@ struct Schedule {
 
 /// The send time of a message not sent.
 const UNSENT: u64 = u64::MAX;
+
+/// Records the echo of a message sent `sent_at` and echoed `arrived` nanoseconds after the
+/// schedule's base in its `rtt`, unless an earlier echo already was, and counts it in `delivered`
+/// if it arrived within `PACED_DEADLINE` of the send.
+fn record_echo(rtt: &mut Option<Duration>, sent_at: u64, arrived: u64, delivered: &AtomicU64) {
+    if rtt.is_some() {
+        return;
+    }
+    let echoed = Duration::from_nanos(arrived.saturating_sub(sent_at));
+    *rtt = Some(echoed);
+    if echoed <= PACED_DEADLINE {
+        delivered.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Nanoseconds from `base` to now.
 fn since(base: Instant) -> u64 {
@@ -862,7 +871,8 @@ where
 /// the echoes as they arrive. Sending goes on past the window, so the echoes of its last messages
 /// arrive under the same load. Each message scheduled inside the window is one operation:
 /// delivered, with the time from its send to its echo, if the echo arrives within
-/// `PACED_DEADLINE` of the send, and lost otherwise.
+/// `PACED_DEADLINE` of the send, and lost otherwise. Every echo that arrives in time, in the window
+/// or not, counts in the worker's `delivered` as it arrives.
 async fn paced<T>(mut worker: Worker<T>, window: Window) -> WorkerResult
 where
     T: StreamingRpcTransport + Clone,
@@ -912,15 +922,8 @@ where
             .unwrap_or(0);
         next = next.max(due.saturating_add(1));
     }
-    for (sequence, (rtt, sent_at)) in schedule.rtts.into_iter().zip(&schedule.sent).enumerate() {
+    for (sequence, rtt) in schedule.rtts.into_iter().enumerate() {
         let rtt = rtt.filter(|rtt| *rtt <= PACED_DEADLINE);
-        if rtt.is_some() {
-            // A message is echoed only after its send was recorded.
-            let offset = Duration::from_nanos(sent_at.load(Ordering::Relaxed));
-            result
-                .delivered_sends
-                .push(base.checked_add(offset).unwrap_or(base));
-        }
         let sent = scheduled(base, worker.interval, sequence);
         if sent < window.start || sent >= window.end {
             continue;
@@ -1033,17 +1036,13 @@ where
         })
     };
     tokio::time::sleep_until(window.start).await;
-    let from = Instant::now();
     let before = link.wire_bytes().map(|bytes| (bytes, delivered_so_far()));
     tokio::time::sleep_until(window.end).await;
     let after = link.wire_bytes().map(|bytes| (bytes, delivered_so_far()));
-    let to = Instant::now();
     let wire = before.zip(after).map(
         |((bytes_before, delivered_before), (bytes_after, delivered_after))| WireSample {
             bytes: bytes_after.saturating_sub(bytes_before),
             delivered: delivered_after.saturating_sub(delivered_before),
-            from,
-            to,
         },
     );
 
@@ -1127,17 +1126,9 @@ impl Report {
         let lost = results
             .iter()
             .fold(0_u64, |total, result| total.saturating_add(result.lost));
-        // The wire bytes are divided by the messages of the same interval: for paced messages,
-        // which count by when they were scheduled, possibly long before they were sent, those sent
-        // in it, and for operations those delivered in it.
+        // The wire bytes are divided by the messages delivered in the same interval.
         let wire = wire.map(|sample| {
-            let wire_msgs = if paced {
-                results
-                    .iter()
-                    .flat_map(|result| &result.delivered_sends)
-                    .filter(|&&sent| sent >= sample.from && sent < sample.to)
-                    .fold(0_u64, |total, _| total.saturating_add(1))
-            } else if sample.delivered > 0 {
+            let wire_msgs = if sample.delivered > 0 {
                 sample.delivered
             } else {
                 // A sampler starved until the window had passed sees no message; the window's
@@ -1261,11 +1252,12 @@ const fn count(value: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    use tokio::time::Instant;
-
-    use super::{Params, Report, WireSample, WorkerResult, error_breakdown};
+    use super::{
+        PACED_DEADLINE, Params, Report, WireSample, WorkerResult, error_breakdown, record_echo,
+    };
     use crate::Flags;
 
     fn worker(errors: &[(&str, u64)]) -> WorkerResult {
@@ -1297,40 +1289,72 @@ mod tests {
 
     /// The wire bytes are divided by the messages delivered between the sample's two instants, not
     /// by the window's: the sampler wakes late on a busy machine, so the two cover different
-    /// intervals.
+    /// intervals. The paced scenarios, whose window counts messages by when they were scheduled,
+    /// divide the same way.
     #[test]
     fn wire_bytes_are_divided_by_the_messages_of_the_sampled_interval() {
-        let params =
-            Params::parse(&Flags(HashMap::from([("scenario", "unary".to_owned())]))).unwrap();
-        let results = || {
-            vec![WorkerResult {
-                latencies: vec![Duration::from_millis(1)],
-                messages: 10,
-                ..WorkerResult::default()
-            }]
-        };
-        let from = Instant::now();
-        let wire = WireSample {
-            bytes: 1000,
-            delivered: 4,
-            from,
-            to: from,
-        };
-        let json = Report::new(&params, "quic", results(), Some(wire))
-            .unwrap()
-            .json();
-        assert!(json.contains(r#""wire_bytes_per_msg":250.0"#), "{json}");
+        for scenario in ["unary", "paced", "unreliable-paced"] {
+            let params =
+                Params::parse(&Flags(HashMap::from([("scenario", scenario.to_owned())]))).unwrap();
+            let results = || {
+                vec![WorkerResult {
+                    latencies: vec![Duration::from_millis(1)],
+                    messages: 10,
+                    ..WorkerResult::default()
+                }]
+            };
+            let wire = WireSample {
+                bytes: 1000,
+                delivered: 4,
+            };
+            let json = Report::new(&params, "quic", results(), Some(wire))
+                .unwrap()
+                .json();
+            assert!(
+                json.contains(r#""wire_bytes_per_msg":250.0"#),
+                "{scenario}: {json}"
+            );
 
-        // A sampler starved past the window saw no message: the window's count is the only one.
-        let starved = WireSample {
-            bytes: 1000,
-            delivered: 0,
-            from,
-            to: from,
-        };
-        let json = Report::new(&params, "quic", results(), Some(starved))
-            .unwrap()
-            .json();
-        assert!(json.contains(r#""wire_bytes_per_msg":100.0"#), "{json}");
+            // A sampler starved past the window saw no message: the window's count is the only
+            // one.
+            let starved = WireSample {
+                bytes: 1000,
+                delivered: 0,
+            };
+            let json = Report::new(&params, "quic", results(), Some(starved))
+                .unwrap()
+                .json();
+            assert!(
+                json.contains(r#""wire_bytes_per_msg":100.0"#),
+                "{scenario}: {json}"
+            );
+        }
+    }
+
+    /// A paced echo counts as delivered when it arrives, for the wire-byte sampling to read, if it
+    /// arrived in time and is the message's first.
+    #[test]
+    fn paced_echoes_count_as_delivered_when_they_arrive_in_time() {
+        let deadline = u64::try_from(PACED_DEADLINE.as_nanos()).unwrap();
+        let delivered = AtomicU64::new(0);
+
+        let mut rtt = None;
+        record_echo(&mut rtt, 1_000, 3_000, &delivered);
+        assert_eq!(rtt, Some(Duration::from_nanos(2_000)));
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+
+        // A second echo of the same message changes nothing.
+        record_echo(&mut rtt, 1_000, 5_000, &delivered);
+        assert_eq!(rtt, Some(Duration::from_nanos(2_000)));
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+
+        // An echo exactly at the deadline is in time; one after it is recorded but lost.
+        let mut on_time = None;
+        record_echo(&mut on_time, 0, deadline, &delivered);
+        assert_eq!(delivered.load(Ordering::Relaxed), 2);
+        let mut late = None;
+        record_echo(&mut late, 0, deadline + 1, &delivered);
+        assert_eq!(late, Some(PACED_DEADLINE + Duration::from_nanos(1)));
+        assert_eq!(delivered.load(Ordering::Relaxed), 2);
     }
 }

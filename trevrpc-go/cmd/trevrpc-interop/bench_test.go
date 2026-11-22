@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -247,65 +249,242 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 	}
 }
 
-// TestBenchPacedWireBytesCountLateMessagesWhenSent holds back three of four
-// paced workers until the window has ended, so they send its messages in a
-// burst after it, and checks that the wire bytes are still divided by the
-// messages sent while they were counted: the burst counts as delivered, but
-// its bytes are not in the window. It runs paced, whose stream delivers the
-// whole burst; unreliable-paced counts the same way but may drop its datagrams.
-func TestBenchPacedWireBytesCountLateMessagesWhenSent(t *testing.T) {
+// TestBenchPacedWireBytesCountLateMessagesWhenEchoed holds back three of four
+// paced workers until the end sample is taken and checks that the wire bytes
+// are still divided by the messages delivered while they were counted: the
+// held back messages count as delivered, but their bytes are not in the
+// window. The workers are held back either before they open their stream, so
+// they send the window's messages in a burst after it, or after they record
+// each send, so the window's messages leave after it although they were sent
+// in it, as when the whole process stalls just before the end sample. It runs
+// paced, whose stream delivers every held back message; unreliable-paced
+// counts the same way but may drop its datagrams.
+//
+// The held back messages are released as soon as the end sample is taken, so
+// that even the first of the window's, recorded about duration before, are
+// echoed well within pacedDeadline.
+func TestBenchPacedWireBytesCountLateMessagesWhenEchoed(t *testing.T) {
 	certFile, ports := startBenchServer(t)
-	const size, warmup, duration = 100, 50 * time.Millisecond, 200 * time.Millisecond
+	const size, warmup, duration = 100, 50 * time.Millisecond, 100 * time.Millisecond
 	pace := benchScenarios["paced"]
 	t.Cleanup(func() { benchScenarios["paced"] = pace })
-	workers := 0
-	benchScenarios["paced"] = func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
-		workload := pace(clients, config, payload).(*pacedWorkload)
-		if workers++; workers > 1 {
-			open, opened := workload.open, false
-			workload.open = func(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error) {
+	for _, test := range []struct {
+		name string
+		// hold returns the worker's open, held back by pastEnd, which returns
+		// once the end sample has been taken.
+		hold func(open openBidi, pastEnd func(context.Context) error) openBidi
+	}{
+		{name: "stream opened late", hold: func(open openBidi, pastEnd func(context.Context) error) openBidi {
+			opened := false
+			return func(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error) {
 				if !opened {
 					opened = true
-					if err := sleepUntil(ctx, time.Now().Add(warmup+duration+50*time.Millisecond)); err != nil {
+					if err := pastEnd(ctx); err != nil {
 						return nil, err
 					}
 				}
 				return open(ctx, options...)
 			}
-		}
-		return workload
-	}
-	var stdout, stderr bytes.Buffer
-	args := []string{
-		"bench",
-		"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
-		"--ca", certFile,
-		"--scenario", "paced",
-		"--size", strconv.Itoa(size),
-		"--rate", "1000",
-		"--concurrency", "4",
-		"--duration", strconv.FormatFloat(duration.Seconds(), 'f', -1, 64),
-		"--warmup", strconv.FormatFloat(warmup.Seconds(), 'f', -1, 64),
-	}
-	if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
-		t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
-	}
-	var got struct {
-		Msgs            uint64
-		WireBytesPerMsg float64 `json:"wire_bytes_per_msg"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("stdout %q is not JSON: %v", stdout.String(), err)
-	}
-	// Each worker schedules about 200 messages in the window, so more than
-	// that means the late workers' burst was delivered and counted.
-	if got.Msgs <= 250 {
-		t.Errorf("msgs = %d, want the late workers' messages delivered too", got.Msgs)
-	}
-	if got.WireBytesPerMsg < size {
-		t.Errorf("wire_bytes_per_msg = %v, want at least the %d payload bytes", got.WireBytesPerMsg, size)
+		}},
+		{name: "messages sent late", hold: func(open openBidi, pastEnd func(context.Context) error) openBidi {
+			return func(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error) {
+				call, err := open(ctx, options...)
+				if err != nil {
+					return nil, err
+				}
+				return holdSends(ctx, call, pastEnd), nil
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workers := 0
+			benchScenarios["paced"] = func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+				workload := pace(clients, config, payload).(*pacedWorkload)
+				if workers++; workers == 1 {
+					return workload
+				}
+				return heldWorkload{pacedWorkload: workload, hold: test.hold}
+			}
+			var stdout, stderr bytes.Buffer
+			args := []string{
+				"bench",
+				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
+				"--ca", certFile,
+				"--scenario", "paced",
+				"--size", strconv.Itoa(size),
+				"--rate", "1000",
+				"--concurrency", "4",
+				"--duration", strconv.FormatFloat(duration.Seconds(), 'f', -1, 64),
+				"--warmup", strconv.FormatFloat(warmup.Seconds(), 'f', -1, 64),
+			}
+			if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+				t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+			}
+			var got struct {
+				Msgs            uint64
+				WireBytesPerMsg float64 `json:"wire_bytes_per_msg"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("stdout %q is not JSON: %v", stdout.String(), err)
+			}
+			// Each worker schedules about 100 messages in the window, so more
+			// than that means the held back workers' messages were delivered and
+			// counted.
+			if got.Msgs <= 150 {
+				t.Errorf("msgs = %d, want the held back workers' messages delivered too", got.Msgs)
+			}
+			if got.WireBytesPerMsg < size {
+				t.Errorf("wire_bytes_per_msg = %v, want at least the %d payload bytes", got.WireBytesPerMsg, size)
+			}
+		})
 	}
 }
+
+// heldWorkload is a paced workload whose open hold holds back until the end
+// sample has been taken.
+type heldWorkload struct {
+	*pacedWorkload
+	hold func(open openBidi, pastEnd func(context.Context) error) openBidi
+}
+
+func (h heldWorkload) work(ctx context.Context, w *benchWorker, start, end time.Time) {
+	h.open = h.hold(h.open, func(ctx context.Context) error {
+		if err := sleepUntil(ctx, end); err != nil {
+			return err
+		}
+		// Takes the end sample unless the main goroutine already has; either
+		// way it has been taken once observe returns.
+		w.sampler.observe(time.Now())
+		return nil
+	})
+	h.pacedWorkload.work(ctx, w, start, end)
+}
+
+// heldCall is a Bidi call whose Send queues its request, which goes out on
+// the call, in order, only once release returns: a transport stalled after
+// the sender recorded each send. Close stops it whatever it is doing.
+type heldCall struct {
+	trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse]
+	// ctx ends when the call's context does or the call is closed.
+	ctx    context.Context
+	cancel context.CancelFunc
+	queue  chan *interoppb.EchoRequest
+	// closeSend closes queue once.
+	closeSend sync.Once
+	// sent receives the first error of releasing and sending the queued
+	// requests, or nil, once the queue is closed and drained, or ctx's error
+	// once ctx ends.
+	sent chan error
+}
+
+func holdSends(ctx context.Context, call trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], release func(context.Context) error) *heldCall {
+	ctx, cancel := context.WithCancel(ctx)
+	held := &heldCall{BidirectionalStreamingCall: call, ctx: ctx, cancel: cancel, queue: make(chan *interoppb.EchoRequest, 4096), sent: make(chan error, 1)}
+	go func() {
+		err := release(ctx)
+		for {
+			select {
+			case request, ok := <-held.queue:
+				if !ok {
+					held.sent <- err
+					return
+				}
+				if err == nil {
+					err = call.Send(request)
+				}
+			case <-ctx.Done():
+				held.sent <- ctx.Err()
+				return
+			}
+		}
+	}()
+	return held
+}
+
+func (c *heldCall) Send(request *interoppb.EchoRequest) error {
+	select {
+	case c.queue <- request:
+		return nil
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+}
+
+func (c *heldCall) CloseSend() error {
+	c.closeSend.Do(func() { close(c.queue) })
+	if err := <-c.sent; err != nil {
+		return err
+	}
+	return c.BidirectionalStreamingCall.CloseSend()
+}
+
+func (c *heldCall) Close() error {
+	c.cancel()
+	return c.BidirectionalStreamingCall.Close()
+}
+
+// TestPacedSenderTakesTheEndSampleBeforeSendingAfterTheWindow has a paced
+// sender wake after the window, as after a stall the main goroutine has not
+// caught up with: the end sample must be taken before each send, so the
+// backlog's bytes are not in it.
+func TestPacedSenderTakesTheEndSampleBeforeSendingAfterTheWindow(t *testing.T) {
+	end := time.Now().Add(-time.Second)
+	wire := new(wireCounter)
+	wire.sent.Store(42)
+	workers := make([]benchWorker, 1)
+	sampler := &wireSampler{wire: wire, workers: workers, start: end.Add(-time.Second), end: end}
+	var sends, unsampled int
+	call := &scriptedBidi{send: func(*interoppb.EchoRequest) {
+		// The sender's goroutine takes the samples, so it may read them.
+		sends++
+		if sampler.at[1].bytes != 42 {
+			unsampled++
+		}
+	}, done: make(chan struct{})}
+	p := &pacedWorkload{
+		open: func(context.Context, ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error) {
+			return call, nil
+		},
+		payload:  newBenchPayload("repeat", 100, 0),
+		interval: time.Millisecond,
+	}
+	const total = 3
+	schedule := pacedSchedule{base: time.Now(), sent: make([]atomic.Int64, total), rtts: []time.Duration{-1, -1, -1}, delivered: &workers[0].delivered, sampler: sampler}
+	next, err := p.stream(t.Context(), &schedule, 0)
+	if next != total || err != nil {
+		t.Fatalf("stream = %d, %v, want %d, nil", next, err, total)
+	}
+	if sends != total || unsampled != 0 {
+		t.Fatalf("%d of %d sends happened before the end sample, want none of %d", unsampled, sends, total)
+	}
+}
+
+// scriptedBidi is a Bidi call that hands each request to send and ends its
+// responses when its request stream is closed. Its other methods are not
+// implemented.
+type scriptedBidi struct {
+	trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse]
+	send func(*interoppb.EchoRequest)
+	done chan struct{}
+	once sync.Once
+}
+
+func (c *scriptedBidi) Send(request *interoppb.EchoRequest) error {
+	c.send(request)
+	return nil
+}
+
+func (c *scriptedBidi) Recv() (*interoppb.EchoResponse, error) {
+	<-c.done
+	return nil, io.EOF
+}
+
+func (c *scriptedBidi) CloseSend() error {
+	c.once.Do(func() { close(c.done) })
+	return nil
+}
+
+func (c *scriptedBidi) Close() error { return c.CloseSend() }
 
 // TestBenchValidationScenariosCallEveryRequestType runs the validation
 // scenarios with each --validation value and checks that the result names it.
@@ -741,17 +920,16 @@ func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
 // window's msgs: the sampler wakes late on a busy machine, so the two cover
 // different intervals.
 func TestWireBytesAreDividedByTheMessagesOfTheSampledInterval(t *testing.T) {
-	config := &benchConfig{scenario: "unary"}
-	got := wireSample{bytes: 1000, delivered: 4}.perMessage(config, nil, 10)
+	got := wireSample{bytes: 1000, delivered: 4}.perMessage(10)
 	if got == nil || *got != 250 {
 		t.Fatalf("wire bytes per message = %v, want 250", got)
 	}
 	// A sampler starved past the window saw no message: the window's count is
 	// the only one.
-	if got := (wireSample{bytes: 1000}).perMessage(config, nil, 10); got == nil || *got != 100 {
+	if got := (wireSample{bytes: 1000}).perMessage(10); got == nil || *got != 100 {
 		t.Fatalf("wire bytes per message with no message sampled = %v, want 100", got)
 	}
-	if got := (wireSample{bytes: 1000}).perMessage(config, nil, 0); got != nil {
+	if got := (wireSample{bytes: 1000}).perMessage(0); got != nil {
 		t.Fatalf("wire bytes per message with no message at all = %v, want none", *got)
 	}
 }
@@ -816,8 +994,5 @@ func TestWireSamplerTakesWhatChangedBetweenTheBoundaries(t *testing.T) {
 	got := sampler.sample()
 	if got.bytes != 300 || got.delivered != 3 {
 		t.Fatalf("sample = %d bytes and %d messages, want 300 and 3", got.bytes, got.delivered)
-	}
-	if got.to.Before(got.from) {
-		t.Fatalf("sample from %v to %v, want its end after its start", got.from, got.to)
 	}
 }
