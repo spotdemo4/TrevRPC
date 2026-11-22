@@ -142,10 +142,13 @@ routes() ->
             end
         },
         %% Sends `Count' responses of `Size' bytes once told to go, reporting
-        %% its start and each response before it sends it.
+        %% its start, and response number `Report' before it sends it (0 for
+        %% none). It reports one response, not each: tens of thousands of
+        %% reports would pile up in the test's mailbox, and every receive
+        %% while it drains the flood would have to scan past them.
         ?FLOOD => #{
             kind => server_streaming,
-            handler => fun(<<Count:32, Size:32>>, Call) ->
+            handler => fun(<<Count:32, Size:32, Report:32>>, Call) ->
                 persistent_term:get(?MODULE) ! {flooding, self()},
                 receive
                     go -> ok
@@ -153,9 +156,12 @@ routes() ->
                 Message = binary:copy(<<"f">>, Size),
                 Test = persistent_term:get(?MODULE),
                 lists:foreach(
-                    fun(N) ->
-                        Test ! {sending, self(), N},
-                        ok = trevrpc_call:send(Call, Message)
+                    fun
+                        (N) when N =:= Report ->
+                            Test ! {sending, self(), N},
+                            ok = trevrpc_call:send(Call, Message);
+                        (_N) ->
+                            ok = trevrpc_call:send(Call, Message)
                     end,
                     lists:seq(1, Count)
                 )
@@ -465,7 +471,7 @@ slow_reader_test(#{credentials := Credentials, version := Version} = Env) ->
     %% is.
     Count = flood_count(Version),
     {ok, Flood} = open_manual(Client, post(?MEDIA_TYPE)),
-    ok = send(Client, Flood, flood_body(Count, 1000), true),
+    ok = send(Client, Flood, flood_body(Version), true),
     _ = await_waiting(Client, Flood, Version),
     %% A refused call's STATUS, too long to fit what is left of the queue,
     %% waits for it as well.
@@ -481,12 +487,19 @@ slow_reader_test(#{credentials := Credentials, version := Version} = Env) ->
     close(Client),
     trevrpc_server:stop(Server).
 
-flood_body(Count, Size) ->
-    unary_body(?FLOOD, <<Count:32, Size:32>>, server_streaming).
+%% A flood of 1000-byte responses that fills what the writer waits for.
+flood_body(Version) ->
+    Request = <<(flood_count(Version)):32, 1000:32, (flood_report(Version)):32>>,
+    unary_body(?FLOOD, Request, server_streaming).
 
 %% Over HTTP/3 the 16 MiB send queue must fill, over HTTP/2 a 64 KiB window.
 flood_count(h3) -> 20000;
 flood_count(h2) -> 200.
+
+%% The response the writer reports before it sends it, which await_waiting/3
+%% waits for over HTTP/2. Over HTTP/3 it reports none.
+flood_report(h3) -> 0;
+flood_report(h2) -> 66.
 
 %% Starts the flood on `Id' and returns once its writer waits. Over HTTP/3
 %% it waits for quic_h3's send queue, which a trace of the writer shows: the
@@ -519,20 +532,23 @@ await_waiting(Client, Id, Version) ->
         h2 ->
             Writer ! go,
             %% 66 responses of 1000 bytes and a 3-byte header end at 66198.
+            Report = flood_report(h2),
             receive
-                {sending, Writer, 66} -> ok
+                {sending, Writer, Report} -> ok
             after 10000 -> error(never_waited)
             end,
             Writer
     end.
 
 %% Reads the whole response of `Flood', returning its credit as it goes, and
-%% the STATUS of `Refused' when it comes.
+%% the STATUS of `Refused' when it comes. The frames gather in reverse, as
+%% appending each chunk's to tens of thousands read before would take time
+%% quadratic in the flood.
 drain(Client, Flood, Refused, Reader, Acc, RefusedStatus) ->
     drain(Client, Flood, Refused, Reader, Acc, RefusedStatus, <<>>).
 
 drain(_Client, done, _Refused, _Reader, Acc, RefusedStatus, _Body) when RefusedStatus =/= none ->
-    {Acc, RefusedStatus};
+    {lists:reverse(Acc), RefusedStatus};
 drain({Tag, Conn} = Client, Flood, Refused, Reader, Acc, RefusedStatus, Body) ->
     receive
         {Tag, Conn, {data, Flood, Data, Fin}} ->
@@ -544,7 +560,7 @@ drain({Tag, Conn} = Client, Flood, Refused, Reader, Acc, RefusedStatus, Body) ->
                     true -> done;
                     false -> Flood
                 end,
-            drain(Client, Done, Refused, Next, Acc ++ Frames, RefusedStatus, Body);
+            drain(Client, Done, Refused, Next, lists:reverse(Frames, Acc), RefusedStatus, Body);
         {Tag, Conn, {response, Refused, 200, _}} ->
             drain(Client, Flood, Refused, Reader, Acc, RefusedStatus, Body);
         {Tag, Conn, {data, Refused, Data, false}} ->
@@ -559,7 +575,7 @@ blocked_reset_test(#{credentials := Credentials, version := Version} = Env) ->
     Server = start_server(Credentials, #{}),
     Client = connect(Env#{port => port(Server), tcp_port => tcp_port(Server)}),
     {ok, Id} = open_manual(Client, post(?MEDIA_TYPE)),
-    ok = send(Client, Id, flood_body(flood_count(Version), 1000), true),
+    ok = send(Client, Id, flood_body(Version), true),
     Writer = await_waiting(Client, Id, Version),
     Monitor = monitor(process, Writer),
     cancel(Client, Id),
@@ -616,7 +632,7 @@ stalled_shutdown_test(#{credentials := Credentials} = Env) ->
     %% The client stops reading: the flood fills quic_h3's send queue, and a
     %% refused call's STATUS waits for it to drain.
     {ok, Flood} = open_manual(Client, post(?MEDIA_TYPE)),
-    ok = send(Client, Flood, flood_body(flood_count(h3), 1000), true),
+    ok = send(Client, Flood, flood_body(h3), true),
     _ = await_waiting(Client, Flood, h3),
     Missing = <<"/test.Echo/", (binary:copy(<<"m">>, 1500))/binary>>,
     {ok, Refused} = open(Client, post(?MEDIA_TYPE)),
