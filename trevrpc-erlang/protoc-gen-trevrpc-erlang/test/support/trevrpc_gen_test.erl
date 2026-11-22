@@ -8,7 +8,20 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--export([options_dir/1, request/3, response/1, fields/1, scratch/0]).
+-export([generating/1, options_dir/1, request/3, response/1, fields/1, scratch/0]).
+
+%% How long a test that generates code may take, in seconds.
+-define(GENERATING_TIMEOUT, 60).
+
+%% `Tests', each under a timeout long enough for a test that runs protoc
+%% and the generator. gpb compiles the generated code, and its modules load
+%% on first use, which on a loaded machine can outlast eunit's 5 s default
+%% for a test. A list's tests each get the timeout, because a group's
+%% timeout does not lift the 5 s default of the tests in it.
+generating(Tests) when is_list(Tests) ->
+    [generating(Test) || Test <- Tests];
+generating(Test) ->
+    {timeout, ?GENERATING_TIMEOUT, Test}.
 
 %% The directory of trevrpc/options.proto: TREVRPC_PROTO, or `Default'.
 options_dir(Default) ->

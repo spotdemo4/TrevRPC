@@ -11,7 +11,10 @@
 
 %% The files of a proto file: its Gleam module where its path says, and
 %% gpb's module and the shim beside it.
-gleam_files_test() ->
+gleam_files_test_() ->
+    trevrpc_gen_test:generating(fun gleam_files/0).
+
+gleam_files() ->
     {ok, Files} = generate(["nested/v1/point.proto"], <<>>),
     ?assertEqual(
         [
@@ -30,7 +33,10 @@ gleam_files_test() ->
 
 %% A service gets a module beside its file's, over the Gleam binding: a method
 %% description, a handler and a client function per method, and routes.
-gleam_service_test() ->
+gleam_service_test_() ->
+    trevrpc_gen_test:generating(fun gleam_service/0).
+
+gleam_service() ->
     {ok, Files} = generate(["methods.proto"], <<>>),
     {_, Service} = lists:keyfind(<<"methods_trevrpc.gleam">>, 1, Files),
     Has = fun(Text) -> ?assertNotEqual(nomatch, binary:match(Service, Text), Text) end,
@@ -49,7 +55,10 @@ gleam_service_test() ->
     Has(<<"response_compression: schema.StreamCompression,">>).
 
 %% A file with enums and no messages: gpb's module has no records.
-gleam_enums_test() ->
+gleam_enums_test_() ->
+    trevrpc_gen_test:generating(fun gleam_enums/0).
+
+gleam_enums() ->
     {ok, Files} = generate(["gleamgen/enums.proto"], <<>>),
     {_, Gleam} = lists:keyfind(<<"gleamgen/enums.gleam">>, 1, Files),
     ?assertNotEqual(nomatch, binary:match(Gleam, <<"pub type Level {\n  LevelUnspecified\n">>)),
@@ -57,7 +66,7 @@ gleam_enums_test() ->
     ?assertEqual(nomatch, binary:match(Shim, <<"-export">>)).
 
 gleam_errors_test_() ->
-    [
+    trevrpc_gen_test:generating([
         ?_assertEqual(
             {error, <<"protoc-gen-trevrpc-gleam takes no parameters, got \"x=y\"">>},
             generate(["empty.proto"], <<"x=y">>)
@@ -101,7 +110,7 @@ gleam_errors_test_() ->
             >>},
             generate(["gleamgen/Upper.proto"], <<>>)
         )
-    ].
+    ]).
 
 %% As the Gleam compiler's to_snake_case and to_upper_camel_case, with
 %% which it names constructors' atoms and modules' types.

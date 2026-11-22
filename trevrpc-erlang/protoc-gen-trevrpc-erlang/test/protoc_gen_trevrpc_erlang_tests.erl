@@ -209,7 +209,10 @@ behaviour() ->
         lists:sort(?METHODS:behaviour_info(callbacks))
     ).
 
-records_test() ->
+records_test_() ->
+    trevrpc_gen_test:generating(fun records/0).
+
+records() ->
     Files = load(generated(["methods.proto"], <<"msg_format=records">>)),
     ?assertEqual(
         [<<"example_methods_v1_methods.erl">>, <<"methods_pb.erl">>, <<"methods_pb.hrl">>], Files
@@ -218,7 +221,10 @@ records_test() ->
     ?assertEqual({?REPLY, <<"text">>}, methods_pb:decode_msg(Bin, ?REPLY)).
 
 %% A service without methods, in a file without a package.
-empty_test() ->
+empty_test_() ->
+    trevrpc_gen_test:generating(fun empty/0).
+
+empty() ->
     ?assertEqual([<<"empty.erl">>, <<"empty_pb.erl">>], load(generated(["empty.proto"], <<>>))),
     ?assertEqual(#{}, empty:routes(handler_module)),
     ?assertEqual(#{}, empty:routes(#{})),
@@ -227,7 +233,10 @@ empty_test() ->
         #{value => 7}, empty_pb:decode_msg(empty_pb:encode_msg(#{value => 7}, 'Lonely'), 'Lonely')
     ).
 
-module_names_test() ->
+module_names_test_() ->
+    trevrpc_gen_test:generating(fun module_names/0).
+
+module_names() ->
     {ok, Files} = generate(
         ["methods.proto"], <<"module_prefix=my_,pb_suffix=_proto,service_suffix=_svc">>
     ),
@@ -239,14 +248,17 @@ module_names_test() ->
     ?assertMatch({match, _}, re:run(Service, <<"my_methods_proto:decode_msg">>)).
 
 %% A file in a subdirectory, which gpb names by its base name.
-subdirectory_test() ->
+subdirectory_test_() ->
+    trevrpc_gen_test:generating(fun subdirectory/0).
+
+subdirectory() ->
     {ok, Files} = generate(["nested/v1/point.proto"], <<>>),
     ?assertEqual([<<"point_pb.erl">>], [Name || {Name, _} <- Files]).
 
 %%% Failures
 
 errors_test_() ->
-    [
+    trevrpc_gen_test:generating([
         ?_assertEqual(
             {error, <<
                 "service example.errors.Collision RPC methods GetFoo and Get_Foo both require "
@@ -300,11 +312,14 @@ errors_test_() ->
         ?_assertEqual(
             {error, <<"malformed CodeGeneratorRequest">>}, response(<<255>>)
         )
-    ].
+    ]).
 
 %% Proto3 optional fields, and no editions, which protoc then refuses to
 %% hand the plugin.
-features_test() ->
+features_test_() ->
+    trevrpc_gen_test:generating(fun features/0).
+
+features() ->
     Fields = trevrpc_gen_test:fields(
         iolist_to_binary(protoc_gen_trevrpc_erlang:generate(request(["empty.proto"], <<>>)))
     ),
