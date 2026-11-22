@@ -1,45 +1,29 @@
 # trevrpc-kotlin
 
-TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients, and call servers over ordinary HTTP/3.
-
-Kotlin is client-only and targets Android: calls are `POST /trevrpc` over HTTP/3 through [Cronet](https://developer.android.com/develop/connectivity/cronet). When UDP is blocked, Cronet falls back to HTTP/2 over TCP on its own; Go, Rust, and Erlang servers serve the same HTTP mapping over HTTP/2 on their TCP listener, so there is nothing to configure. Servers are written in Go, Rust, or Erlang.
+The Kotlin client for [TrevRPC](https://trev.zip/llc/TrevRPC), an RPC framework like gRPC built on QUIC instead of HTTP/2. It is client-only and targets Android: calls are `POST /trevrpc` over HTTP/3 through [Cronet](https://developer.android.com/develop/connectivity/cronet), and when UDP is blocked Cronet falls back to HTTP/2 over TCP on its own, so there is nothing to configure. Servers are written in Go, Rust, or Erlang.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, and `trevrpc-kotlin`
-> 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, `trevrpc-kotlin`
+> 1.12.0, and the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a
+> milestone for 2.0.
 
-Full documentation: https://trev.zip/llc/TrevRPC/wiki
+## Packages
 
-## Modules
+Published to Maven Central under the group `zip.trev.trevrpc`.
 
-| Module                      | Purpose                                                            |
-| --------------------------- | ------------------------------------------------------------------ |
-| `core`                      | Client runtime: calls, framing, metadata, status, wire codec.      |
-| `transport-cronet`          | `CronetRpcChannel`: the Cronet HTTP/3 transport.                   |
-| `protoc-gen-trevrpc-kotlin` | `protoc` plugin that generates one client class per service.       |
-| `interop-android`           | Android app and instrumented test for the cross-runtime scenarios. |
+| Package                                                                                                         | Install                                                         | Purpose                                                      |
+| --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------ |
+| [`zip.trev.trevrpc:core`](https://central.sonatype.com/artifact/zip.trev.trevrpc/core)                          | `implementation("zip.trev.trevrpc:core:<version>")`             | Client runtime: calls, framing, metadata, status, wire codec |
+| [`zip.trev.trevrpc:transport-cronet`](https://central.sonatype.com/artifact/zip.trev.trevrpc/transport-cronet)  | `implementation("zip.trev.trevrpc:transport-cronet:<version>")` | `CronetRpcChannel`, the Cronet HTTP/3 transport              |
+| [`protoc-gen-trevrpc-kotlin`](https://central.sonatype.com/artifact/zip.trev.trevrpc/protoc-gen-trevrpc-kotlin) | `zip.trev.trevrpc:protoc-gen-trevrpc-kotlin:<version>:jdk21`    | `protoc` plugin: one client class per service                |
 
-## Protobuf
+The plugin is an executable JAR with its dependencies that runs with `java -jar` on JDK 21+; `protoc` needs a small wrapper script that calls it. The `trevrpc-kotlin` Nix package also provides the plugin: `nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin`. From a checkout, `./gradlew :protoc-gen-trevrpc-kotlin:installDist` builds it under `protoc-gen-trevrpc-kotlin/build/install/protoc-gen-trevrpc-kotlin/bin/`.
 
-```proto
-syntax = "proto3";
+## Example
 
-package example.greeter;
+Generate Java messages with `protoc` and the client with `protoc-gen-trevrpc-kotlin`:
 
-service Greeter {
-  rpc SayHello(HelloRequest) returns (HelloReply);
-  rpc LotsOfReplies(HelloRequest) returns (stream HelloReply);
-  rpc LotsOfGreetings(stream HelloRequest) returns (HelloReply);
-  rpc BidiHello(stream HelloRequest) returns (stream HelloReply);
-}
-
-message HelloRequest { string name = 1; }
-message HelloReply { string message = 1; }
-```
-
-Generate Java messages and the client with `protoc`:
-
-```shell
+```sh
 protoc \
   --java_out=build/generated \
   --plugin=protoc-gen-trevrpc-kotlin=path/to/protoc-gen-trevrpc-kotlin \
@@ -47,9 +31,7 @@ protoc \
   greeter.proto
 ```
 
-## Client
-
-The application owns the `CronetEngine` and callback executor; the channel never shuts them down. `transport-cronet` is a JVM 17 library that compiles against Cronet but does not ship it, so the application adds Cronet and chooses its provider: `org.chromium.net:cronet-bundled` embeds the native library, while `org.chromium.net:cronet` alone uses the platform `HttpEngine` (Android 14+) or a Google Play services provider. Cronet 500.x requires `minSdk` 24 (Android 7.0) and no longer merges its permissions into the app, so the application must declare `android.permission.INTERNET` and `android.permission.ACCESS_NETWORK_STATE`. `core` and `transport-cronet` are built for Kotlin 2.3 (language and API version, against kotlin-stdlib 2.3.0), so applications can use Kotlin 2.3 or newer.
+Open a Cronet channel and call the generated client:
 
 ```kotlin
 val engine = CronetEngine.Builder(context).enableQuic(true).build()
@@ -57,22 +39,7 @@ val executor = Executors.newSingleThreadExecutor()
 val channel = CronetRpcChannel.create(engine, "https://rpc.example.com", executor)
 val client = GreeterClient(channel, CallOptions(timeout = 10.seconds))
 
-fun req(name: String) = HelloRequest.newBuilder().setName(name).build()
-
-// Unary
-val reply = client.sayHello(req("TrevRPC"))
-
-// Server streaming
-client.lotsOfReplies(req("TrevRPC")).collect { println(it.message) }
-
-// Client streaming
-val summary = client.lotsOfGreetings(flowOf(req("Alice"), req("Bob")))
-
-// Bidirectional streaming
-client.bidiHello(flowOf(req("Alice"), req("Bob"))).collect { println(it.message) }
-
-// Per-call options start from the client's defaults
-val quick = client.sayHello(req("TrevRPC")) { copy(timeout = 2.seconds) }
+val reply = client.sayHello(HelloRequest.newBuilder().setName("TrevRPC").build())
 
 // A successful close proves every call has settled; only then release the engine and executor.
 channel.close()
@@ -80,87 +47,23 @@ engine.shutdown()
 executor.shutdown()
 ```
 
-Requests use `Content-Type: application/trevrpc`, which names wire version 1; frames carry no version, so a server that does not serve it answers `415`. Every call names its method by one path (`/example.greeter.Greeter/SayHello`), which the generator emits as a `GREETER_SAY_HELLO_PATH` constant per method. Calling `Client` directly takes that path: `client.unary(GREETER_SAY_HELLO_PATH, request, requestCodec, responseCodec)`.
+## Documentation
 
-A generated client has one function per RPC, in the shape of the RPC: a unary call is a `suspend` function that returns the response, a server-streaming call returns a `Flow` of responses, a client-streaming call takes a `Flow` of requests and returns the response, and a bidirectional call takes a `Flow` of requests and returns a `Flow` of responses. A flow makes its call when it is collected, and cancelling the collection cancels the call. The last parameter, `options`, changes the client's default `CallOptions` for one call, as in `client.sayHello(request) { copy(timeout = 2.seconds) }`. `Client` also has `openServerStreaming`, `openClientStreaming`, and `openBidirectionalStreaming`, which return call objects for sending and receiving one message at a time.
+The [Kotlin guide](https://trev.zip/llc/TrevRPC/wiki/Kotlin-Guide) covers generating a client, the Cronet channel, calls and streams, headers and metadata, ending a call early, call options, compression, and Cronet notes. The rest of the [wiki](https://trev.zip/llc/TrevRPC/wiki) covers the transports, the protocol, compression, and operations.
 
-Cronet decides between HTTP/3 and HTTP/2, so the wire format and the channel API are identical on both. Servers must keep their TCP port reachable for the fallback (Go uses the same port number for TCP and UDP). Their HTTP/2 responses carry an `Alt-Svc` header pointing at the UDP port (or the port configured for it behind a proxy), so Cronet can move to HTTP/3 when it is available.
+## Development
 
-### Headers and metadata
-
-A response has two metadata maps. Response headers arrive in an optional `HEADERS` frame before the first message; trailing metadata arrives with the terminal `STATUS` frame. A call reports them to the `onResponseHeaders` and `onResponseMetadata` callbacks of its `CallOptions`: the headers (empty when the server sent none) as soon as the headers, the first message or the final status arrives, and the trailing metadata when the call succeeds, before its result is returned or its flow completes. A failed call carries its metadata on the `TrevRpcException`. A callback that throws fails the call.
-
-```kotlin
-var headers = Metadata.EMPTY
-var trailers = Metadata.EMPTY
-val reply =
-    client.sayHello(req("TrevRPC")) {
-        copy(onResponseHeaders = { headers = it }, onResponseMetadata = { trailers = it })
-    }
-println(headers["x-request-id"]?.decodeToString())   // response headers
-println(trailers["x-cost"]?.decodeToString())        // trailing metadata
+```shell
+cd trevrpc-kotlin
+./gradlew check                    # core, transport, and generator tests
+./gradlew verifyStagedMavenRepository   # stage and verify the published artifacts
+ktlint "**/src/**/*.kt" "**/*.gradle.kts"  # lint and format check
+python3 -I -m unittest discover -s interop-android
 ```
 
-### Connection metadata
+### Interop tests
 
-Request metadata that every call of a channel carries, such as a bearer token, is set once on the channel instead of in each call's options. The server merges it into each call's metadata before validation and authorization, and the call's own entries win. Pass it in `CronetTransportOptions` and replace it at any time with `setConnectionMetadata` (empty metadata removes it); calls opened afterwards use the new set, and calls in flight keep theirs.
-
-```kotlin
-val channel =
-    CronetRpcChannel.create(
-        engine, "https://rpc.example.com", executor,
-        CronetTransportOptions(connectionMetadata = Metadata.bearer(token)),
-    )
-channel.setConnectionMetadata(Metadata.bearer(refreshed))
-```
-
-`Metadata.bearer(token)` builds the `authorization` metadata of a bearer token, and throws `TrevRpcException` with `Code.INVALID_ARGUMENT` for a token that the servers' bearer token parsers would reject as malformed (anything but an RFC 6750 `b64token`), so that a client bug is not mistaken for an expired session. It works in `CallOptions(metadata = ...)` too.
-
-Cronet does not say which calls share a connection, and servers do not confirm a set over the ordinary HTTP mapping, so every call carries the whole set in its `REQUEST`.
-
-Frames use HTTP/3's layout (QUIC variable-length integer type and length, then the payload), so `core` skips unknown frame types, including after `STATUS`. Request messages are written raw in `MESSAGE` frames, and unary and server-streaming calls send `REQUEST`, the one `MESSAGE`, and the end of the request stream in a single write. See the [wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format).
-
-Failed calls throw `TrevRpcException` carrying a `Status`. Calls are never retried, and deadlines, idle timeouts, and response size limits are set through `CallOptions`.
-
-### Ending a call early
-
-A server may end a call before it has read the whole request. Client-streaming and bidirectional calls therefore read their response while they upload, in a coroutine of the `Client`'s `responseContext` (`Dispatchers.Default` unless you pass another context to `Client(channel, context)`). As soon as the server's terminal `STATUS` arrives, a `send` that is waiting on flow control is cancelled and later sends fail, even if nobody is calling `receive` and the server did not stop the request side:
-
-| What ended the call                           | `send` throws                                                                  |
-| --------------------------------------------- | ------------------------------------------------------------------------------ |
-| Non-OK `STATUS`                               | `TrevRpcException` with that status, the same error `receive` reports          |
-| OK `STATUS` before the upload finished        | `TrevRpcException` with `Code.CANCELLED`; `receive` still returns the response |
-| Response failure (lost connection, bad frame) | `TrevRpcException` carrying that failure, not a generic "closed" error         |
-| Response limit exceeded                       | `Code.RESOURCE_EXHAUSTED`, which is also what `receive` reports                |
-| `closeSend()` or `close()` was called         | `Code.CANCELLED` ("request stream is closed")                                  |
-
-`closeSend` does nothing once the call has ended. To stop at the first sign that the server is done and let `receive` report the outcome, use `sendAll(flow)`: it sends every request, half-closes, and returns normally when the server ends the call early. The generated functions, which take a `Flow` of requests, use it, so they return the response (or throw the status) rather than a `CANCELLED` error from the upload.
-
-Finding the status can mean reading responses the caller has not asked for yet. While the request side is open, that read-ahead is bounded by the call's own response limits: `maxResponseMessages` and `maxResponseStreamBodySize` (4096 messages and 16 MiB when they are `null`, as they are by default), plus the frame that crosses a limit. A frame that crosses a limit you set ends the call with `RESOURCE_EXHAUSTED`, as it would for `receive`; with no limit set, reaching the bound pauses reading until you receive. After `closeSend` the read-ahead falls back to two frames and the transport's flow control paces the server. The reading coroutine stops at `STATUS` or when the call closes.
-
-If the call's own deadline passes while the client waits for the end of the stream after `STATUS`, the server's status still decides the outcome. Cancelling the caller's coroutine at that point propagates the cancellation, and `terminalStatus` holds the server's status.
-
-A call's outcome is recorded once and every later `receive()` and `headers()` replays it: `receive()` returns `null` only after a final status `OK`, and throws the same error again after a failure or a non-OK status. Cancelling a `receive()` or `headers()` that is waiting for the stream, for example with `withTimeout`, cancels the call, because a read abandoned in flight cannot be resumed without risking a lost message. The cancelled coroutine sees its own `CancellationException`, and every later `receive()` and `headers()` throws a `TrevRpcException` with `CANCELLED`. Use `CallOptions.streamIdleTimeout` or `timeout` to bound a wait and keep the call's outcome. `close()` from another coroutine fails a pending `receive()` with the same `CANCELLED` error, and a `headers()` that waits for a pending `receive()` returns as soon as the headers arrive.
-
-### Compression
-
-Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). Compression calls [zstd-jni](https://github.com/luben/zstd-jni), which `core` compiles against but does not ship, so the application adds it: `com.github.luben:zstd-jni` as an `aar` on Android (its AAR needs `compileSdk` 37), or the plain JAR on the JVM, at the version TrevRPC is tested with in [`gradle/libs.versions.toml`](gradle/libs.versions.toml). Configure it on the channel:
-
-```kotlin
-val compression =
-    Compression(listOf(Dictionary(context.assets.open("metrics.dict").readBytes(), listOf("example.v1.MetricSample"))))
-val channel = CronetRpcChannel.create(engine, "https://rpc.example.com", executor, CronetTransportOptions(compression = compression))
-```
-
-Generated codecs carry each message's protobuf type, which picks its dictionary. Cronet does not say which calls share a connection, so every call asks the server which of its dictionaries it holds. Responses are compressed from the first call on; a client-streaming or bidirectional call compresses its requests once the server's answer (an ANSWER frame, before the response headers) arrives, and unary and server-streaming requests are never compressed.
-
-Methods marked `option (trevrpc.method) = {compression: COMPRESSION_MESSAGE}` (or `COMPRESSION_STREAM`) also compress messages of 256 bytes or more without a dictionary where none applies to their type, negotiated per call like a dictionary (as ID 0); `Compression(emptyList())` is enough. Generated clients pass the method's `CompressMessages` directions, leaving out message types with `debug_redact` fields. As with dictionaries, responses may be compressed from the first call, streaming requests once the call's answer arrives, and unary and server-streaming requests never.
-
-Streaming methods marked `option (trevrpc.method) = {compression: COMPRESSION_STREAM}` also use stream compression: each streamed direction of a call compresses with one zstd context, so later messages compress against earlier ones, with no dictionary needed (`Compression(emptyList())` enables only this). Generated clients pass the method's `CompressStream` directions. Responses use it as soon as the server chooses to; requests from their third message, without waiting for the server's answer: a server that cannot decode them refuses the call before its handler runs, and the client replays it without stream compression. After a refusal, calls wait for the answer until a server accepts one again. `CronetTransportOptions.streamCompressionMemory` (64 MiB by default, 0 turns it off) bounds the memory its contexts hold on the channel; a call beyond it falls back to per-message compression.
-
-## Interop tests
-
-`interop-android` generates its client from the shared [`interop/proto/interop.proto`](../interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](../interop/README.md) from an emulator against a Go or Rust server on the host. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:
+`interop-android` is an Android app and instrumented test that generates its client from the shared [`interop/proto/interop.proto`](../interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](../interop/README.md) from an emulator against a Go, Rust, or Erlang server on the host. It is not published. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:
 
 ```shell
 nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go-interop --command \
@@ -175,10 +78,4 @@ The runner generates a certificate for `10.0.2.2` (the emulator's alias for the 
 
 Several runs can share a host. Each run starts its own adb server on a free port, which does not scan for emulators and so knows only the emulator that registers with it, and the emulator picks a free console port itself.
 
-## Development
-
-```shell
-./gradlew check                    # core, transport, and generator tests
-./gradlew verifyStagedMavenRepository   # stage and verify the published artifacts
-python3 -I -m unittest discover -s interop-android
-```
+See [Local Development](https://trev.zip/llc/TrevRPC/wiki/Local-Development) for the repository-wide checks.
