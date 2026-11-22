@@ -7,8 +7,8 @@ QMux over TLS on the server's TCP listener where UDP is blocked, on messages gen
 [protobuf-py](https://github.com/bufbuild/protobuf-py). It is a client only, asyncio only, and requires
 Python 3.14.
 
-This package is an early work in progress: it does not send datagrams or share connection metadata
-yet. See [#666](https://trev.zip/llc/TrevRPC/issues/666).
+This package is an early work in progress: it does not share connection metadata yet. See
+[#666](https://trev.zip/llc/TrevRPC/issues/666).
 
 ## Generating a client
 
@@ -78,6 +78,15 @@ channel = trevrpc.Channel(
 ```
 
 `channel.transport` says which one the current connection uses (`"quic"` or `"qmux"`).
+
+## Datagrams
+
+On native QUIC, the messages of directions the schema marks `unreliable_requests` or
+`unreliable_responses` may travel as QUIC datagrams: they can be lost or reordered, but never
+duplicated, and applications that need ordering add sequence numbers. A request that does not fit a
+datagram, or finds the connection's datagram queue full, goes on the stream, as every message does
+over QMux over TLS. Datagram responses are held until the response headers have been read, and a
+call whose responses ended waits up to 10 ms for the datagrams the server said it sent.
 
 ## Compression
 

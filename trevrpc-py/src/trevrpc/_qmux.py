@@ -532,6 +532,17 @@ class QMuxSession:
     def is_open(self) -> bool:
         return self.error is None
 
+    # Datagrams: QMux has none, so every message stays on the stream.
+
+    def open_flow(self, receiver: object) -> int | None:
+        return None
+
+    def send_datagram(self, data: bytes) -> bool:
+        return False
+
+    def close_flow(self, flow_id: int) -> None:
+        pass
+
     # Streams
 
     async def open_stream(self, max_frame_size: int) -> Stream:

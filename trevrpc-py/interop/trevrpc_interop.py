@@ -24,6 +24,7 @@ from gen.compressed_pb import PlainMessage
 from gen.compressed_trevrpc import CompressedEchoClient, RefusingEchoClient
 from gen.interop_pb import EchoRequest, EchoResponse
 from gen.interop_trevrpc import EchoClient
+from gen.unreliable_trevrpc import UnreliableEchoClient
 from trevrpc import Code, TrevRpcError
 
 # The message types the interop dictionary compresses.
@@ -35,9 +36,11 @@ PLAIN_COMPRESSED_RECEIVED = "interop-plain-compressed-received"
 
 @dataclass(frozen=True)
 class Clients:
+    channel: trevrpc.Channel
     echo: EchoClient
     compressed: CompressedEchoClient
     refusing: RefusingEchoClient
+    unreliable: UnreliableEchoClient
 
 
 class ScenarioError(Exception):
@@ -320,6 +323,80 @@ async def compressed_plain(clients: Clients) -> None:
             expect(b"1", received, f"call {call} {PLAIN_COMPRESSED_RECEIVED}")
 
 
+UNRELIABLE_REQUESTS = 50
+UNRELIABLE_LARGE_SIZE = 4096
+"""Too large for a datagram, compressed or not."""
+
+
+def incompressible(n: int) -> str:
+    """Base64 digits from the same xorshift generator as the other clients'."""
+    digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    state = 0x9E3779B97F4A7C15
+    mask = (1 << 64) - 1
+    out: list[str] = []
+    for _ in range(n):
+        state ^= (state << 13) & mask
+        state ^= state >> 7
+        state ^= (state << 17) & mask
+        out.append(digits[state % 64])
+    return "".join(out)
+
+
+async def unreliable(clients: Clients) -> None:
+    """Small messages that may travel as datagrams both ways, and one too large for a datagram."""
+    large = incompressible(UNRELIABLE_LARGE_SIZE)
+    messages = [str(i) for i in range(UNRELIABLE_REQUESTS)] + [large]
+    pending = set(messages)
+    responses = 0
+    async with clients.unreliable.bidi() as call:
+
+        async def recv() -> bool:
+            nonlocal responses
+            response = await call.recv()
+            if response is None:
+                return False
+            if response.message not in pending or response.index != 0:
+                raise ScenarioError(
+                    f"unexpected or repeated response ({response.message[:32]!r}, {response.index})"
+                )
+            pending.discard(response.message)
+            responses += 1
+            return True
+
+        for message in messages[:UNRELIABLE_REQUESTS]:
+            await call.send(EchoRequest(message=message, count=1))
+        # The stream may overtake the datagrams still queued, and the server drops those that
+        # arrive after the requests end: send the rest once one came back.
+        if not await recv():
+            raise ScenarioError("the stream ended before the first response")
+        await call.send(EchoRequest(message=large, count=1))
+        await call.close_send()
+        while await recv():
+            pass
+        status = await call.status()
+    if large in pending:
+        raise ScenarioError("the 4096-byte echo, which cannot be a datagram, is missing")
+    received = metadata_count(status.metadata, "interop-received")
+    datagrams = metadata_count(status.metadata, "interop-datagrams-received")
+    total = len(messages)
+    if clients.channel.transport != "quic":
+        expect(
+            (total, total, 0), (responses, received, datagrams), "responses, received, datagrams"
+        )
+        return
+    if not 1 <= received <= total or datagrams < 1:
+        raise ScenarioError(
+            f"on QUIC: interop-received = {received}, interop-datagrams-received = {datagrams}; "
+            f"want 1..{total} and at least 1"
+        )
+    connection = clients.channel._connection  # pyright: ignore[reportPrivateUsage]
+    if getattr(connection, "datagrams_received", 0) == 0:
+        raise ScenarioError(
+            "the connection received no DATAGRAM frames, so the server sent no response as a "
+            "datagram"
+        )
+
+
 def on_echo(
     scenario: Callable[[EchoClient], Awaitable[None]],
 ) -> Callable[[Clients], Awaitable[None]]:
@@ -342,7 +419,7 @@ SCENARIOS: dict[str, Scenario] = {
     "bidi-error": on_echo(bidi_error),
     "unary-headers": on_echo(unary_headers),
     "server-stream-headers": on_echo(server_stream_headers),
-    "unreliable": "datagram messages are not implemented",
+    "unreliable": unreliable,
     "compressed": compressed,
     "compressed-stream": compressed_stream,
     "refused-stream": refused_stream,
@@ -386,7 +463,11 @@ async def run(args: argparse.Namespace) -> int:
             )
             return 1
         clients = Clients(
-            EchoClient(channel), CompressedEchoClient(channel), RefusingEchoClient(channel)
+            channel,
+            EchoClient(channel),
+            CompressedEchoClient(channel),
+            RefusingEchoClient(channel),
+            UnreliableEchoClient(channel),
         )
         passed = True
         for name, scenario in SCENARIOS.items():

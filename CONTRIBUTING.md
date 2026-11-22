@@ -30,7 +30,7 @@ direnv allow
 | `trevrpc-erlang/protoc-gen-trevrpc-erlang/` | `protoc-gen-trevrpc-erlang`, gpb message modules and service stubs                                                                                      |
 | `trevrpc-erlang/protoc-gen-trevrpc-gleam/`  | `protoc-gen-trevrpc-gleam`, Gleam messages and service modules, on `protoc-gen-trevrpc-erlang`                                                          |
 | `trevrpc-erlang/protoc-gen-trevrpc-elixir/` | `protoc-gen-trevrpc-elixir`, Elixir service modules over gpb's messages, on `protoc-gen-trevrpc-erlang`                                                 |
-| `trevrpc-py/`                               | Python client (in progress: native QUIC, QMux over TLS, zstd), the Python interop client                                                                |
+| `trevrpc-py/`                               | Python client (in progress: native QUIC, QMux over TLS, zstd, datagrams), the Python interop client                                                     |
 | `trevrpc-py/protoc-gen-trevrpc-py/`         | `protoc-gen-trevrpc-py`, clients for protobuf-py's messages                                                                                             |
 | `interop/`                                  | cross-runtime test suite                                                                                                                                |
 | `bench/`                                    | load benchmarks and the grpc-go and connect-go baselines                                                                                                |

@@ -20,11 +20,14 @@ from typing import TYPE_CHECKING, Any, Literal, cast, override
 from aioquic.quic import events
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
+from aioquic.quic.exceptions import ConnectionStateError, DatagramFrameCapacityError
 
 from ._compression import ConnectionCompression
+from ._datagram import MAX_DATAGRAM_FRAME_SIZE, SEND_QUEUE, DatagramReceiver
 from ._frames import MAX_FRAME_HEADER_SIZE
 from ._status import Code, TrevRpcError
 from ._stream import CANCEL_CODE, Stream
+from ._varint import decode_varint
 
 if TYPE_CHECKING:
     from aioquic.quic.packet_builder import QuicPacketBuilder
@@ -128,6 +131,10 @@ class QuicTransport(asyncio.DatagramProtocol):
         self._blocked: set[Stream] = set()
         self._closed_locally = False
         self.compression = ConnectionCompression()
+        self._flows: dict[int, DatagramReceiver] = {}
+        self._next_flow = 1
+        self.datagrams_received = 0
+        """DATAGRAM frames the connection received, for diagnostics."""
         self.error: TrevRpcError | None = None
         """Why the connection ended, once it has."""
         self.closed: asyncio.Future[None] = loop.create_future()
@@ -154,6 +161,7 @@ class QuicTransport(asyncio.DatagramProtocol):
             max_stream_data=max_frame_size + MAX_FRAME_HEADER_SIZE,
             max_data=max(_CONNECTION_WINDOW, max_frame_size + MAX_FRAME_HEADER_SIZE),
             idle_timeout=idle_timeout,
+            max_datagram_frame_size=MAX_DATAGRAM_FRAME_SIZE,
         )
         if verify:
             configuration.verify_mode = ssl.CERT_REQUIRED
@@ -239,6 +247,33 @@ class QuicTransport(asyncio.DatagramProtocol):
         self._streams[stream_id] = stream
         return stream
 
+    # Datagrams
+
+    def open_flow(self, receiver: DatagramReceiver) -> int | None:
+        """Registers a datagram flow, when the server accepts datagrams. IDs count up from 1 and
+        are never reused on the connection."""
+        if self.error is not None or self._quic.get_datagram_frame_capacity() is None:
+            return None
+        flow_id = self._next_flow
+        self._next_flow += 1
+        self._flows[flow_id] = receiver
+        return flow_id
+
+    def close_flow(self, flow_id: int) -> None:
+        self._flows.pop(flow_id, None)
+
+    def send_datagram(self, data: bytes) -> bool:
+        if self.error is not None:
+            return False
+        if len(self._quic._datagrams_pending) >= SEND_QUEUE:  # pyright: ignore[reportPrivateUsage]
+            return False
+        try:
+            self._quic.send_datagram_frame(data)
+        except DatagramFrameCapacityError, ConnectionStateError:
+            return False
+        self.transmit_soon()
+        return True
+
     def _process_events(self) -> None:
         quic = self._quic
         while (event := quic.next_event()) is not None:
@@ -259,6 +294,13 @@ class QuicTransport(asyncio.DatagramProtocol):
                     stream = self._streams.get(stream_id)
                     if stream is not None:
                         stream.on_stop_sending(code)
+                case events.DatagramFrameReceived(data=data):
+                    self.datagrams_received += 1
+                    decoded = decode_varint(data, 0)
+                    if decoded is not None and decoded[0] != 0:
+                        receiver = self._flows.get(decoded[0])
+                        if receiver is not None:
+                            receiver.on_datagram(data[decoded[1] :])
                 case events.HandshakeCompleted():
                     if not self._handshake.done():
                         self._handshake.set_result(None)
@@ -288,6 +330,7 @@ class QuicTransport(asyncio.DatagramProtocol):
         streams = list(self._streams.values())
         self._streams.clear()
         self._blocked.clear()
+        self._flows.clear()
         for stream in streams:
             stream.on_connection_error(error)
         if self._transport is not None:

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol, Self, TypedDict
 from protobuf import Message
 
 from ._compression import CallCompression, Compression, StreamBudget
+from ._datagram import HELD_BYTES, HELD_MESSAGES, DatagramFlow
 from ._frames import FrameType, encode_frame
 from ._metadata import Metadata, MetadataInput, normalize_metadata, validate_metadata
 from ._method import Method, MethodKind
@@ -93,18 +94,27 @@ def _prepare(
 
 
 def _negotiate(
-    channel: StreamOpener, stream: Stream, method: Method[Message, Message], request: RpcRequest
+    channel: StreamOpener,
+    stream: Stream,
+    method: Method[Message, Message],
+    request: RpcRequest,
+    flow: DatagramFlow | None = None,
 ) -> tuple[CallCompression, RpcRequest]:
     """The call's compression on the stream's connection, and its REQUEST with the negotiation
-    fields."""
+    fields and its datagram flow."""
     compression = CallCompression(
-        channel.compression, stream.compression, channel.stream_budget, method
+        channel.compression,
+        stream.compression,
+        channel.stream_budget,
+        method,
+        datagrams=flow is not None,
     )
     request = replace(
         request,
         accept_dictionaries=compression.accept_dictionaries,
         dictionary_query=compression.dictionary_query,
         stream_compression=compression.stream_compression,
+        datagram_flow=flow.id if flow is not None else 0,
     )
     return compression, request
 
@@ -164,6 +174,7 @@ class _Response:
         "_on_metadata",
         "_seen",
         "answer",
+        "datagram_count",
         "headers",
         "messages",
         "status",
@@ -176,6 +187,8 @@ class _Response:
         self._compression = compression
         self._max_size = max_size
         self.answer: RpcAnswer | None = None
+        self.datagram_count = 0
+        """The datagrams the server sent, from DATAGRAM_COUNT."""
         self._on_headers = options.get("on_response_headers")
         self._on_metadata = options.get("on_response_metadata")
         self._seen = False
@@ -231,6 +244,7 @@ class _Response:
                         raise TrevRpcError(Code.INTERNAL, "malformed DATAGRAM_COUNT")
                     self._counted = True
                     self._seen = True
+                    self.datagram_count = count[0]
                 case _:
                     raise TrevRpcError(Code.INTERNAL, f"frame of type {frame_type} on a response")
         except WireError as error:
@@ -390,8 +404,12 @@ class _StreamingCall[Req: Message, Resp: Message]:
         self._response: _Response | None = None
         self._stream: Stream | None = None
         self._error: TrevRpcError | None = None
-        self._queue: deque[tuple[Resp, int]] = deque()
+        self._queue: deque[tuple[Resp, int, bool]] = deque()
+        """Responses read ahead: each message, its size, and whether it came in a datagram."""
         self._queued_bytes = 0
+        self._flow: DatagramFlow | None = None
+        self._held_datagrams = 0
+        self._held_datagram_bytes = 0
         self._end: TrevRpcError | Status | None = None
         """What follows the queued messages: the OK status or the call's error."""
         self._outcome: asyncio.Future[Status] = loop.create_future()
@@ -429,7 +447,14 @@ class _StreamingCall[Req: Message, Resp: Message]:
             stream.fail(self._error)
             raise self._error
         self._stream = stream
-        compression, self._request = _negotiate(self._channel, stream, self._method, self._request)  # pyright: ignore[reportArgumentType]
+        flow = self._open_flow(stream)
+        compression, self._request = _negotiate(
+            self._channel,
+            stream,
+            self._method,  # pyright: ignore[reportArgumentType]
+            self._request,
+            flow,
+        )
         self._compression = compression
         if compression.settled:
             self._settled.set()
@@ -447,6 +472,60 @@ class _StreamingCall[Req: Message, Resp: Message]:
             raise
         self._pump_task = self._loop.create_task(self._pump(stream))
         return stream
+
+    def _open_flow(self, stream: Stream) -> DatagramFlow | None:
+        """A datagram flow, when the schema marks a streamed direction unreliable and the
+        connection has datagrams. Response datagrams are accepted whenever the responses stream."""
+        method = self._method
+        requests = method.kind in (MethodKind.CLIENT_STREAMING, MethodKind.BIDI_STREAMING)
+        responses = method.kind in (MethodKind.SERVER_STREAMING, MethodKind.BIDI_STREAMING)
+        send = method.unreliable_requests and requests
+        if not (send or (method.unreliable_responses and responses)):
+            return None
+        flow = DatagramFlow(
+            stream.connection,
+            send=send,
+            receive=responses,
+            decode=self._decode_datagram_message,
+            deliver=self._deliver_datagrams,
+        )
+        flow_id = stream.connection.open_flow(flow)
+        if flow_id is None:
+            return None
+        flow.id = flow_id
+        self._flow = flow
+        return flow
+
+    def _decode_datagram_message(self, frame_type: int, payload: bytes) -> bytes:
+        compression = self._compression
+        assert compression is not None
+        return compression.decode(frame_type, payload, self._max_frame_size)
+
+    def _deliver_datagrams(self, payloads: list[bytes]) -> None:
+        """Queues datagram messages with the stream's, in arrival order, while the call holds
+        fewer than `HELD_MESSAGES` and `HELD_BYTES` of them; the rest are dropped."""
+        if self._end is not None or self._error is not None:
+            return
+        for payload in payloads:
+            size = len(payload)
+            if size > self._max_frame_size or (
+                self._held_datagrams
+                and (
+                    self._held_datagrams >= HELD_MESSAGES
+                    or self._held_datagram_bytes + size > HELD_BYTES
+                )
+            ):
+                continue
+            try:
+                message = _decode(self._method.response, payload)
+            except TrevRpcError as error:
+                self._fail(error)
+                return
+            self._queue.append((message, size, True))
+            self._queued_bytes += size
+            self._held_datagrams += 1
+            self._held_datagram_bytes += size
+        self._wake_reader()
 
     async def _stream_ready(self) -> Stream:
         try:
@@ -479,6 +558,10 @@ class _StreamingCall[Req: Message, Resp: Message]:
                 payload = response.handle(*received)
                 if self._headers.done() is False and response.headers is not None:
                     self._headers.set_result(response.headers)
+                flow = self._flow
+                if flow is not None and received[0] != FrameType.ANSWER:
+                    # Datagram messages are delivered once the response's HEADERS were read.
+                    flow.open()
                 if payload is not None:
                     message = _decode(self._method.response, payload)
                     while (
@@ -499,11 +582,18 @@ class _StreamingCall[Req: Message, Resp: Message]:
                             self._room = None
                     if self._error is not None:
                         return
-                    self._queue.append((message, len(payload)))
+                    self._queue.append((message, len(payload), False))
                     self._queued_bytes += len(payload)
                     self._wake_reader()
                 if response.status is not None:
                     break
+            if self._flow is not None:
+                # The responses end once the datagrams DATAGRAM_COUNT announced arrived, or after
+                # a short wait for them; later ones are dropped.
+                await self._flow.await_count(response.datagram_count)
+                self._flow.close()
+                if self._error is not None:
+                    return
             stream.detach()
             try:
                 status = response.outcome()
@@ -655,6 +745,8 @@ class _StreamingCall[Req: Message, Resp: Message]:
         waiting for room."""
         if self._compression is not None:
             self._compression.close()
+        if self._flow is not None:
+            self._flow.close()
         self._settled.set()
 
     def _cancel_timer(self) -> None:
@@ -698,8 +790,11 @@ class _StreamingCall[Req: Message, Resp: Message]:
         """The next response message, or `None` after the final OK status."""
         while True:
             if self._queue:
-                message, size = self._queue.popleft()
+                message, size, datagram = self._queue.popleft()
                 self._queued_bytes -= size
+                if datagram:
+                    self._held_datagrams -= 1
+                    self._held_datagram_bytes -= size
                 self._take_room()
                 return message
             end = self._end
@@ -748,6 +843,9 @@ class _StreamingCall[Req: Message, Resp: Message]:
                     continue
                 generation = self._generation
                 frame = compression.encode(payload)
+                flow = self._flow
+                if flow is not None and flow.send(frame):
+                    return
                 try:
                     await stream.write(frame)
                 except TrevRpcError as error:
@@ -804,8 +902,9 @@ class _StreamingCall[Req: Message, Resp: Message]:
             if self._end is not None or self._error is not None or stream.send_done:
                 return
             generation = self._generation
+            count = self._flow.end_send() if self._flow is not None else b""
             try:
-                await stream.write(b"", end=True)
+                await stream.write(count, end=True)
             except TrevRpcError:
                 if self._generation != generation:
                     # The replay ends the new stream's requests.

@@ -199,6 +199,8 @@ class CallCompression:
         connection: ConnectionCompression,
         budget: StreamBudget | None,
         method: Method[Message, Message],
+        *,
+        datagrams: bool = False,
     ) -> None:
         self._config = config
         self._connection = connection
@@ -268,9 +270,10 @@ class CallCompression:
 
         # Optimistic: stream-compress requests from the start, when the budget has room for a
         # compressing context and the server has not refused optimism on the connection.
-        # (A call with a datagram flow would not be: its replay would need a flow of its own.)
+        # A call with a datagram flow is not: its replay would need a flow of its own.
         self.optimistic = (
             self._request_stream_allowed
+            and not datagrams
             and not connection.pessimistic
             and budget is not None
             and budget.used + ENCODER_COST <= budget.limit

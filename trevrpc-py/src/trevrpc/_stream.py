@@ -11,6 +11,7 @@ from ._status import Code, TrevRpcError
 
 if TYPE_CHECKING:
     from ._compression import ConnectionCompression
+    from ._datagram import DatagramReceiver
 
 CANCEL_CODE = 1
 """The stream error code of a cancelled call."""
@@ -22,6 +23,18 @@ class StreamTransport(Protocol):
 
     compression: ConnectionCompression
     """What the connection has negotiated for compressed messages."""
+
+    def open_flow(self, receiver: DatagramReceiver) -> int | None:
+        """Registers a datagram flow and returns its ID, or `None` when the connection has no
+        datagrams."""
+        ...
+
+    def send_datagram(self, data: bytes) -> bool:
+        """Sends a datagram; `False` when it does not fit, the queue is full, or the connection
+        cannot send datagrams."""
+        ...
+
+    def close_flow(self, flow_id: int) -> None: ...
 
     def write(self, stream: Stream, data: bytes, end: bool) -> bool:
         """Queues data, and the end of the stream with `end`; returns whether the stream has
@@ -223,6 +236,10 @@ class Stream:
     def compression(self) -> ConnectionCompression:
         """What the stream's connection has negotiated for compressed messages."""
         return self._connection.compression
+
+    @property
+    def connection(self) -> StreamTransport:
+        return self._connection
 
     @property
     def stopped_by_peer(self) -> bool:

@@ -46,12 +46,20 @@ message's frame type. Methods for compression:
   them all, and over QMux it stops reading requests while more than 4 KiB of its echoes are unsent,
   as a server applying backpressure does.
 
+Datagrams, on native QUIC: `/test.Echo/Unreliable` is `Bidi` with both directions unreliable. On a
+call with a datagram flow it sends each echo as a datagram, after HEADERS, and ends with
+DATAGRAM_COUNT; its OK status carries trailing metadata `received` and `datagrams`, the requests
+it received and how many came as datagrams. `TestServer.datagram_before_headers` sends the first
+echo before HEADERS, `TestServer.malformed_datagrams` sends two malformed datagrams first, and
+`TestServer.datagram_count_extra` announces more datagrams than were sent.
+
 Tests wait on what the server saw through `Signal`s, never by sleeping.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import ipaddress
 import ssl
@@ -65,12 +73,14 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.asyncio.server import serve  # pyright: ignore[reportUnknownVariableType]
 from aioquic.quic import events
 from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.exceptions import DatagramFrameCapacityError
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from protobuf.wkt.google.protobuf.wrappers_pb import StringValue
 from trevrpc import TrevRpcError
+from trevrpc._datagram import datagram_frames
 from trevrpc._frames import FrameReader, FrameType, encode_frame
 from trevrpc._qmux import (
     QMUX_ALPN,
@@ -84,7 +94,7 @@ from trevrpc._qmux import (
     stop_sending_frame,
 )
 from trevrpc._stream import Stream
-from trevrpc._varint import decode_varint
+from trevrpc._varint import decode_varint, encode_varint
 from trevrpc._wire import RpcHeaders, _len_field, _map_field, _varint_field, read_fields
 from trevrpc._zstd import (
     CompressionError,
@@ -166,6 +176,14 @@ class ServerCall:
     request_frames: list[int] = field(default_factory=list[int])
     """The frame type of each request message."""
     response_frames: list[int] = field(default_factory=list[int])
+    flow: int = 0
+    """The REQUEST's datagram_flow."""
+    datagram_requests: int = 0
+    """Request messages that came as datagrams."""
+    client_count: int = 0
+    """The request stream's DATAGRAM_COUNT."""
+    datagrams_received: int = 0
+    datagrams_sent: int = 0
     refused: bool = False
     refusing: bool = False
     """Refuses once enough requests arrived (`BoundedEcho`)."""
@@ -193,6 +211,8 @@ class ServerCall:
                 call.kind = value
             elif number == 4 and isinstance(value, int):
                 call.timeout_nanos = value
+            elif number == 5 and isinstance(value, int):
+                call.flow = value
             elif number == 6:
                 if isinstance(value, int):
                     call.accept.append(value)
@@ -320,6 +340,10 @@ class _Wire(Protocol):
         """Waits until what was sent so far has gone out."""
         ...
 
+    def send_datagram(self, payload: bytes) -> bool:
+        """Sends a datagram of the call's flow; `False` without datagrams."""
+        ...
+
 
 class Connection(Protocol):
     def close(self) -> None: ...
@@ -380,6 +404,8 @@ async def _handle(
                 await queue.get()
                 frame = encode_frame(FrameType.ZSTD_STREAM_MESSAGE, UNASKED_STREAM)
                 wire.send(frame + _status_frame(), end=True)
+            case "Unreliable":
+                await _unreliable(server, call, wire, queue)
             case "Bidi" | "BoundedEcho":
                 while (value := await queue.get()) is not None:
                     if value.startswith("fail:"):
@@ -416,6 +442,44 @@ async def _handle(
     except Exception:
         # The stream is gone, as when the client reset it.
         pass
+
+
+async def _unreliable(
+    server: TestServer, call: ServerCall, wire: _Wire, queue: asyncio.Queue[str | None]
+) -> None:
+    received = 0
+    headers_sent = False
+
+    def headers() -> None:
+        nonlocal headers_sent
+        if not headers_sent:
+            headers_sent = True
+            wire.send(_headers_frame({}))
+
+    if server.malformed_datagrams and call.flow:
+        headers()
+        wire.send_datagram(b"\x00\x05ab")  # a MESSAGE frame longer than the datagram
+        wire.send_datagram(encode_frame(FrameType.ZSTD_STREAM_MESSAGE, UNASKED_STREAM))
+    while (value := await queue.get()) is not None:
+        received += 1
+        frame = call.message(value)
+        if not server.datagram_before_headers:
+            headers()
+        if not wire.send_datagram(frame):
+            headers()
+            wire.send(frame)
+        headers()
+    # Datagrams the client announced may still be on their way.
+    with contextlib.suppress(TimeoutError):
+        await server.changed.wait_until(lambda: call.datagrams_received >= call.client_count, 1)
+    received = len(call.request_frames)
+    trailers = {
+        "received": str(received).encode(),
+        "datagrams": str(call.datagram_requests).encode(),
+    }
+    count = call.datagrams_sent + server.datagram_count_extra
+    frames = encode_frame(FrameType.DATAGRAM_COUNT, encode_varint(count)) if count else b""
+    wire.send(frames + _status_frame(0, "", trailers), end=True)
 
 
 def _dispatch(
@@ -514,6 +578,18 @@ class _QuicWire:
     async def flushed(self) -> None:
         self._protocol.transmit()
 
+    def send_datagram(self, payload: bytes) -> bool:
+        call = self._protocol._calls.get(self._id)
+        if call is None or not call.flow:
+            return False
+        try:
+            self._protocol._quic.send_datagram_frame(encode_varint(call.flow) + payload)
+        except DatagramFrameCapacityError:
+            return False
+        self._protocol._transmit_soon()
+        call.datagrams_sent += 1
+        return True
+
     def flow(self) -> tuple[int, int, int] | None:
         stream = self._protocol._quic._streams.get(self._id)
         if stream is None:
@@ -534,6 +610,10 @@ class _QuicProtocol(QuicConnectionProtocol):
         self._readers: dict[int, FrameReader] = {}
         self._queues: dict[int, asyncio.Queue[str | None]] = {}
         self._calls: dict[int, ServerCall] = {}
+        self._flows: dict[int, int] = {}
+        """Stream IDs by datagram flow."""
+        self._early: list[bytes] = []
+        """Datagrams that overtook their REQUEST."""
 
     def datagram_received(self, data: bytes | str, addr: object) -> None:
         super().datagram_received(data, addr)  # pyright: ignore[reportArgumentType]
@@ -548,6 +628,8 @@ class _QuicProtocol(QuicConnectionProtocol):
                     self._frame(stream_id, *frame)
                 if end and stream_id in self._queues:
                     self._queues[stream_id].put_nowait(None)
+            case events.DatagramFrameReceived(data=data):
+                self._datagram(data)
             case events.StreamReset(stream_id=stream_id, error_code=code):
                 if (call := self._calls.get(stream_id)) is not None:
                     call.reset_code = code
@@ -560,13 +642,45 @@ class _QuicProtocol(QuicConnectionProtocol):
                 pass
         self.server.changed.notify()
 
+    def _datagram(self, data: bytes) -> None:
+        decoded = decode_varint(data, 0)
+        if decoded is None:
+            return
+        flow, pos = decoded
+        stream_id = self._flows.get(flow)
+        if stream_id is None:
+            self._early.append(data)
+            return
+        call = self._calls[stream_id]
+        call.datagrams_received += 1
+        frames = datagram_frames(data[pos:])
+        for frame_type, payload in frames or ():
+            call.datagram_requests += 1
+            _receive(
+                self.server,
+                call,
+                frame_type,
+                payload,
+                self._queues[stream_id],
+                _QuicWire(self, stream_id),
+            )
+
     def _frame(self, stream_id: int, frame_type: int, payload: bytes) -> None:
+        if frame_type == FrameType.DATAGRAM_COUNT:
+            count = decode_varint(payload, 0)
+            if (call := self._calls.get(stream_id)) is not None and count is not None:
+                call.client_count = count[0]
         if frame_type == FrameType.REQUEST:
             call = ServerCall.from_request(stream_id, payload, self.server)
             queue: asyncio.Queue[str | None] = asyncio.Queue()
             self._calls[stream_id] = call
             self._queues[stream_id] = queue
             _dispatch(self.server, call, _QuicWire(self, stream_id), queue)
+            if call.flow:
+                self._flows[call.flow] = stream_id
+                early, self._early = self._early, []
+                for data in early:
+                    self._datagram(data)
         elif frame_type in _MESSAGE_KINDS:
             _receive(
                 self.server,
@@ -622,6 +736,9 @@ class _QMuxWire:
     async def flushed(self) -> None:
         session = self._session
         await session.server.changed.wait_until(lambda: not session._control)
+
+    def send_datagram(self, payload: bytes) -> bool:
+        return False
 
 
 class _QMuxServerSession(QMuxSession):
@@ -705,6 +822,9 @@ class TestServer:
     dictionaries: dict[int, LoadedDictionary] = field(default_factory=dict[int, LoadedDictionary])
     answer_later: asyncio.Event = field(default_factory=asyncio.Event)
     refuse_after: int = 1
+    datagram_before_headers: bool = False
+    malformed_datagrams: bool = False
+    datagram_count_extra: int = 0
     refuse_now: asyncio.Event = field(default_factory=asyncio.Event)
     changed: Signal = field(default_factory=Signal)
     close: Callable[[], None] = lambda: None
@@ -765,7 +885,9 @@ async def start_server(
     cert, key = _certificate(Path(directory.name))
     test_server = TestServer(ca=str(cert), dictionaries={d.id: d for d in dictionaries})
 
-    configuration = QuicConfiguration(is_client=False, alpn_protocols=["trevrpc/1"])
+    configuration = QuicConfiguration(
+        is_client=False, alpn_protocols=["trevrpc/1"], max_datagram_frame_size=65535
+    )
     configuration.load_cert_chain(str(cert), str(key))  # pyright: ignore[reportUnknownMemberType]
 
     def create_protocol(*args: object, **kwargs: object) -> _QuicProtocol:
