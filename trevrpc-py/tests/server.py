@@ -53,6 +53,11 @@ it received and how many came as datagrams. `TestServer.datagram_before_headers`
 echo before HEADERS, `TestServer.malformed_datagrams` sends two malformed datagrams first, and
 `TestServer.datagram_count_extra` announces more datagrams than were sent.
 
+Connection metadata follows the server side of the protocol: each connection stores up to 4 offered
+sets, merges the set an offer or a reference names into the call's metadata (the call's own entries
+winning), confirms a stored offer in the call's ANSWER, and fails a reference to a set it does not
+hold with `INVALID_ARGUMENT`. Each call records what its REQUEST carried.
+
 Tests wait on what the server saw through `Signal`s, never by sleeping.
 """
 
@@ -178,6 +183,10 @@ class ServerCall:
     response_frames: list[int] = field(default_factory=list[int])
     flow: int = 0
     """The REQUEST's datagram_flow."""
+    connection_metadata: tuple[int, dict[str, bytes]] | None = None
+    """The REQUEST's connection_metadata: the set's ID, and its entries in an offer."""
+    stored_metadata: int = 0
+    """The offered set the server stored, which its ANSWER confirms."""
     datagram_requests: int = 0
     """Request messages that came as datagrams."""
     client_count: int = 0
@@ -231,6 +240,14 @@ class ServerCall:
                 call.query.append((info_id, fingerprint))
             elif number == 8 and isinstance(value, int):
                 call.stream_compression = value
+            elif number == 9 and isinstance(value, bytes):
+                set_id, entries = 0, b""
+                for set_number, _, item in read_fields(value):
+                    if set_number == 1 and isinstance(item, int):
+                        set_id = item
+                    elif set_number == 2 and isinstance(item, bytes):
+                        entries += _len_field(1, item)
+                call.connection_metadata = (set_id, RpcHeaders.decode(entries).metadata)
         return call
 
     # The server side of compression
@@ -267,7 +284,7 @@ class ServerCall:
         return self.answer()
 
     def answer(self) -> bytes:
-        if not self.query and not self._stream_requests:
+        if not self.query and not self._stream_requests and not self.stored_metadata:
             return b""
         payload = b"".join(
             _len_field(1, _varint_field(1, i) + (_len_field(2, d.fingerprint) if d else b""))
@@ -275,7 +292,28 @@ class ServerCall:
         )
         if self._stream_requests:
             payload += _varint_field(2, 1)
+        if self.stored_metadata:
+            payload += _varint_field(3, self.stored_metadata)
         return encode_frame(FrameType.ANSWER, payload)
+
+    def resolve_metadata(self, store: dict[int, dict[str, bytes]]) -> bool:
+        """Stores an offered set on the connection and merges the set into the call's metadata;
+        `False` for a reference to a set the connection does not hold."""
+        if self.connection_metadata is None:
+            return True
+        set_id, entries = self.connection_metadata
+        if entries:
+            store.pop(set_id, None)
+            if len(store) == 4:
+                del store[next(iter(store))]
+            store[set_id] = entries
+            self.stored_metadata = set_id
+        elif set_id in store:
+            entries = store[set_id]
+        else:
+            return False
+        self.metadata = {**entries, **self.metadata}
+        return True
 
     def _lookup(self, dictionary_id: int) -> LoadedDictionary | bool | None:
         if dictionary_id == 0:
@@ -483,10 +521,19 @@ async def _unreliable(
 
 
 def _dispatch(
-    server: TestServer, call: ServerCall, wire: _Wire, queue: asyncio.Queue[str | None]
+    server: TestServer,
+    call: ServerCall,
+    wire: _Wire,
+    queue: asyncio.Queue[str | None],
+    metadata_sets: dict[int, dict[str, bytes]],
 ) -> None:
-    """Starts a call: its refusal or ANSWER at dispatch, then its handler."""
+    """Starts a call: its connection metadata, its refusal or ANSWER at dispatch, then its
+    handler."""
     server.calls.append(call)
+    if not call.resolve_metadata(metadata_sets):
+        call.refused = True
+        wire.send(_status_frame(3, "unknown connection metadata set"), end=True)
+        return
     opening = call.opening()
     if call.refusing:
         return
@@ -612,6 +659,7 @@ class _QuicProtocol(QuicConnectionProtocol):
         self._calls: dict[int, ServerCall] = {}
         self._flows: dict[int, int] = {}
         """Stream IDs by datagram flow."""
+        self.metadata_sets: dict[int, dict[str, bytes]] = {}
         self._early: list[bytes] = []
         """Datagrams that overtook their REQUEST."""
 
@@ -675,7 +723,7 @@ class _QuicProtocol(QuicConnectionProtocol):
             queue: asyncio.Queue[str | None] = asyncio.Queue()
             self._calls[stream_id] = call
             self._queues[stream_id] = queue
-            _dispatch(self.server, call, _QuicWire(self, stream_id), queue)
+            _dispatch(self.server, call, _QuicWire(self, stream_id), queue, self.metadata_sets)
             if call.flow:
                 self._flows[call.flow] = stream_id
                 early, self._early = self._early, []
@@ -747,6 +795,7 @@ class _QMuxServerSession(QMuxSession):
 
     server: TestServer
     calls: dict[int, ServerCall]
+    metadata_sets: dict[int, dict[str, bytes]]
 
     def _handle_frame(self, frame: Frame) -> None:
         super()._handle_frame(frame)
@@ -777,7 +826,7 @@ class _QMuxServerSession(QMuxSession):
                     call = ServerCall.from_request(stream.id, payload, self.server)
                     self.calls[stream.id] = call
                     wire = _QMuxWire(self, stream)
-                    _dispatch(self.server, call, wire, queue)
+                    _dispatch(self.server, call, wire, queue, self.metadata_sets)
                     if call.refusing and call.name == "RefuseLater":
                         # Reads nothing, then refuses when told to, and discards the requests
                         # instead of reading them: the client's writes wait until it replays.
@@ -929,6 +978,7 @@ async def start_server(
         )
         session.server = test_server
         session.calls = {}
+        session.metadata_sets = {}
         test_server.connections.append(session)
         await session.closed
 

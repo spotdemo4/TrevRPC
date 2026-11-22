@@ -37,6 +37,8 @@ PLAIN_COMPRESSED_RECEIVED = "interop-plain-compressed-received"
 @dataclass(frozen=True)
 class Clients:
     channel: trevrpc.Channel
+    new_channel: Callable[..., trevrpc.Channel]
+    """Opens another channel with the same settings and these options."""
     echo: EchoClient
     compressed: CompressedEchoClient
     refusing: RefusingEchoClient
@@ -397,6 +399,23 @@ async def unreliable(clients: Clients) -> None:
         )
 
 
+async def connection_metadata(clients: Clients) -> None:
+    """The server merges the channel's connection metadata into every call, the later calls
+    referring to the set it confirmed, and the call's own entry wins."""
+    async with clients.new_channel(connection_metadata={"interop-suffix": "!"}) as channel:
+        echo = EchoClient(channel)
+
+        async def call(message: str, want: str, **options: object) -> None:
+            response = await echo.unary(EchoRequest(message=message), **options)  # pyright: ignore[reportArgumentType]
+            expect_response(response, want, 0)
+
+        for message in ("a", "b", "c"):
+            await call(message, message + "!")
+        await call("d", "d?", metadata={"interop-suffix": "?"})
+        channel.set_connection_metadata({"interop-suffix": "#"})
+        await call("e", "e#")
+
+
 def on_echo(
     scenario: Callable[[EchoClient], Awaitable[None]],
 ) -> Callable[[Clients], Awaitable[None]]:
@@ -424,7 +443,7 @@ SCENARIOS: dict[str, Scenario] = {
     "compressed-stream": compressed_stream,
     "refused-stream": refused_stream,
     "compressed-plain": compressed_plain,
-    "connection-metadata": "connection metadata is not implemented",
+    "connection-metadata": connection_metadata,
     "validation": "buf.validate.Violations details are not decoded",
 }
 
@@ -442,14 +461,19 @@ async def run(args: argparse.Namespace) -> int:
     if args.dictionary is not None:
         data = Path(args.dictionary).read_bytes()
         dictionaries = (trevrpc.Dictionary(data, INTEROP_MESSAGE_TYPES),)
-    channel = trevrpc.Channel(
-        args.addr,
-        ca=args.ca,
-        server_name=args.server_name,
-        transport=args.transport,
-        tcp_address=args.tcp_addr or args.addr,
-        compression=trevrpc.Compression(dictionaries),
-    )
+
+    def new_channel(**options: object) -> trevrpc.Channel:
+        return trevrpc.Channel(
+            args.addr,
+            ca=args.ca,
+            server_name=args.server_name,
+            transport=args.transport,
+            tcp_address=args.tcp_addr or args.addr,
+            compression=trevrpc.Compression(dictionaries),
+            **options,  # pyright: ignore[reportArgumentType]
+        )
+
+    channel = new_channel()
     try:
         try:
             await channel.connect()
@@ -464,6 +488,7 @@ async def run(args: argparse.Namespace) -> int:
             return 1
         clients = Clients(
             channel,
+            new_channel,
             EchoClient(channel),
             CompressedEchoClient(channel),
             RefusingEchoClient(channel),

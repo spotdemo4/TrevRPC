@@ -7,8 +7,7 @@ QMux over TLS on the server's TCP listener where UDP is blocked, on messages gen
 [protobuf-py](https://github.com/bufbuild/protobuf-py). It is a client only, asyncio only, and requires
 Python 3.14.
 
-This package is an early work in progress: it does not share connection metadata yet. See
-[#666](https://trev.zip/llc/TrevRPC/issues/666).
+This package is an early work in progress; see [#666](https://trev.zip/llc/TrevRPC/issues/666).
 
 ## Generating a client
 
@@ -59,6 +58,19 @@ Every method takes the call options as keyword arguments: `timeout` (seconds), `
 `INVALID_ARGUMENT`), and the `on_response_headers` and `on_response_metadata` callbacks. A call that
 does not end with an OK status raises `trevrpc.TrevRpcError`, which carries the status's code,
 message, trailing metadata and details (`retry_delay`, `find_details()`).
+
+## Connection metadata
+
+Metadata that every call of a channel carries, such as a bearer token, can be set once on the
+channel. Each connection carries it until the server confirms it stored it, and later calls refer to
+it by ID instead of repeating it. A call's own metadata wins for a key both have.
+
+```python
+channel = trevrpc.Channel(
+    "example.com:443", connection_metadata={"authorization": f"Bearer {token}"}
+)
+channel.set_connection_metadata({"authorization": f"Bearer {refreshed}"})  # later calls
+```
 
 ## Transports
 

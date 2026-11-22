@@ -23,6 +23,7 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.exceptions import ConnectionStateError, DatagramFrameCapacityError
 
 from ._compression import ConnectionCompression
+from ._connection_metadata import ConnectionMetadataState
 from ._datagram import MAX_DATAGRAM_FRAME_SIZE, SEND_QUEUE, DatagramReceiver
 from ._frames import MAX_FRAME_HEADER_SIZE
 from ._status import Code, TrevRpcError
@@ -131,6 +132,7 @@ class QuicTransport(asyncio.DatagramProtocol):
         self._blocked: set[Stream] = set()
         self._closed_locally = False
         self.compression = ConnectionCompression()
+        self.connection_metadata = ConnectionMetadataState()
         self._flows: dict[int, DatagramReceiver] = {}
         self._next_flow = 1
         self.datagrams_received = 0

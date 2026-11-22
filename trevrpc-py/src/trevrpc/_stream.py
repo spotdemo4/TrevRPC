@@ -11,6 +11,7 @@ from ._status import Code, TrevRpcError
 
 if TYPE_CHECKING:
     from ._compression import ConnectionCompression
+    from ._connection_metadata import ConnectionMetadataState
     from ._datagram import DatagramReceiver
 
 CANCEL_CODE = 1
@@ -23,6 +24,8 @@ class StreamTransport(Protocol):
 
     compression: ConnectionCompression
     """What the connection has negotiated for compressed messages."""
+    connection_metadata: ConnectionMetadataState
+    """Which connection metadata set the connection's server confirmed."""
 
     def open_flow(self, receiver: DatagramReceiver) -> int | None:
         """Registers a datagram flow and returns its ID, or `None` when the connection has no

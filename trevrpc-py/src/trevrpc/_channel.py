@@ -18,7 +18,9 @@ from ._call import (
     unary_call,
 )
 from ._compression import DEFAULT_STREAM_COMPRESSION_MEMORY, Compression, StreamBudget
+from ._connection_metadata import ConnectionMetadataSource
 from ._frames import DEFAULT_MAX_FRAME_SIZE
+from ._metadata import MetadataInput
 from ._method import Method, MethodKind
 from ._qmux import QMuxSession
 from ._quic import QuicTransport
@@ -87,6 +89,10 @@ class ChannelOptions(TypedDict, total=False):
     """Dictionaries to compress messages with, and the zstd level (1 by default). Compression
     without a dictionary and stream compression, on the methods whose schema allows them, need no
     settings."""
+    connection_metadata: MetadataInput
+    """Request metadata for every call of the channel, such as a bearer token. Each connection
+    carries it until the server confirms it stored it, and calls refer to it after that. A call's
+    own metadata wins for a key both have. `Channel.set_connection_metadata()` replaces it."""
     stream_compression_memory: int
     """The memory, in bytes, that stream compression may hold for the channel's calls: about 350
     KiB for a direction it decodes and 585 KiB for one it compresses, and the requests an
@@ -142,6 +148,7 @@ class Channel:
         self.compression = options.get("compression") or Compression()
         memory = options.get("stream_compression_memory", 0) or DEFAULT_STREAM_COMPRESSION_MEMORY
         self.stream_budget = StreamBudget(memory) if memory > 0 else None
+        self.connection_metadata = ConnectionMetadataSource(options.get("connection_metadata"))
         self._quic_failed_at: float | None = None
         """When QMux last won a race, while reconnects skip QUIC."""
         self._connection: _Connection | None = None
@@ -153,6 +160,14 @@ class Channel:
         """The transport of the current connection, or `None` while there is none."""
         connection = self._connection
         return connection.kind if connection is not None and connection.is_open else None
+
+    def set_connection_metadata(self, metadata: MetadataInput | None) -> None:
+        """Replaces the channel's connection metadata, for example when a token is refreshed;
+        empty metadata removes it. Calls that start afterwards carry the new set, which each
+        connection offers until its server confirms it, and calls in flight keep theirs. Raises an
+        `INVALID_ARGUMENT` `TrevRpcError` for metadata that breaks the limits of request
+        metadata."""
+        self.connection_metadata.set(metadata)
 
     async def connect(self) -> None:
         """Connects now instead of at the first call; raises an `UNAVAILABLE` `TrevRpcError` if

@@ -21,6 +21,7 @@ from enum import IntEnum
 from typing import Literal
 
 from ._compression import ConnectionCompression
+from ._connection_metadata import ConnectionMetadataState
 from ._frames import MAX_FRAME_HEADER_SIZE
 from ._status import Code, TrevRpcError
 from ._stream import CANCEL_CODE, Stream
@@ -466,6 +467,7 @@ class QMuxSession:
         self._closed_task: asyncio.Task[None] | None = None
         self._handshake: asyncio.Future[None] = loop.create_future()
         self.compression = ConnectionCompression()
+        self.connection_metadata = ConnectionMetadataState()
         self._wake = asyncio.Event()
         self.error: TrevRpcError | None = None
         """Why the connection ended, once it has."""

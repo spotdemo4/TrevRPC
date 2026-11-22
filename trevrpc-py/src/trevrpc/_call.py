@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol, Self, TypedDict
 from protobuf import Message
 
 from ._compression import CallCompression, Compression, StreamBudget
+from ._connection_metadata import CallConnectionMetadata, ConnectionMetadataSource
 from ._datagram import HELD_BYTES, HELD_MESSAGES, DatagramFlow
 from ._frames import FrameType, encode_frame
 from ._metadata import Metadata, MetadataInput, normalize_metadata, validate_metadata
@@ -66,6 +67,7 @@ class StreamOpener(Protocol):
     max_frame_size: int
     compression: Compression
     stream_budget: StreamBudget | None
+    connection_metadata: ConnectionMetadataSource
 
     async def open_stream(self, max_frame_size: int) -> Stream: ...
 
@@ -98,10 +100,11 @@ def _negotiate(
     stream: Stream,
     method: Method[Message, Message],
     request: RpcRequest,
+    metadata: CallConnectionMetadata,
     flow: DatagramFlow | None = None,
 ) -> tuple[CallCompression, RpcRequest]:
     """The call's compression on the stream's connection, and its REQUEST with the negotiation
-    fields and its datagram flow."""
+    fields, its connection metadata and its datagram flow."""
     compression = CallCompression(
         channel.compression,
         stream.compression,
@@ -115,6 +118,7 @@ def _negotiate(
         dictionary_query=compression.dictionary_query,
         stream_compression=compression.stream_compression,
         datagram_flow=flow.id if flow is not None else 0,
+        connection_metadata=metadata.prepare(stream.connection.connection_metadata),
     )
     return compression, request
 
@@ -170,6 +174,7 @@ class _Response:
         "_counted",
         "_kind",
         "_max_size",
+        "_metadata",
         "_on_headers",
         "_on_metadata",
         "_seen",
@@ -181,10 +186,16 @@ class _Response:
     )
 
     def __init__(
-        self, kind: MethodKind, options: CallOptions, compression: CallCompression, max_size: int
+        self,
+        kind: MethodKind,
+        options: CallOptions,
+        compression: CallCompression,
+        max_size: int,
+        metadata: CallConnectionMetadata,
     ) -> None:
         self._kind = kind
         self._compression = compression
+        self._metadata = metadata
         self._max_size = max_size
         self.answer: RpcAnswer | None = None
         self.datagram_count = 0
@@ -236,6 +247,7 @@ class _Response:
                     self._answered = True
                     self.answer = answer
                     self._compression.learn(answer)
+                    self._metadata.learn(answer)
                 case FrameType.DATAGRAM_COUNT:
                     if self._counted:
                         raise TrevRpcError(Code.INTERNAL, "second DATAGRAM_COUNT")
@@ -322,12 +334,13 @@ async def unary_call[Req: Message, Resp: Message](
     base, deadline = _prepare(method, options)  # pyright: ignore[reportArgumentType]
     max_frame_size = _frame_limit(channel, options)
     payload = _serialize(request, max_frame_size)
+    metadata = CallConnectionMetadata(channel.connection_metadata)
     stream: Stream | None = None
     compression: CallCompression | None = None
     try:
         async with asyncio.timeout_at(deadline):
             stream = await channel.open_stream(max_frame_size)
-            compression, full = _negotiate(channel, stream, method, base)  # pyright: ignore[reportArgumentType]
+            compression, full = _negotiate(channel, stream, method, base, metadata)  # pyright: ignore[reportArgumentType]
             frame = _request_frame(full) + compression.encode(payload)
             try:
                 await stream.write(frame, end=True)
@@ -336,7 +349,7 @@ async def unary_call[Req: Message, Resp: Message](
                 # the response then reports.
                 if not stream.stopped_by_peer:
                     raise
-            response = _Response(method.kind, options, compression, max_frame_size)
+            response = _Response(method.kind, options, compression, max_frame_size, metadata)
             payload = b""
             while response.status is None:
                 received = await stream.read_frame()
@@ -399,6 +412,8 @@ class _StreamingCall[Req: Message, Resp: Message]:
         self._options = options
         self._max_frame_size = _frame_limit(channel, options)
         self._request, self._deadline = _prepare(method, options)  # pyright: ignore[reportArgumentType]
+        self._connection_metadata = CallConnectionMetadata(channel.connection_metadata)
+        """The set current when the call started, which it keeps, through a replay too."""
         first_payload = _serialize(first, self._max_frame_size) if first is not None else None
         self._compression: CallCompression | None = None
         self._response: _Response | None = None
@@ -453,13 +468,18 @@ class _StreamingCall[Req: Message, Resp: Message]:
             stream,
             self._method,  # pyright: ignore[reportArgumentType]
             self._request,
+            self._connection_metadata,
             flow,
         )
         self._compression = compression
         if compression.settled:
             self._settled.set()
         self._response = _Response(
-            self._method.kind, self._options, compression, self._max_frame_size
+            self._method.kind,
+            self._options,
+            compression,
+            self._max_frame_size,
+            self._connection_metadata,
         )
         frame = _request_frame(self._request)
         if first is not None:
@@ -645,13 +665,25 @@ class _StreamingCall[Req: Message, Resp: Message]:
                 stream.fail(error)
                 raise error
             self._stream = stream
-            request = replace(self._request, stream_compression=StreamCompression.ENABLED)
+            # The call's set again: a reference only while it is still the channel's current
+            # one, since the server may have dropped a set replaced since the first REQUEST.
+            request = replace(
+                self._request,
+                stream_compression=StreamCompression.ENABLED,
+                connection_metadata=self._connection_metadata.prepare(
+                    stream.connection.connection_metadata
+                ),
+            )
             if self._deadline is not None:
                 remaining = self._deadline - self._loop.time()
                 request = replace(request, timeout_nanos=max(1, math.ceil(remaining * 1e9)))
             self._request = request
             self._response = _Response(
-                self._method.kind, self._options, compression, self._max_frame_size
+                self._method.kind,
+                self._options,
+                compression,
+                self._max_frame_size,
+                self._connection_metadata,
             )
             frame = _request_frame(request) + b"".join(compression.encode_message(p) for p in kept)
         except BaseException as error:
