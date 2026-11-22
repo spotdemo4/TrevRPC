@@ -11,6 +11,9 @@
     "type": "git",
     "url": "https://trev.zip/llc/TrevRPC.git"
   },
+  "workspaces": [
+    "qmux"
+  ],
   "files": [
     "src/**",
     "README.md",
@@ -45,6 +48,9 @@
     "test": "node --test test/*.test.js",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm test",
     "interop": "node interop-browser/cli.js"
+  },
+  "dependencies": {
+    "@trevrpc/qmux": "^1.12.0"
   },
   "devDependencies": {
     "@bufbuild/protobuf": "^2.17.0",

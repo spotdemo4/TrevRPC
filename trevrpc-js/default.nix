@@ -11,14 +11,35 @@
   gnugrep,
   playwright-driver,
   wireGolden,
-  qmuxGolden,
   zstdGolden,
   interopProto,
   trevrpcProto,
+  trevrpc-js-qmux,
 }:
 let
   jsPackage = builtins.fromJSON (builtins.readFile ./package.json);
   packageLock = lib.importJSON ./package-lock.json;
+  # trevrpc-js depends on @trevrpc/qmux, which is the npm workspace in qmux/ and a package of its
+  # own. The lock records it as a link to that directory, which the source leaves out, so the build
+  # installs without it and links the built package instead, as adapter.nix does with trevrpc-js.
+  withoutQmux = attrs: removeAttrs attrs [ "@trevrpc/qmux" ];
+  installedPackage = removeAttrs jsPackage [ "workspaces" ] // {
+    dependencies = withoutQmux jsPackage.dependencies;
+  };
+  installedLock = packageLock // {
+    packages =
+      removeAttrs packageLock.packages [
+        ""
+        "qmux"
+        "node_modules/@trevrpc/qmux"
+      ]
+      // {
+        "" = removeAttrs packageLock.packages."" [ "workspaces" ] // {
+          dependencies = withoutQmux packageLock.packages."".dependencies;
+        };
+      };
+  };
+  qmuxModule = "${trevrpc-js-qmux}/lib/node_modules/@trevrpc/qmux";
   playwrightManifestVersion = jsPackage.devDependencies.playwright;
   playwrightVersion = packageLock.packages."node_modules/playwright".version;
   playwrightCoreVersion = packageLock.packages."node_modules/playwright-core".version;
@@ -31,18 +52,17 @@ let
   protocGen = callPackage ./protoc-gen-trevrpc-js { inherit interopProto trevrpcProto; };
 
   # The interop descriptors are generated from the shared interop protos, which import the TrevRPC
-  # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
-  # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
-  # module is built on its own; only the script that embeds it is needed here. The Effect adapter
-  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own, which
-  # adapter.nix builds. The source of protoc-gen-trevrpc-js/ is kept: the build runs it to generate
-  # the codecs it tests.
+  # schema options, and the wire and compression tests read the shared golden vectors; all of them
+  # live outside this directory, as does the root oxlint config that ours extends. The wasm module
+  # is built on its own; only the script that embeds it is needed here. The Effect adapter in
+  # effect/ and the protovalidate adapter in protovalidate/ are packages of their own, which
+  # adapter.nix builds, and so is @trevrpc/qmux in qmux/. The source of protoc-gen-trevrpc-js/ is
+  # kept: the build runs it to generate the codecs it tests.
   sourceTree = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
       ../.oxlintrc.json
       wireGolden
-      qmuxGolden
       zstdGolden
       interopProto
       trevrpcProto
@@ -51,6 +71,7 @@ let
           ./zstd-wasm
           ./effect
           ./protovalidate
+          ./qmux
           ./protoc-gen-trevrpc-js/default.nix
           ./checks.nix
           ./release-check.nix
@@ -100,7 +121,15 @@ buildNpmPackage (final: {
   npmConfigHook = importNpmLock.npmConfigHook;
   npmDeps = importNpmLock {
     npmRoot = ./.;
+    package = installedPackage;
+    packageLock = installedLock;
   };
+
+  # The build, the bundles and the tests import @trevrpc/qmux like any dependency.
+  preBuild = ''
+    mkdir -p node_modules/@trevrpc
+    ln -s ${qmuxModule} node_modules/@trevrpc/qmux
+  '';
 
   # Embeds the libzstd module into src/zstd-wasm.js, generates the protobuf-es descriptors of the
   # interop and test protos with protoc, and bundles the interop page into build/interop/.
@@ -122,8 +151,15 @@ buildNpmPackage (final: {
 
   # The pruned install drops devDependencies; the interop CLI needs playwright at runtime, and the
   # library its peer dependency @bufbuild/protobuf, which the installed package carries so that it
-  # loads on its own, as the Effect adapter's build and the checks below load it.
+  # loads on its own, as the Effect adapter's build and the checks below load it. The prune runs
+  # with the manifest and lock without the workspace, and without the link to @trevrpc/qmux, which
+  # it would see as extraneous; the installed package gets its manifest back and links
+  # @trevrpc/qmux next to the peer dependency.
   preInstall = ''
+    rm node_modules/@trevrpc/qmux
+    cp package.json "$TMPDIR/package.json.orig"
+    cp ${builtins.toFile "package.json" (builtins.toJSON installedPackage)} package.json
+    cp ${builtins.toFile "package-lock.json" (builtins.toJSON installedLock)} package-lock.json
     mkdir -p "$TMPDIR/interop-node_modules" "$TMPDIR/peer-node_modules/@bufbuild"
     cp -R node_modules/playwright node_modules/playwright-core "$TMPDIR/interop-node_modules/"
     cp -R node_modules/@bufbuild/protobuf "$TMPDIR/peer-node_modules/@bufbuild/"
@@ -131,8 +167,10 @@ buildNpmPackage (final: {
 
   postInstall = ''
     library="$out/lib/node_modules/@trevrpc/trevrpc-js"
-    mkdir -p "$library/node_modules"
+    mkdir -p "$library/node_modules/@trevrpc"
     cp -R "$TMPDIR/peer-node_modules/@bufbuild" "$library/node_modules/"
+    ln -s ${qmuxModule} "$library/node_modules/@trevrpc/qmux"
+    cp "$TMPDIR/package.json.orig" "$library/package.json"
 
     interop="$out/lib/trevrpc-interop-browser"
     mkdir -p "$interop/interop-browser" "$interop/build/interop"

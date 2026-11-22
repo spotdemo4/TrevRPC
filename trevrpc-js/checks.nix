@@ -4,6 +4,7 @@
   oxfmt,
   oxlint,
   stdenv,
+  typescript,
   self,
 }:
 let
@@ -56,6 +57,22 @@ in
     '';
   };
 
+  # The package has no dependencies, so tsc comes from nixpkgs; its tsconfig maps @trevrpc/qmux to
+  # its declarations for the type tests.
+  qmux-lint = {
+    src = packages.trevrpc-js-qmux;
+    packages = [
+      oxfmt
+      oxlint
+      typescript
+    ];
+    script = ''
+      oxfmt --check
+      oxlint --deny-warnings src test
+      tsc -p tsconfig.json
+    '';
+  };
+
   protoc-gen-lint = {
     src = packages.trevrpc-js.protocGen;
     packages = [
@@ -74,6 +91,7 @@ in
       trevrpc-js
       trevrpc-js-effect
       trevrpc-js-protovalidate
+      trevrpc-js-qmux
       ;
   };
 }

@@ -65,9 +65,9 @@ npm run interop -- --browser chromium --url ... --cert-hash ...
 
 `nix build .#trevrpc-js` runs the same checks and installs the library, `protoc-gen-trevrpc-js`, and the wrapped `trevrpc-interop-browser` with matching Playwright browsers. The pinned `playwright` version must equal nixpkgs' `playwright-driver`; `nix run .#sync-playwright` updates it.
 
-Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt` (frame bytes, and the frame reader against the shared byte streams), the QMux frames against `testdata/qmux-golden-vectors.txt`, framing, the `trevrpc.method` option, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.
+Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt` (frame bytes, and the frame reader against the shared byte streams), framing, the WebSocket fallback against a QMux server session, the `trevrpc.method` option, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.
 
-`zstd-wasm/` is a Rust crate that is not published: it builds libzstd as the WebAssembly module that `npm run build` embeds for the `@trevrpc/trevrpc-js/zstd` entry point. The Effect and protovalidate adapters and the plugin are packages of their own in `effect/`, `protovalidate/` and `protoc-gen-trevrpc-js/`.
+`zstd-wasm/` is a Rust crate that is not published: it builds libzstd as the WebAssembly module that `npm run build` embeds for the `@trevrpc/trevrpc-js/zstd` entry point. The Effect and protovalidate adapters and the plugin are packages of their own in `effect/`, `protovalidate/` and `protoc-gen-trevrpc-js/`, and so is the QMux implementation, [`@trevrpc/qmux`](qmux/README.md) in `qmux/`, which the client depends on through an npm workspace.
 
 ### Interop client
 

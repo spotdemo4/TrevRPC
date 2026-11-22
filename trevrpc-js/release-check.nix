@@ -21,12 +21,14 @@
   trevrpc-js,
   trevrpc-js-effect,
   trevrpc-js-protovalidate,
+  trevrpc-js-qmux,
 }:
 let
   packages = [
     trevrpc-js
     trevrpc-js-effect
     trevrpc-js-protovalidate
+    trevrpc-js-qmux
     trevrpc-js.protocGen
   ];
   # The directory flake-release enters: the package's sourceRoot within its source.
@@ -36,6 +38,7 @@ let
     trevrpc-js = "trevrpc-trevrpc-js";
     trevrpc-js-effect = "trevrpc-effect";
     trevrpc-js-protovalidate = "trevrpc-protovalidate";
+    trevrpc-js-qmux = "trevrpc-qmux";
     trevrpc-js-protoc-gen = "trevrpc-protoc-gen-trevrpc-js";
   };
 in
@@ -116,6 +119,11 @@ runCommand "trevrpc-js-release-check"
         package/src/index.d.ts package/src/index.js | diff -u - "$out/$adapter.list"
     done
 
+    # @trevrpc/qmux ships its modules and declarations, nothing of its tests or the golden vectors.
+    printf '%s\n' package/LICENSE package/README.md package/package.json package/src/errors.js \
+      package/src/frames.js package/src/index.d.ts package/src/index.js package/src/params.js \
+      package/src/session.js package/src/varint.js | diff -u - "$out/trevrpc-js-qmux.list"
+
     # The generated module reaches the tarball with the libzstd module in it, not as an empty file.
     wasm="$TMPDIR/unpacked-trevrpc-js/package/src/zstd-wasm.js"
     grep -qx 'package/src/zstd-wasm.js' "$out/trevrpc-js.list"
@@ -126,16 +134,20 @@ runCommand "trevrpc-js-release-check"
     head -n 1 "$TMPDIR/unpacked-trevrpc-js-protoc-gen/package/bin/protoc-gen-trevrpc-js" \
       | grep -qx '#!/usr/bin/env node'
 
-    # A consumer installing the tarball loads both entry points, the zstd one with its module.
+    # A consumer installing the tarball, with its dependency @trevrpc/qmux, loads both entry points,
+    # the zstd one with its module.
     consumer="$TMPDIR/consumer"
     mkdir -p "$consumer/node_modules/@trevrpc"
     cp -R "$TMPDIR/unpacked-trevrpc-js/package" "$consumer/node_modules/@trevrpc/trevrpc-js"
+    cp -R "$TMPDIR/unpacked-trevrpc-js-qmux/package" "$consumer/node_modules/@trevrpc/qmux"
     ln -s "$peerModules/@bufbuild" "$consumer/node_modules/@bufbuild"
     (
       cd "$consumer"
       node --input-type=module -e '
         import assert from "node:assert/strict";
         await import("@trevrpc/trevrpc-js");
+        const qmux = await import("@trevrpc/qmux");
+        assert.equal(typeof qmux.QMuxSession, "function");
         // The runtime that generated codecs import.
         const codec = await import("@trevrpc/trevrpc-js/codec");
         assert.equal(typeof codec.defineCodec, "function");

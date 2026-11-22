@@ -1,6 +1,7 @@
-// QMux frames (draft-ietf-quic-qmux-02): the QUIC v1 frames QMux carries plus its own
-// QX_TRANSPORT_PARAMETERS and QX_PING frames.
-import { readVarint, varintLength, writeVarint } from "../varint.js";
+// QMux frames (draft-ietf-quic-qmux-02): the QUIC v1 frames QMux carries, RFC 9221 DATAGRAM, and
+// QMux's own QX_TRANSPORT_PARAMETERS and QX_PING frames.
+import { QMuxProtocolError, TransportError } from "./errors.js";
+import { readVarint, varintLength, writeVarint } from "./varint.js";
 
 export const FrameType = Object.freeze({
   Padding: 0x00,
@@ -17,7 +18,7 @@ export const FrameType = Object.freeze({
   StreamsBlockedUni: 0x17,
   ConnectionClose: 0x1c,
   ApplicationClose: 0x1d,
-  /** RFC 9221 DATAGRAM, without and with a Length field. Never negotiated. */
+  /** RFC 9221 DATAGRAM, without and with a Length field. */
   Datagram: 0x30,
   DatagramLen: 0x31,
   TransportParameters: 0x3f51_5330_0d0a_0d0an,
@@ -28,29 +29,6 @@ export const FrameType = Object.freeze({
 const StreamFin = 0x01;
 const StreamLen = 0x02;
 const StreamOff = 0x04;
-
-/** QUIC transport error codes (RFC 9000 §20.1). */
-export const TransportError = Object.freeze({
-  NoError: 0x00,
-  InternalError: 0x01,
-  FlowControlError: 0x03,
-  StreamLimitError: 0x04,
-  StreamStateError: 0x05,
-  FinalSizeError: 0x06,
-  FrameEncodingError: 0x07,
-  TransportParameterError: 0x08,
-  ProtocolViolation: 0x0a,
-});
-
-/** A QMux protocol error that closes the session with a transport CONNECTION_CLOSE. */
-export class QMuxProtocolError extends Error {
-  constructor(code, message, frameType = 0) {
-    super(message);
-    this.name = "QMuxProtocolError";
-    this.code = code;
-    this.frameType = frameType;
-  }
-}
 
 function truncated(frameType) {
   return new QMuxProtocolError(TransportError.FrameEncodingError, "truncated frame", frameType);
@@ -133,6 +111,20 @@ export function writeMaxStreamData(writer, streamId, maximum) {
   return writer.varint(FrameType.MaxStreamData).varint(streamId).varint(maximum);
 }
 
+export function writeMaxStreams(writer, bidi, maximum) {
+  return writer.varint(bidi ? FrameType.MaxStreamsBidi : FrameType.MaxStreamsUni).varint(maximum);
+}
+
+/** Size of a DATAGRAM frame carrying `length` bytes, with its Length field. */
+export function datagramFrameSize(length) {
+  return 1 + varintLength(length) + length;
+}
+
+/** Appends a DATAGRAM frame. It always carries a length so that frames may follow it. */
+export function writeDatagram(writer, data) {
+  return writer.varint(FrameType.DatagramLen).varint(data.length).bytes(data);
+}
+
 /** Appends an application CONNECTION_CLOSE, or a transport one for a QMuxProtocolError. */
 export function writeConnectionClose(writer, { code = 0, reason = "", protocolError } = {}) {
   const reasonBytes = new TextEncoder().encode(reason).subarray(0, 256);
@@ -151,13 +143,19 @@ export function writePing(writer, type, sequence) {
   return writer.varint(type).varint(sequence);
 }
 
-/** Decodes the frames of one record; `next()` returns null at its end. */
+/**
+ * Decodes the frames of one record; `next()` returns null at its end. DATAGRAM frames are a
+ * PROTOCOL_VIOLATION unless `maxDatagramFrameSize`, the local max_datagram_frame_size, admits
+ * them (RFC 9221 §3).
+ */
 export class FrameParser {
   #bytes;
   #offset = 0;
+  #maxDatagramFrameSize;
 
-  constructor(bytes) {
+  constructor(bytes, { maxDatagramFrameSize = 0 } = {}) {
     this.#bytes = bytes;
+    this.#maxDatagramFrameSize = maxDatagramFrameSize;
   }
 
   #varint(frameType) {
@@ -195,6 +193,7 @@ export class FrameParser {
     if (this.#offset >= this.#bytes.length) {
       return null;
     }
+    const start = this.#offset;
     const type = this.#varint(0);
     if (typeof type === "bigint") {
       if (type === FrameType.TransportParameters) {
@@ -240,12 +239,7 @@ export class FrameParser {
       }
       case FrameType.Datagram:
       case FrameType.DatagramLen:
-        // RFC 9221 section 3: a DATAGRAM frame without max_datagram_frame_size.
-        throw new QMuxProtocolError(
-          TransportError.ProtocolViolation,
-          "DATAGRAM frame without max_datagram_frame_size",
-          type,
-        );
+        return this.#datagram(type, start);
       default:
         if (type >= FrameType.Stream && type <= (FrameType.Stream | 0x07)) {
           return this.#stream(type);
@@ -269,5 +263,26 @@ export class FrameParser {
       data: this.#take(type, length),
       fin: (type & StreamFin) !== 0,
     };
+  }
+
+  #datagram(type, start) {
+    if (this.#maxDatagramFrameSize === 0) {
+      throw new QMuxProtocolError(
+        TransportError.ProtocolViolation,
+        "DATAGRAM frame without max_datagram_frame_size",
+        type,
+      );
+    }
+    const length =
+      type === FrameType.DatagramLen ? this.#number(type) : this.#bytes.length - this.#offset;
+    const datagram = this.#take(type, length);
+    if (this.#offset - start > this.#maxDatagramFrameSize) {
+      throw new QMuxProtocolError(
+        TransportError.ProtocolViolation,
+        "DATAGRAM frame exceeds max_datagram_frame_size",
+        type,
+      );
+    }
+    return { type, datagram };
   }
 }

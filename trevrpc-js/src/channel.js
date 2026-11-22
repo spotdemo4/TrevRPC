@@ -1,9 +1,11 @@
+import { QMuxSession } from "@trevrpc/qmux";
+
 import { settledOrAborted, sleep } from "./async.js";
 import { certificateHashesUrl, fetchServerCertificateHashes } from "./certificate-hashes.js";
 import { CompressionPending } from "./compression.js";
 import { ConnectionMetadataSource } from "./connection-metadata.js";
 import { interceptorList } from "./interceptor.js";
-import { QMuxWebSocketSession } from "./qmux/session.js";
+import { DefaultMaxFrameSize } from "./limits.js";
 import { closeQuietly, dialRace } from "./race.js";
 import {
   Code,
@@ -496,6 +498,26 @@ function requireWireVersion(session) {
   }
 }
 
+/** The WebSocket subprotocol of TrevRPC over QMux. */
+const QMuxProtocol = "qmux-02.trevrpc-1";
+
+/**
+ * The transport parameters of TrevRPC's QMux sessions. The server opens no streams and sends no
+ * datagrams, and the session and each stream receive one frame of the default `maxFrameSize` and
+ * its header, which is at most 16 bytes, at a time.
+ */
+const QMuxParameters = Object.freeze({
+  maxIdleTimeoutMs: 0,
+  initialMaxData: DefaultMaxFrameSize + 16,
+  initialMaxStreamDataBidiLocal: DefaultMaxFrameSize + 16,
+  initialMaxStreamDataBidiRemote: 0,
+  initialMaxStreamDataUni: 0,
+  initialMaxStreamsBidi: 0,
+  initialMaxStreamsUni: 0,
+  maxDatagramFrameSize: 0,
+  maxRecordSize: 64 * 1024,
+});
+
 /** Establishes a ready QMux over WebSocket session; aborting the signal abandons the attempt. */
 function dialWebSocket(url, options, signal) {
   if (signal?.aborted) {
@@ -503,7 +525,11 @@ function dialWebSocket(url, options, signal) {
   }
   let session;
   try {
-    session = new QMuxWebSocketSession(url, { WebSocket: options.WebSocket });
+    session = new QMuxSession(url, {
+      protocols: [QMuxProtocol],
+      parameters: QMuxParameters,
+      WebSocket: options.WebSocket,
+    });
   } catch (error) {
     throw statusFromTransportError(error);
   }

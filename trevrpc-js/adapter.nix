@@ -51,8 +51,8 @@ buildNpmPackage (final: {
   inherit (adapterPackage) version;
 
   # The adapter and the trevrpc-js sources it links to, whose test server the tests reuse, plus the
-  # root oxlint config that ours extends. The other adapters, the wasm module and the Nix files are
-  # left out.
+  # root oxlint config that ours extends. The other adapters, @trevrpc/qmux, the wasm module and the
+  # Nix files are left out; trevrpc-js finds @trevrpc/qmux in the node_modules of its built package.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions (
@@ -63,6 +63,7 @@ buildNpmPackage (final: {
             ./zstd-wasm
             ./effect
             ./protovalidate
+            ./qmux
             (lib.fileset.fileFilter (file: file.hasExt "nix") ./.)
           ]
         ))

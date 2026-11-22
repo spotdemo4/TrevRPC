@@ -98,7 +98,9 @@ jobs:
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
           NPMJS_TOKEN: ${{ secrets.NPM_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
+          # @trevrpc/qmux goes first: @trevrpc/trevrpc-js depends on it.
           PACKAGES: |
+            packages.x86_64-linux.trevrpc-js-qmux
             packages.x86_64-linux.trevrpc-js
             packages.x86_64-linux.trevrpc-js-effect
             packages.x86_64-linux.trevrpc-js-protovalidate

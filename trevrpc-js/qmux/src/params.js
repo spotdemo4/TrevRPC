@@ -1,10 +1,11 @@
-import { readVarint, varintLength } from "../varint.js";
 // QX_TRANSPORT_PARAMETERS (draft-ietf-quic-qmux-02 §6): the subset of QUIC transport parameters
-// that QMux keeps, plus max_record_size.
-import { FrameType, FrameWriter, QMuxProtocolError, TransportError } from "./frames.js";
+// that QMux keeps, RFC 9221's max_datagram_frame_size, and max_record_size.
+import { QMuxProtocolError, TransportError } from "./errors.js";
+import { FrameType, FrameWriter } from "./frames.js";
+import { readVarint, varintLength } from "./varint.js";
 
 /** The max_record_size a peer may assume until told otherwise, and the smallest it may set. */
-const DefaultMaxRecordSize = 16382;
+export const DefaultMaxRecordSize = 16382;
 
 const Param = Object.freeze({
   MaxIdleTimeout: 0x01,
@@ -14,6 +15,7 @@ const Param = Object.freeze({
   InitialMaxStreamDataUni: 0x07,
   InitialMaxStreamsBidi: 0x08,
   InitialMaxStreamsUni: 0x09,
+  MaxDatagramFrameSize: 0x20,
   MaxRecordSize: 0x0571_c594_29cd_0845n,
 });
 
@@ -28,6 +30,7 @@ const Fields = new Map([
   [Param.InitialMaxStreamDataUni, "initialMaxStreamDataUni"],
   [Param.InitialMaxStreamsBidi, "initialMaxStreamsBidi"],
   [Param.InitialMaxStreamsUni, "initialMaxStreamsUni"],
+  [Param.MaxDatagramFrameSize, "maxDatagramFrameSize"],
   [Param.MaxRecordSize, "maxRecordSize"],
 ]);
 
@@ -62,6 +65,7 @@ export function decodeTransportParameters(bytes) {
     initialMaxStreamDataUni: 0,
     initialMaxStreamsBidi: 0,
     initialMaxStreamsUni: 0,
+    maxDatagramFrameSize: 0,
     maxRecordSize: DefaultMaxRecordSize,
   };
   const seen = new Set();
@@ -97,8 +101,10 @@ export function decodeTransportParameters(bytes) {
       `max_record_size ${params.maxRecordSize} is below ${DefaultMaxRecordSize}`,
     );
   }
-  if (params.initialMaxStreamsBidi > 2 ** 60) {
-    throw parameterError("initial_max_streams_bidi exceeds 2^60");
+  for (const field of ["initialMaxStreamsBidi", "initialMaxStreamsUni"]) {
+    if (params[field] > 2 ** 60) {
+      throw parameterError(`${field} exceeds 2^60`);
+    }
   }
   return params;
 }

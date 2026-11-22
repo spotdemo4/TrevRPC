@@ -8,6 +8,7 @@
     "zstd-wasm/target/**",
     "effect/**",
     "protovalidate/**",
-    "protoc-gen-trevrpc-js/**"
+    "protoc-gen-trevrpc-js/**",
+    "qmux/**"
   ]
 }

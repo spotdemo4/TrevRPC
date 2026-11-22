@@ -325,14 +325,15 @@
                 trevrpcProto
                 ;
             };
+            trevrpc-js-qmux = pkgs.callPackage ./trevrpc-js/qmux { inherit qmuxGolden; };
             trevrpc-js = pkgs.callPackage ./trevrpc-js {
               inherit
                 wireGolden
-                qmuxGolden
                 zstdGolden
                 interopProto
                 trevrpcProto
                 ;
+              inherit (self.packages.${system}) trevrpc-js-qmux;
             };
             trevrpc-js-effect = pkgs.callPackage ./trevrpc-js/effect {
               inherit (self.packages.${system}) trevrpc-js;
