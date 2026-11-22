@@ -10,11 +10,12 @@
 let
   inherit (beamMinimal29Packages) buildRebar3;
   lock = callPackage ./deps.nix { } ./rebar.lock;
-  # protoc-gen-trevrpc-erlang and protoc-gen-trevrpc-gleam, which this package provides like the
-  # other runtimes' packages provide their plugins. Each is an escript of its own, built and tested
-  # in its own derivation.
+  # protoc-gen-trevrpc-erlang, protoc-gen-trevrpc-gleam and protoc-gen-trevrpc-elixir, which this
+  # package provides like the other runtimes' packages provide their plugins. Each is an escript of
+  # its own, built and tested in its own derivation.
   protocGen = callPackage ./protoc-gen-trevrpc-erlang { inherit trevrpcProto; };
   protocGenGleam = callPackage ./protoc-gen-trevrpc-gleam { inherit trevrpcProto; };
+  protocGenElixir = callPackage ./protoc-gen-trevrpc-elixir { inherit trevrpcProto; };
 in
 (buildRebar3 (final: {
   name = "trevrpc";
@@ -43,6 +44,7 @@ in
           ./interop
           ./protoc-gen-trevrpc-erlang
           ./protoc-gen-trevrpc-gleam
+          ./protoc-gen-trevrpc-elixir
         ]
       ))
     ];
@@ -68,11 +70,12 @@ in
     mkdir -p $out/bin
     ln -s ${protocGen}/bin/protoc-gen-trevrpc-erlang $out/bin/protoc-gen-trevrpc-erlang
     ln -s ${protocGenGleam}/bin/protoc-gen-trevrpc-gleam $out/bin/protoc-gen-trevrpc-gleam
+    ln -s ${protocGenElixir}/bin/protoc-gen-trevrpc-elixir $out/bin/protoc-gen-trevrpc-elixir
   '';
 
   meta = {
     mainProgram = "protoc-gen-trevrpc-erlang";
-    description = "Erlang runtime and Gleam binding for TrevRPC";
+    description = "Erlang runtime and Gleam binding for TrevRPC, with Erlang, Gleam and Elixir codegen";
     license = lib.licenses.mit;
     homepage = "https://trev.zip/llc/TrevRPC";
     downloadPage = "https://trev.zip/llc/TrevRPC/releases";
@@ -84,7 +87,12 @@ in
   (
     previous: {
       passthru = previous.passthru // {
-        inherit protocGen protocGenGleam lock;
+        inherit
+          protocGen
+          protocGenGleam
+          protocGenElixir
+          lock
+          ;
         gleam = callPackage ./gleam.nix {
           inherit (previous) version;
           inherit trevrpcProto;

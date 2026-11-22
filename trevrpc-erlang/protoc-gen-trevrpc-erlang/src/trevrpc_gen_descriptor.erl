@@ -15,7 +15,7 @@
 %% gpb compiles the messages from.
 -module(trevrpc_gen_descriptor).
 
--export([decode_request/1, encode_response/1]).
+-export([decode_request/1, encode_response/1, to_generate/1]).
 
 -export_type([request/0, file/0, message/0, service/0, method/0, response/0]).
 
@@ -62,6 +62,17 @@
 %% The extension field of `trevrpc.method' on google.protobuf.MethodOptions.
 -define(TREVRPC_METHOD, 58247).
 
+%% @doc The files of a request to generate, in order, and every message of
+%% the request by full name, which the methods' compression looks into.
+-spec to_generate(request()) -> {[file()], #{binary() => message()}}.
+to_generate(#{files_to_generate := Names, files := Files}) ->
+    ByName = maps:from_list([{Name, File} || #{name := Name} = File <- Files]),
+    Messages = maps:from_list([
+        {Name, Message}
+     || #{messages := Ms} <- Files, #{name := Name} = Message <- Ms
+    ]),
+    {[maps:get(Name, ByName) || Name <- Names], Messages}.
+
 %% @doc Decodes a `CodeGeneratorRequest'.
 -spec decode_request(binary()) -> {ok, request()} | {error, binary()}.
 decode_request(Bin) ->
@@ -93,14 +104,11 @@ file(Bin) ->
 %% and the messages nested in it.
 message(Bin, Scope) ->
     Fields = fields(Bin),
-    Name = qualified(Scope, last([Name || {1, {bytes, Name}} <- Fields], <<>>)),
+    Name = trevrpc_gen_names:qualified(Scope, last([Name || {1, {bytes, Name}} <- Fields], <<>>)),
     [
         #{name => Name, fields => [field(Field) || {2, {bytes, Field}} <- Fields]}
         | lists:append([message(Nested, Name) || {3, {bytes, Nested}} <- Fields])
     ].
-
-qualified(<<>>, Name) -> Name;
-qualified(Scope, Name) -> <<Scope/binary, ".", Name/binary>>.
 
 %% FieldDescriptorProto: type_name 6, options 8; FieldOptions:
 %% debug_redact 16.

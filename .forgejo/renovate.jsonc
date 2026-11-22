@@ -70,7 +70,9 @@
         "trevrpc-erlang/rebar.lock",
         "trevrpc-erlang/interop/rebar.lock",
         "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.config",
-        "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock"
+        "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock",
+        "trevrpc-erlang/protoc-gen-trevrpc-elixir/rebar.config",
+        "trevrpc-erlang/protoc-gen-trevrpc-elixir/rebar.lock"
       ],
       "executionMode": "branch"
     }
@@ -169,7 +171,9 @@
           "trevrpc-erlang/rebar.lock",
           "trevrpc-erlang/interop/rebar.lock",
           "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.config",
-          "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock"
+          "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock",
+          "trevrpc-erlang/protoc-gen-trevrpc-elixir/rebar.config",
+          "trevrpc-erlang/protoc-gen-trevrpc-elixir/rebar.lock"
         ],
         "executionMode": "branch"
       }

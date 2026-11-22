@@ -1,0 +1,10 @@
+// The other half of same.proto.
+syntax = "proto3";
+
+package elixirgen.fooBar;
+
+message Empty {}
+
+service Svc {
+  rpc Get(Empty) returns (Empty);
+}

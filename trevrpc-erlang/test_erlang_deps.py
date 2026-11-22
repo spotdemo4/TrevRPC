@@ -87,7 +87,7 @@ class Runtime:
 
     def __init__(self, root: Path, packages: list[dict[str, Any]], locked: list[Locked]) -> None:
         self.root = root
-        for directory in ("interop", "protoc-gen-trevrpc-erlang", "protoc-gen-trevrpc-gleam"):
+        for directory in ("interop", "protoc-gen-trevrpc-erlang", *erlang_deps.PLUGINS_ON_ERLANG):
             (root / directory).mkdir()
         (root / "gleam.toml").write_text(GLEAM_TOML)
         (root / "manifest.toml").write_text(manifest_toml(packages))
@@ -98,10 +98,9 @@ class Runtime:
             PLUGIN_CONFIG.format("~> 5.0.0")
         )
         (root / "protoc-gen-trevrpc-erlang" / "rebar.lock").write_text("the gpb lock\n")
-        (root / "protoc-gen-trevrpc-gleam" / "rebar.config").write_text(
-            PLUGIN_CONFIG.format("~> 4.0.0")
-        )
-        (root / "protoc-gen-trevrpc-gleam" / "rebar.lock").write_text("")
+        for plugin in erlang_deps.PLUGINS_ON_ERLANG:
+            (root / plugin / "rebar.config").write_text(PLUGIN_CONFIG.format("~> 4.0.0"))
+            (root / plugin / "rebar.lock").write_text("")
 
     def synced(self, offline: bool = False) -> dict[Path, str]:
         return erlang_deps.synced(self.root, offline)
@@ -165,11 +164,12 @@ class SyncTest(TestCase):
             ),
         )
 
-    def test_gives_the_gleam_plugin_the_erlang_plugins_gpb(self) -> None:
+    def test_gives_the_plugins_on_the_erlang_plugin_its_gpb(self) -> None:
         files = self.runtime().synced()
-        plugin = self.tmp / "protoc-gen-trevrpc-gleam"
-        self.assertEqual(files[plugin / "rebar.config"], PLUGIN_CONFIG.format("~> 5.0.0"))
-        self.assertEqual(files[plugin / "rebar.lock"], "the gpb lock\n")
+        for name in ("protoc-gen-trevrpc-gleam", "protoc-gen-trevrpc-elixir"):
+            plugin = self.tmp / name
+            self.assertEqual(files[plugin / "rebar.config"], PLUGIN_CONFIG.format("~> 5.0.0"))
+            self.assertEqual(files[plugin / "rebar.lock"], "the gpb lock\n")
 
     def test_downloads_the_inner_checksum_of_a_new_version_only(self) -> None:
         packages = [*PACKAGES]

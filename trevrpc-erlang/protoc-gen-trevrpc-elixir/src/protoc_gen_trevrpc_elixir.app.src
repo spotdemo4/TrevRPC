@@ -1,0 +1,10 @@
+{application, protoc_gen_trevrpc_elixir, [
+    {description, "protoc plugin generating Elixir code for TrevRPC services"},
+    {vsn, "1.12.0"},
+    {registered, []},
+    {applications, [kernel, stdlib, gpb, protoc_gen_trevrpc_erlang]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{"Source", "https://trev.zip/llc/TrevRPC"}]}
+]}.

@@ -1,0 +1,10 @@
+// Two services in packages that camelize to the same Elixir module.
+syntax = "proto3";
+
+package elixirgen.foo_bar;
+
+import "elixirgen/same_other.proto";
+
+service Svc {
+  rpc Get(elixirgen.fooBar.Empty) returns (elixirgen.fooBar.Empty);
+}

@@ -141,23 +141,17 @@ upper(C) -> C.
 
 %% @doc The files for the proto files a `CodeGeneratorRequest' asks for.
 -spec files(map()) -> {ok, [{binary(), iodata()}]} | {error, binary()}.
-files(#{files_to_generate := Names, files := Files, file_set := FileSet}) ->
+files(#{files_to_generate := Names, files := Files, file_set := FileSet} = Request) ->
+    {Generate, Messages} = trevrpc_gen_descriptor:to_generate(Request),
     maybe
-        ok ?=
-            trevrpc_gen_service:check_files([
-                File
-             || #{name := Name} = File <- Files, lists:member(Name, Names)
-            ]),
+        ok ?= trevrpc_gen_service:check_files(Generate),
         {ok, Defs} ?= trevrpc_gen_messages:defs(FileSet),
         {ok, World} ?= world(Defs, [Name || #{name := Name} <- Files]),
         Descriptors = #{
             descriptors => maps:from_list([{Name, File} || #{name := Name} = File <- Files]),
             %% Every message of the request, for the fields marked
             %% debug_redact, as trevrpc_gen_service:modes/2 takes them.
-            descriptor_messages => maps:from_list([
-                {Name, Message}
-             || #{messages := Ms} <- Files, #{name := Name} = Message <- Ms
-            ])
+            descriptor_messages => Messages
         },
         generate(Names, Defs, maps:merge(World, Descriptors), [])
     end.

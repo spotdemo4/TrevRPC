@@ -1,0 +1,10 @@
+// A method named after Elixir's `when`, which no function can be.
+syntax = "proto3";
+
+package elixirgen;
+
+message Empty {}
+
+service Guards {
+  rpc When(Empty) returns (Empty);
+}

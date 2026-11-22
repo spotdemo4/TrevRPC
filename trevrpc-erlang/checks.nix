@@ -1,6 +1,7 @@
 # The Erlang runtime's and the Gleam binding's checks, which the flake names trevrpc-erlang-<name>.
 # The packages run the tests.
 {
+  beamMinimal29Packages,
   callPackage,
   erlfmt,
   pkgs,
@@ -11,6 +12,8 @@
 }:
 let
   packages = self.packages.${stdenv.hostPlatform.system};
+  # trevrpc/options.proto, which the Elixir fixture's proto imports.
+  trevrpcProto = ../proto;
 in
 {
   lint = {
@@ -64,6 +67,26 @@ in
     protocGen = packages.trevrpc-erlang.protocGenGleam;
   };
 
+  # The Elixir code protoc-gen-trevrpc-elixir generates compiles, and an Elixir server and client
+  # call each other through it.
+  protoc-gen-elixir = callPackage ./protoc-gen-trevrpc-elixir/test/elixir {
+    inherit (packages) trevrpc-erlang;
+    inherit trevrpcProto;
+    protocGen = packages.trevrpc-erlang.protocGenElixir;
+  };
+
+  elixir-lint = {
+    root = ./protoc-gen-trevrpc-elixir/test/elixir;
+    files = [
+      ./protoc-gen-trevrpc-elixir/test/elixir/mix.exs
+      ./protoc-gen-trevrpc-elixir/test/elixir/test
+    ];
+    packages = [ beamMinimal29Packages.elixir ];
+    script = ''
+      HOME=$(mktemp -d) mix format --check-formatted mix.exs 'test/**/*.exs'
+    '';
+  };
+
   gleam-lint = {
     root = ../.;
     files = [
@@ -101,10 +124,20 @@ in
       ./protoc-gen-trevrpc-erlang/rebar.lock
       ./protoc-gen-trevrpc-gleam/rebar.config
       ./protoc-gen-trevrpc-gleam/rebar.lock
+      ./protoc-gen-trevrpc-elixir/rebar.config
+      ./protoc-gen-trevrpc-elixir/rebar.lock
     ];
     packages = [ python3 ];
     script = ''
       python3 -I trevrpc-erlang/erlang_deps.py check
+    '';
+  };
+
+  protoc-gen-elixir-lint = {
+    src = packages.trevrpc-erlang.protocGenElixir;
+    packages = [ erlfmt ];
+    script = ''
+      erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
     '';
   };
 

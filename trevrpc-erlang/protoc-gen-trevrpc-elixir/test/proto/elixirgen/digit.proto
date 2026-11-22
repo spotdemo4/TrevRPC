@@ -1,0 +1,10 @@
+// A package part that cannot start an Elixir alias.
+syntax = "proto3";
+
+package elixirgen.v1._2fa;
+
+message Empty {}
+
+service Codes {
+  rpc Check(Empty) returns (Empty);
+}

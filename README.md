@@ -333,6 +333,19 @@ gleam add trevrpc
 decodes, and service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
 `trevrpc-erlang/protoc-gen-trevrpc-gleam/`. See [`trevrpc-erlang`](trevrpc-erlang#gleam-code-generation).
 
+### elixir
+
+Elixir projects use the same `trevrpc` Hex package as Erlang ones, from `mix.exs`:
+
+```elixir
+defp deps, do: [{:trevrpc, "~> 1.12"}]
+```
+
+`protoc-gen-trevrpc-elixir` generates gpb message modules, whose messages are maps, and an Elixir module per
+service with its behaviour, routes and client functions; it is available from [nix](#nix), or from a checkout with
+`rebar3 escriptize` in `trevrpc-erlang/protoc-gen-trevrpc-elixir/`. See
+[`trevrpc-erlang`](trevrpc-erlang#elixir-code-generation).
+
 ### nix
 
 each language's package provides its `protoc` plugin:
@@ -342,7 +355,7 @@ nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-go
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
-nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-erlang   # protoc-gen-trevrpc-erlang and protoc-gen-trevrpc-gleam
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-erlang   # protoc-gen-trevrpc-erlang, -gleam and -elixir
 ```
 
 ### download

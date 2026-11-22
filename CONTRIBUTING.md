@@ -29,6 +29,7 @@ direnv allow
 | `trevrpc-erlang/`                           | Erlang runtime (in progress: native QUIC, QMux over TLS and WebSocket, HTTP/3 and HTTP/2, zstd) and its Gleam binding (`src/trevrpc/`), one Hex package |
 | `trevrpc-erlang/protoc-gen-trevrpc-erlang/` | `protoc-gen-trevrpc-erlang`, gpb message modules and service stubs                                                                                      |
 | `trevrpc-erlang/protoc-gen-trevrpc-gleam/`  | `protoc-gen-trevrpc-gleam`, Gleam messages and service modules, on `protoc-gen-trevrpc-erlang`                                                          |
+| `trevrpc-erlang/protoc-gen-trevrpc-elixir/` | `protoc-gen-trevrpc-elixir`, Elixir service modules over gpb's messages, on `protoc-gen-trevrpc-erlang`                                                 |
 | `interop/`                                  | cross-runtime test suite                                                                                                                                |
 | `bench/`                                    | load benchmarks and the grpc-go and connect-go baselines                                                                                                |
 | `testdata/`                                 | wire, QMux, and zstd golden vectors shared by the runtimes                                                                                              |
@@ -103,9 +104,12 @@ rebar3 dialyzer
 erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
 ```
 
-the same in `trevrpc-erlang/protoc-gen-trevrpc-erlang/` and `trevrpc-erlang/protoc-gen-trevrpc-gleam/`, whose
-tests also need `protoc`. The Gleam plugin's fixture, `test/gleam/test.sh`, generates Gleam code from its protos
-and runs it, and needs `gleam` too (`nix shell nixpkgs#gleam`); the `trevrpc-erlang-protoc-gen-gleam` check runs it.
+the same in `trevrpc-erlang/protoc-gen-trevrpc-erlang/`, `trevrpc-erlang/protoc-gen-trevrpc-gleam/` and
+`trevrpc-erlang/protoc-gen-trevrpc-elixir/`, whose tests also need `protoc`. The Gleam plugin's fixture,
+`test/gleam/test.sh`, generates Gleam code from its protos and runs it, and needs `gleam` too
+(`nix shell nixpkgs#gleam`); the `trevrpc-erlang-protoc-gen-gleam` check runs it. The Elixir plugin's fixture,
+`test/elixir/test.sh`, generates Elixir code and runs an Elixir server and client through it with `mix test`, and
+needs Elixir too (`nix shell nixpkgs#beam29Packages.elixir`); the `trevrpc-erlang-protoc-gen-elixir` check runs it.
 `trevrpc-erlang/gleam-test.sh` generates the Gleam binding's test service and runs its tests, a Gleam server and
 client on loopback; `nix build .#trevrpc-erlang.gleam` runs it, and `nix fmt` formats Gleam with `gleam format`. The Erlang interop
 executable runs on bindings generated from `interop/proto`, kept in `trevrpc-erlang/interop/src/generated`;
@@ -117,8 +121,8 @@ trevrpc-erlang/interop/generate.sh
 
 the Erlang runtime's Hex dependencies are declared in `trevrpc-erlang/gleam.toml` and locked in its `manifest.toml`,
 which Renovate updates. Renovate then runs `nix run .#sync-erlang-deps`, which copies them into rebar3's files:
-`rebar.config`, `rebar.lock`, the interop executable's `rebar.lock`, and `protoc-gen-trevrpc-gleam`'s `gpb`, which
-follows `protoc-gen-trevrpc-erlang`'s. Run it after changing those by hand; the `trevrpc-erlang-deps` check fails
+`rebar.config`, `rebar.lock`, the interop executable's `rebar.lock`, and `protoc-gen-trevrpc-gleam`'s and
+`protoc-gen-trevrpc-elixir`'s `gpb`, which follows `protoc-gen-trevrpc-erlang`'s. Run it after changing those by hand; the `trevrpc-erlang-deps` check fails
 when they drift
 
 with the cross-runtime [interop](interop) suite:

@@ -25,11 +25,7 @@ module_path(Dir, Service) ->
 -spec generate(binary(), trevrpc_gen_descriptor:service(), map()) ->
     {ok, iodata()} | {error, binary()}.
 generate(Source, #{name := Name, methods := Methods}, #{package := Package} = Context) ->
-    Full =
-        case Package of
-            <<>> -> Name;
-            _ -> <<Package/binary, ".", Name/binary>>
-        end,
+    Full = trevrpc_gen_names:qualified(Package, Name),
     maybe
         ok ?= names(Full, Methods),
         Body = [
@@ -119,8 +115,7 @@ method(Full, #{name := Name, input := Input, output := Output} = Method, Context
     {RequestMode, ResponseMode} = trevrpc_gen_service:modes(
         maps:get(descriptor_messages, Context), Method
     ),
-    #{unreliable_requests := UnreliableRequests, unreliable_responses := UnreliableResponses} =
-        Method,
+    Unreliable = trevrpc_gen_service:unreliable(Method),
     [
         "/// `",
         Full,
@@ -154,9 +149,9 @@ method(Full, #{name := Name, input := Input, output := Output} = Method, Context
         ",\n    response_compression: ",
         mode(ResponseMode),
         ",\n    unreliable_requests: ",
-        bool(UnreliableRequests),
+        bool(lists:member(requests, Unreliable)),
         ",\n    unreliable_responses: ",
-        bool(UnreliableResponses),
+        bool(lists:member(responses, Unreliable)),
         ",\n  )\n}\n\n"
     ].
 
@@ -211,10 +206,15 @@ routes(Methods) ->
         "  ]\n}\n\n"
     ].
 
-route(#{client_streaming := false, server_streaming := false}) -> "unary";
-route(#{client_streaming := false, server_streaming := true}) -> "server_streaming";
-route(#{client_streaming := true, server_streaming := false}) -> "client_streaming";
-route(#{client_streaming := true, server_streaming := true}) -> "bidi".
+%% The `trevrpc/server' function that makes a method's route, after its
+%% kind as the Erlang plugin decides it.
+route(Method) ->
+    case trevrpc_gen_service:kind(Method) of
+        unary -> "unary";
+        server_streaming -> "server_streaming";
+        client_streaming -> "client_streaming";
+        bidirectional_streaming -> "bidi"
+    end.
 
 client(#{name := Name, input := Input, output := Output} = Method, Context) ->
     #{type := In} = message(Input, Context),

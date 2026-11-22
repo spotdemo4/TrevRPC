@@ -1,7 +1,7 @@
 %% @doc The Erlang names of protobuf things.
 -module(trevrpc_gen_names).
 
--export([snake/1, atom/1, message_module/2, service_module/3]).
+-export([snake/1, atom/1, qualified/2, check_part/2, message_module/2, service_module/3]).
 
 %% @doc A protobuf identifier in snake case: `SayHello' is `say_hello',
 %% `HTTPRequest' `http_request' and `GetV2' `get_v2'. A capital starts a
@@ -34,12 +34,35 @@ lower(C) -> is_integer(C) andalso C >= $a andalso C =< $z.
 upper(C) -> is_integer(C) andalso C >= $A andalso C =< $Z.
 lower_or_digit(C) -> lower(C) orelse (C >= $0 andalso C =< $9).
 
+%% @doc The full name of `Name' in package `Package': `example.v1.Greeter',
+%% or `Greeter' without a package.
+-spec qualified(binary(), binary()) -> binary().
+qualified(<<>>, Name) -> Name;
+qualified(Package, Name) -> <<Package/binary, ".", Name/binary>>.
+
 %% @doc `Name' as an atom in Erlang source, quoted where it must be (a
 %% reserved word such as `receive', or one that starts with an
 %% underscore).
 -spec atom(binary()) -> iodata().
 atom(Name) ->
     io_lib:write_atom(binary_to_atom(Name, utf8)).
+
+%% @doc Checks `Value', the value of parameter `Name', which goes in the
+%% names of Erlang modules: it must keep them atoms that need no quotes.
+-spec check_part(binary(), binary()) -> ok | {error, binary()}.
+check_part(Name, Value) ->
+    case re:run(Value, <<"^[a-z0-9_]*$">>, [{capture, none}]) of
+        match ->
+            ok;
+        nomatch ->
+            {error, <<
+                "invalid ",
+                Name/binary,
+                " \"",
+                Value/binary,
+                "\": expected lower-case letters, digits and underscores"
+            >>}
+    end.
 
 %% @doc The module of a proto file's messages: the file's base name in
 %% snake case, with `Prefix' before and `Suffix' after; `foo/bar.proto' is

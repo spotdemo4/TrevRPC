@@ -36,6 +36,7 @@ mkGleamPackage (finalAttrs: {
           ./interop
           ./protoc-gen-trevrpc-erlang
           ./protoc-gen-trevrpc-gleam
+          ./protoc-gen-trevrpc-elixir
         ]
       ))
     ];

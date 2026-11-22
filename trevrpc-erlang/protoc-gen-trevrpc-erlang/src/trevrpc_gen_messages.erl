@@ -16,7 +16,7 @@
 %% of its types, so that a Gleam value is gpb's record.
 -module(trevrpc_gen_messages).
 
--export([defs/1, generate/4, gpb_name/1]).
+-export([defs/1, generate/4, generate_files/4, gpb_name/1]).
 
 -export_type([defs/0, format/0]).
 
@@ -99,6 +99,27 @@ generate(File, Module, Defs, Format) ->
         {error, Reason, _Warnings} ->
             {error, iolist_to_binary(gpb_compile:format_error(Reason))}
     end.
+
+%% @doc The files of the message modules of proto files `Files' (see
+%% generate/4), each named `Module(Name)' after its file's name. An error
+%% names the file it is about.
+-spec generate_files(
+    [trevrpc_gen_descriptor:file()], fun((binary()) -> binary()), defs(), format()
+) -> {ok, [{binary(), iodata()}]} | {error, binary()}.
+generate_files(Files, Module, Defs, Format) ->
+    lists:foldl(
+        fun
+            (_File, {error, _} = Error) ->
+                Error;
+            (#{name := Name}, {ok, Acc}) ->
+                case generate(Name, Module(Name), Defs, Format) of
+                    {ok, Generated} -> {ok, Acc ++ Generated};
+                    {error, Message} -> {error, <<Name/binary, ": ", Message/binary>>}
+                end
+        end,
+        {ok, []},
+        Files
+    ).
 
 %% Gives the messages in `Names' their new names where definitions name a
 %% message: their own definitions and entries keyed by them, field types

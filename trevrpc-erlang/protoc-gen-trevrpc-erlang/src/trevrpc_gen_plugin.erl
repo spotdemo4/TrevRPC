@@ -1,10 +1,11 @@
-%% @doc The protoc plugin protocol, which protoc-gen-trevrpc-erlang and
-%% protoc-gen-trevrpc-gleam share: a `CodeGeneratorRequest' on standard
-%% input, and the `CodeGeneratorResponse' with the files a generator makes
-%% of it, or its error, on standard output.
+%% @doc The protoc plugin protocol, which protoc-gen-trevrpc-erlang,
+%% protoc-gen-trevrpc-gleam and protoc-gen-trevrpc-elixir share: a
+%% `CodeGeneratorRequest' on standard input, and the
+%% `CodeGeneratorResponse' with the files a generator makes of it, or its
+%% error, on standard output.
 -module(trevrpc_gen_plugin).
 
--export([main/1, generate/2]).
+-export([main/1, generate/2, options/3]).
 
 -export_type([generator/0]).
 
@@ -44,3 +45,23 @@ generate(Generator, Bin) ->
             {error, Message} -> #{error => Message}
         end,
     trevrpc_gen_descriptor:encode_response(Response).
+
+%% @doc The options of plugin parameter `Parameter', `name=value' pairs
+%% separated by commas (`--NAME_opt=...'): `Defaults' with each pair given
+%% to `Option', in order, which returns the options with the pair's value
+%% or why the pair is invalid. `Option' gets `[Name, Value]', or `[Name]'
+%% for a pair without `='.
+-spec options(binary(), Options, fun(([binary()], Options) -> {ok, Options} | {error, binary()})) ->
+    {ok, Options} | {error, binary()}
+when
+    Options :: map().
+options(Parameter, Defaults, Option) ->
+    Pairs = [P || P <- binary:split(Parameter, <<",">>, [global]), P =/= <<>>],
+    lists:foldl(
+        fun
+            (_Pair, {error, _} = Error) -> Error;
+            (Pair, {ok, Options}) -> Option(binary:split(Pair, <<"=">>), Options)
+        end,
+        {ok, Defaults},
+        Pairs
+    ).

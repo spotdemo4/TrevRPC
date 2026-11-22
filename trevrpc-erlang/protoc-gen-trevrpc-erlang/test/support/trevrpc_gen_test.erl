@@ -1,5 +1,5 @@
-%% Test helpers that protoc-gen-trevrpc-erlang's and
-%% protoc-gen-trevrpc-gleam's tests share: a `CodeGeneratorRequest' built
+%% Test helpers that protoc-gen-trevrpc-erlang's, protoc-gen-trevrpc-gleam's
+%% and protoc-gen-trevrpc-elixir's tests share: a `CodeGeneratorRequest' built
 %% from the descriptors protoc writes, and the files or error of a
 %% response.
 %%

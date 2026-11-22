@@ -10,3 +10,8 @@ rebar3.crashdump
 /protoc-gen-trevrpc-gleam/test/gleam/build/
 /protoc-gen-trevrpc-gleam/test/gleam/src/
 /protoc-gen-trevrpc-gleam/test/gleam/out/
+
+# What protoc-gen-trevrpc-elixir's Elixir test generates and builds.
+/protoc-gen-trevrpc-elixir/test/elixir/_build/
+/protoc-gen-trevrpc-elixir/test/elixir/gen/
+/protoc-gen-trevrpc-elixir/test/elixir/deps/

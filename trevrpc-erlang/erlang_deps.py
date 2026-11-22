@@ -12,8 +12,9 @@ executable use, so they take their Hex dependencies from the Gleam files:
   manifest.toml has and the inner one from the package's tarball;
 - interop/rebar.lock is that lock one level deeper, as the runtime is a
   checkout there, which rebar3 does not lock;
-- protoc-gen-trevrpc-gleam, whose escript carries protoc-gen-trevrpc-erlang's
-  modules, requires and locks gpb as protoc-gen-trevrpc-erlang does.
+- protoc-gen-trevrpc-gleam and protoc-gen-trevrpc-elixir, whose escripts carry
+  protoc-gen-trevrpc-erlang's modules, require and lock gpb as
+  protoc-gen-trevrpc-erlang does.
 
 `sync` rewrites the rebar3 files, downloading the tarballs of the packages
 rebar.lock does not lock yet at their versions. `check` fails, without the
@@ -38,6 +39,9 @@ from typing import Any, NoReturn
 # The dependencies of the Gleam binding that the runtime's modules do not use,
 # which rebar.config leaves out.
 GLEAM_ONLY = {"gleam_stdlib"}
+
+# The protoc plugins that carry protoc-gen-trevrpc-erlang's modules, and so its gpb.
+PLUGINS_ON_ERLANG = ("protoc-gen-trevrpc-gleam", "protoc-gen-trevrpc-elixir")
 
 # {app, "requirement"} or {app, "requirement", {pkg, package}}
 DEPENDENCY = re.compile(r'\{(\w+), "([^"]*)"(?:, \{pkg, (\w+)\})?\}')
@@ -210,13 +214,13 @@ def synced(root: Path, offline: bool) -> dict[Path, str]:
     )
 
     erlang_plugin = root / "protoc-gen-trevrpc-erlang"
-    gleam_plugin = root / "protoc-gen-trevrpc-gleam"
     gpb = GPB.findall((erlang_plugin / "rebar.config").read_text())
-    config = (gleam_plugin / "rebar.config").read_text()
-    if len(gpb) != 1 or len(GPB.findall(config)) != 1:
-        fail("each protoc plugin's rebar.config must require gpb once")
-    files[gleam_plugin / "rebar.config"] = GPB.sub(f'{{gpb, "{gpb[0]}"}}', config)
-    files[gleam_plugin / "rebar.lock"] = (erlang_plugin / "rebar.lock").read_text()
+    for plugin in PLUGINS_ON_ERLANG:
+        config = (root / plugin / "rebar.config").read_text()
+        if len(gpb) != 1 or len(GPB.findall(config)) != 1:
+            fail("each protoc plugin's rebar.config must require gpb once")
+        files[root / plugin / "rebar.config"] = GPB.sub(f'{{gpb, "{gpb[0]}"}}', config)
+        files[root / plugin / "rebar.lock"] = (erlang_plugin / "rebar.lock").read_text()
     return files
 
 

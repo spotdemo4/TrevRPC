@@ -1,0 +1,52 @@
+// The service the Elixir fixture serves and calls through the generated module.
+syntax = "proto3";
+
+package fixture.v1;
+
+import "google/protobuf/timestamp.proto";
+import "trevrpc/options.proto";
+
+message HelloRequest {
+  string name = 1;
+  int32 count = 2;
+  // Fails the call with this message, as INVALID_ARGUMENT.
+  optional string fail = 3;
+  google.protobuf.Timestamp at = 4;
+  oneof choice {
+    string text = 5;
+    int64 id = 6;
+  }
+}
+
+message HelloReply {
+  string message = 1;
+  int32 index = 2;
+}
+
+service Greeter {
+  rpc SayHello(HelloRequest) returns (HelloReply);
+  // `count` replies.
+  rpc Countdown(HelloRequest) returns (stream HelloReply);
+  // The names, joined.
+  rpc Collect(stream HelloRequest) returns (HelloReply);
+  // A reply per request.
+  rpc Chat(stream HelloRequest) returns (stream HelloReply);
+  // A reply per request, whose messages may travel as datagrams; the
+  // trailers say how many requests arrived, and how many as datagrams.
+  rpc Telemetry(stream HelloRequest) returns (stream HelloReply) {
+    option (trevrpc.method) = {
+      unreliable_requests: true
+      unreliable_responses: true
+    };
+  }
+  // A reply per request, the stream compressed; the trailers say how many
+  // requests arrived compressed with the stream's context.
+  rpc Compressed(stream HelloRequest) returns (stream HelloReply) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+  // Names Elixir reserves, or that the generated module uses itself.
+  rpc End(HelloRequest) returns (HelloReply);
+  rpc Receive(HelloRequest) returns (HelloReply);
+  rpc Channel(HelloRequest) returns (HelloReply);
+  rpc Options(stream HelloRequest) returns (HelloReply);
+}

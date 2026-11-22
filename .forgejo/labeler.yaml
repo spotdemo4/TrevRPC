@@ -14,6 +14,7 @@ erlang:
           - "**/*.app.src"
           - "**/rebar.config"
           - "**/rebar.lock"
+          - trevrpc-erlang/protoc-gen-trevrpc-elixir/**
 
 gleam:
   - changed-files:

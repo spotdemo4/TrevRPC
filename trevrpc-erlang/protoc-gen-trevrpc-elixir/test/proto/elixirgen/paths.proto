@@ -1,0 +1,15 @@
+// Two services whose Elixir modules differ only in case, which Mix's
+// conventions put in one file.
+syntax = "proto3";
+
+package elixirgen;
+
+message Empty {}
+
+service HTTPServer {
+  rpc Get(Empty) returns (Empty);
+}
+
+service HttpServer {
+  rpc Get(Empty) returns (Empty);
+}

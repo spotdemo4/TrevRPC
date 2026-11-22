@@ -48,7 +48,7 @@ chat(Call) ->
     end.
 ```
 
-The runtime depends on no protobuf library: messages are binaries, unless the route has a `codec` (`#{encode := fun((Message) -> iodata()), decode := fun((binary()) -> Message)}`, see `trevrpc_codec`), with which handlers get and give messages as terms. The code [protoc-gen-trevrpc-erlang](#code-generation) generates sets one on every route and call; Elixir users can pass protox's encoders and decoders. A request the codec cannot decode ends the call with `invalid_argument` (`trevrpc_call:recv/1` returns that status to a streaming handler), and a response it cannot encode ends it with `internal`, which the client sees as an internal server error (`trevrpc_call:send/2` returns that status to the handler). A codec that cannot encode is logged as an error, as it is a bug of this side, and one that cannot decode at debug level, as it is more likely a bad peer; the log has the exception's class, its reason's tag and where it was raised, never the message.
+The runtime depends on no protobuf library: messages are binaries, unless the route has a `codec` (`#{encode := fun((Message) -> iodata()), decode := fun((binary()) -> Message)}`, see `trevrpc_codec`), with which handlers get and give messages as terms. The code [protoc-gen-trevrpc-erlang](#code-generation) and [protoc-gen-trevrpc-elixir](#elixir-code-generation) generate sets one on every route and call; Elixir users can also pass protox's encoders and decoders. A request the codec cannot decode ends the call with `invalid_argument` (`trevrpc_call:recv/1` returns that status to a streaming handler), and a response it cannot encode ends it with `internal`, which the client sees as an internal server error (`trevrpc_call:send/2` returns that status to the handler). A codec that cannot encode is logged as an error, as it is a bug of this side, and one that cannot decode at debug level, as it is more likely a bad peer; the log has the exception's class, its reason's tag and where it was raised, never the message.
 
 Unary and server-streaming handlers take `(Request, Call)`, client-streaming and bidirectional ones `(Call)`. They return `{ok, Response}` (single responses), `ok` (streamed responses) or `{error, Status}`, where a status is a map such as `trevrpc_status:new(not_found, <<"missing">>)`, optionally with `metadata` and `details`. `trevrpc_call` reads requests, sends responses, headers and trailers, and gives the call's metadata and deadline.
 
@@ -178,7 +178,70 @@ ok = trevrpc_client:send(Call, #{name => <<"you">>}),
 
 The generated modules need nothing but the runtime. The escript carries gpb, which is LGPL-2.1-or-later; the code gpb generates is not covered by that license.
 
-[`protoc-gen-trevrpc-gleam`](#gleam-code-generation) builds on this plugin to generate Gleam code.
+[`protoc-gen-trevrpc-gleam`](#gleam-code-generation) and [`protoc-gen-trevrpc-elixir`](#elixir-code-generation) build on this plugin to generate Gleam and Elixir code.
+
+## Elixir code generation
+
+`protoc-gen-trevrpc-elixir` ([`protoc-gen-trevrpc-elixir/`](protoc-gen-trevrpc-elixir)) is a protoc plugin for Elixir projects, which call the runtime's Erlang modules (`:trevrpc_server`, `:trevrpc_channel`, `:trevrpc_client`, `:trevrpc_call`) directly. For every proto file it generates gpb's module, as [protoc-gen-trevrpc-erlang](#code-generation) does with `msg_format=maps`, and for every service an Elixir module with its behaviour, its routes and a client function per method. The `trevrpc-erlang` Nix package provides it, or build it with `rebar3 escriptize` in its directory (the escript is `_build/default/bin/protoc-gen-trevrpc-elixir`). Like the Gleam plugin, it carries protoc-gen-trevrpc-erlang's modules, from `_checkouts`, and gpb, which is LGPL-2.1-or-later; the code gpb generates is not covered by that license. The generated code is laid out for reading, not as `mix format` would lay it out, so it goes in a directory of its own, `gen/`, which the formatter's default inputs (`{config,lib,test}/**/*.{ex,exs}`) leave out, and which Mix compiles both Elixir and Erlang from:
+
+```sh
+protoc --plugin=protoc-gen-trevrpc-elixir=path/to/protoc-gen-trevrpc-elixir \
+    -I proto -I path/to/TrevRPC/proto --trevrpc-elixir_out=gen example/greeter/v1/greeter.proto
+```
+
+```elixir
+# mix.exs
+def project do
+  [
+    ...,
+    elixirc_paths: ["lib", "gen"],
+    erlc_paths: ["src", "gen"],
+    deps: [{:trevrpc, "~> 1.12"}]
+  ]
+end
+```
+
+For service `example.greeter.v1.Greeter` in `greeter.proto`, it writes `greeter_pb.erl`, at the root of the output directory as Erlang modules share one namespace, and `example/greeter/v1/greeter.ex`, the module `Example.Greeter.V1.Greeter`:
+
+```elixir
+defmodule Greeter do
+  @behaviour Example.Greeter.V1.Greeter
+
+  @impl true
+  def say_hello(%{name: name}, _call), do: {:ok, %{message: "hello " <> name}}
+
+  @impl true
+  def chat(call) do
+    case :trevrpc_call.recv(call) do
+      {:ok, %{name: name}} ->
+        :ok = :trevrpc_call.send(call, %{message: "hello " <> name})
+        chat(call)
+
+      :eof ->
+        :ok
+
+      {:error, status} ->
+        {:error, status}
+    end
+  end
+end
+
+{:ok, server} =
+  :trevrpc_server.start_link(%{..., routes: Example.Greeter.V1.Greeter.routes(Greeter)})
+
+{:ok, %{message: message}, _} = Example.Greeter.V1.Greeter.say_hello(channel, %{name: "you"})
+{:ok, call} = Example.Greeter.V1.Greeter.chat(channel, %{timeout: 5000})
+:ok = :trevrpc_client.send(call, %{name: "you"})
+{:ok, %{message: reply}} = :trevrpc_client.recv(call)
+```
+
+- The module is named after the service's package and name, each part camelized (`foo_bar` is `FooBar`), at the path Mix's conventions give it. A method is a callback and a client function named in snake case, as in Erlang. Client functions take the channel, then the request unless the client streams, then optional `:trevrpc_client` call options, which win over those of the schema.
+- `routes/1` takes a module that implements the behaviour, or a map of handler funs by method name, as the Erlang plugin's does, and its routes and calls carry the same message types, compression, datagram flags and codec.
+- Messages are gpb's maps with atom keys, with strings as binaries and message names that carry their package (`:"example.greeter.v1.HelloRequest"`); a oneof is `{field, value}` and an unset optional field is left out. The callbacks' and client functions' specs use gpb's types.
+- Parameters (`--trevrpc-elixir_opt=name=value,...`): `module_prefix`, an alias put before every service module (`MyApp.Rpc`), and `pb_prefix` and `pb_suffix` (`_pb`), around the names of gpb's modules. Records are not offered: Elixir would need `Record.extract/2` for them.
+- Methods Elixir reserves the names of are defined through `unquote` (`End` is `unquote(:end)`, called as `Greeter.end(channel, request)`); `When`, which no function can be named, is refused, as are service modules or files two services would share. Editions files are refused.
+
+`protoc-gen-trevrpc-elixir/test/elixir` is a Mix project that runs the generated code: `test/elixir/test.sh` generates it into `gen/` and runs an Elixir server and client through it with `mix test`, taking `trevrpc` from `ERL_LIBS` rather than Hex.
 
 ## Compression
 
@@ -345,7 +408,7 @@ rebar3 xref
 rebar3 dialyzer
 ```
 
-`nix build .#trevrpc-erlang` runs all three. `nix fmt` formats the sources with erlfmt, and the Gleam sources with `gleam format`. The same commands work in `protoc-gen-trevrpc-erlang/` and `protoc-gen-trevrpc-gleam/`, whose tests also need `protoc`, and `nix build .#trevrpc-erlang` runs them too, as it builds the plugins it provides. The interop executable's bindings, in `interop/src/generated`, are regenerated with `interop/generate.sh`, and a check fails when they differ from what the plugin generates.
+`nix build .#trevrpc-erlang` runs all three. `nix fmt` formats the sources with erlfmt, and the Gleam sources with `gleam format`. The same commands work in `protoc-gen-trevrpc-erlang/`, `protoc-gen-trevrpc-gleam/` and `protoc-gen-trevrpc-elixir/`, whose tests also need `protoc`, and `nix build .#trevrpc-erlang` runs them too, as it builds the plugins it provides. The `trevrpc-erlang-protoc-gen-elixir` check runs the Elixir plugin's fixture, which `protoc-gen-trevrpc-elixir/test/elixir/test.sh` runs locally with Elixir on the PATH. The interop executable's bindings, in `interop/src/generated`, are regenerated with `interop/generate.sh`, and a check fails when they differ from what the plugin generates.
 
 ```sh
 ./gleam-test.sh   # gleam-generate.sh, which generates the Gleam tests' service with protoc-gen-trevrpc-gleam, then gleam test
@@ -353,4 +416,4 @@ rebar3 dialyzer
 
 The Gleam tests (`test/trevrpc_test.gleam`) run a Gleam server and client on loopback. `gleam test` builds the plugin in `protoc-gen-trevrpc-gleam/` unless `PROTOC_GEN_TREVRPC_GLEAM` names it, and runs only that module, as rebar3 runs the Erlang tests. The `trevrpc-erlang-gleam` check (`nix build .#trevrpc-erlang.gleam`, from `gleam.nix`) builds the package as `gleam publish` does and runs them offline, and `trevrpc-erlang-protoc-gen-gleam` runs the Gleam plugin's fixture.
 
-rebar3 builds the application from `rebar.config` and `src/trevrpc.app.src`, Gleam from `gleam.toml`, which `gleam publish` turns into the Hex package's metadata and `.app` file. The Hex dependencies are declared in `gleam.toml` and locked in `manifest.toml`, which Renovate's Gleam manager updates; no Renovate manager reads rebar3's files. `nix run .#sync-erlang-deps` (`erlang_deps.py`) copies them into `rebar.config` (the ranges, verbatim, as rebar3 reads Hex's syntax), `rebar.lock` (the locked versions and their checksums, the inner ones from the packages' tarballs), the interop executable's `rebar.lock`, and `protoc-gen-trevrpc-gleam`'s `gpb`, which follows `protoc-gen-trevrpc-erlang`'s. Renovate runs it after updating the Gleam files; after changing a dependency by hand, change `gleam.toml`, run `gleam update` (or `gleam deps download`), then the sync. The Nix package reads versions and tarball hashes from `rebar.lock`, and the `trevrpc-erlang-deps` check fails when rebar3's files drift from the Gleam ones. `python3 -I -m unittest discover -s trevrpc-erlang`, from the repository's root, runs the sync's tests, as the `python-test` check does. `gleam_stdlib` is the one dependency only `gleam.toml` has, and adding or removing one takes both `gleam.toml` and `rebar.config`.
+rebar3 builds the application from `rebar.config` and `src/trevrpc.app.src`, Gleam from `gleam.toml`, which `gleam publish` turns into the Hex package's metadata and `.app` file. The Hex dependencies are declared in `gleam.toml` and locked in `manifest.toml`, which Renovate's Gleam manager updates; no Renovate manager reads rebar3's files. `nix run .#sync-erlang-deps` (`erlang_deps.py`) copies them into `rebar.config` (the ranges, verbatim, as rebar3 reads Hex's syntax), `rebar.lock` (the locked versions and their checksums, the inner ones from the packages' tarballs), the interop executable's `rebar.lock`, and `protoc-gen-trevrpc-gleam`'s and `protoc-gen-trevrpc-elixir`'s `gpb`, which follows `protoc-gen-trevrpc-erlang`'s. Renovate runs it after updating the Gleam files; after changing a dependency by hand, change `gleam.toml`, run `gleam update` (or `gleam deps download`), then the sync. The Nix package reads versions and tarball hashes from `rebar.lock`, and the `trevrpc-erlang-deps` check fails when rebar3's files drift from the Gleam ones. `python3 -I -m unittest discover -s trevrpc-erlang`, from the repository's root, runs the sync's tests, as the `python-test` check does. `gleam_stdlib` is the one dependency only `gleam.toml` has, and adding or removing one takes both `gleam.toml` and `rebar.config`.

@@ -14,8 +14,9 @@
 %% - `pb_suffix': put after the names of message modules (`_pb');
 %% - `service_suffix': put after the names of service modules (none).
 %%
-%% The plugin protocol and the modules protoc-gen-trevrpc-gleam builds on
-%% are shared with it: see {@link trevrpc_gen_plugin}.
+%% The plugin protocol and the modules protoc-gen-trevrpc-gleam and
+%% protoc-gen-trevrpc-elixir build on are shared with them: see
+%% {@link trevrpc_gen_plugin}.
 -module(protoc_gen_trevrpc_erlang).
 
 -export([main/1, generate/1]).
@@ -42,15 +43,7 @@ options(Parameter) ->
     Defaults = #{
         msg_format => maps, prefix => <<>>, pb_suffix => <<"_pb">>, service_suffix => <<>>
     },
-    Pairs = [P || P <- binary:split(Parameter, <<",">>, [global]), P =/= <<>>],
-    lists:foldl(
-        fun
-            (_Pair, {error, _} = Error) -> Error;
-            (Pair, {ok, Options}) -> option(binary:split(Pair, <<"=">>), Options)
-        end,
-        {ok, Defaults},
-        Pairs
-    ).
+    trevrpc_gen_plugin:options(Parameter, Defaults, fun option/2).
 
 option([<<"msg_format">>, <<"maps">>], Options) ->
     {ok, Options#{msg_format := maps}};
@@ -60,50 +53,37 @@ option([<<"msg_format">>, Value], _Options) ->
     {error, <<"invalid msg_format \"", Value/binary, "\": expected maps or records">>};
 option([<<"module_prefix">> = Name, Value], Options) ->
     maybe
-        ok ?= name_part(Name, Value),
+        ok ?= trevrpc_gen_names:check_part(Name, Value),
         {ok, Options#{prefix := Value}}
     end;
 option([<<"pb_suffix">> = Name, Value], Options) ->
     maybe
-        ok ?= name_part(Name, Value),
+        ok ?= trevrpc_gen_names:check_part(Name, Value),
         {ok, Options#{pb_suffix := Value}}
     end;
 option([<<"service_suffix">> = Name, Value], Options) ->
     maybe
-        ok ?= name_part(Name, Value),
+        ok ?= trevrpc_gen_names:check_part(Name, Value),
         {ok, Options#{service_suffix := Value}}
     end;
 option([Name | _], _Options) ->
     {error, <<"unknown trevrpc-erlang option \"", Name/binary, "\"">>}.
 
-%% A part of module names must keep them atoms that need no quotes.
-name_part(Name, Value) ->
-    case re:run(Value, <<"^[a-z0-9_]*$">>, [{capture, none}]) of
-        match ->
-            ok;
-        nomatch ->
-            {error, <<
-                "invalid ",
-                Name/binary,
-                " \"",
-                Value/binary,
-                "\": expected lower-case letters, digits and underscores"
-            >>}
-    end.
-
-files(#{files_to_generate := Names, files := Files, file_set := FileSet}, Options) ->
+files(#{file_set := FileSet} = Request, Options) ->
     #{msg_format := Format} = Options,
-    ByName = maps:from_list([{Name, File} || #{name := Name} = File <- Files]),
-    Messages = maps:from_list([
-        {Name, Message}
-     || #{messages := Ms} <- Files, #{name := Name} = Message <- Ms
-    ]),
-    Generate = [maps:get(Name, ByName) || Name <- Names],
+    {Generate, Messages} = trevrpc_gen_descriptor:to_generate(Request),
     maybe
         ok ?= trevrpc_gen_service:check_files(Generate),
         ok ?= check_modules(Generate, Options),
         {ok, Defs} ?= trevrpc_gen_messages:defs(FileSet),
-        generated(Generate, Defs, Messages, Format, Options, [])
+        {ok, MessageFiles} ?=
+            trevrpc_gen_messages:generate_files(
+                Generate,
+                fun(Name) -> trevrpc_gen_names:message_module(Name, Options) end,
+                Defs,
+                Format
+            ),
+        {ok, MessageFiles ++ service_files(Generate, Messages, Options)}
     end.
 
 %% Every generated module needs a name no other one has.
@@ -114,47 +94,29 @@ check_modules(Files, Options) ->
             | [
                 {
                     trevrpc_gen_names:service_module(Package, Service, Options),
-                    <<"service ", (qualified(Package, Service))/binary>>
+                    <<"service ", (trevrpc_gen_names:qualified(Package, Service))/binary>>
                 }
              || #{name := Service} <- Services
             ]
         ]
      || #{name := Name, package := Package, services := Services} <- Files
     ]),
-    trevrpc_gen_errors:first([
-        {error, <<First/binary, " and ", Second/binary, " both require module ", Module/binary>>}
-     || {Module, First} <- Modules,
-        {M, Second} <- Modules,
-        M =:= Module,
-        First < Second
-    ]).
+    trevrpc_gen_errors:distinct(Modules, <<"module">>).
 
-qualified(<<>>, Name) -> Name;
-qualified(Package, Name) -> <<Package/binary, ".", Name/binary>>.
-
-generated([], _Defs, _Messages, _Format, _Options, Acc) ->
-    {ok, lists:append(lists:reverse(Acc))};
-generated([File | Rest], Defs, Messages, Format, Options, Acc) ->
-    #{name := Name, package := Package, services := Services} = File,
-    MessagesModule = trevrpc_gen_names:message_module(Name, Options),
-    case trevrpc_gen_messages:generate(Name, MessagesModule, Defs, Format) of
-        {ok, MessageFiles} ->
-            ServiceFiles = [
-                begin
-                    Module = trevrpc_gen_names:service_module(Package, ServiceName, Options),
-                    Context = #{
-                        file => File,
-                        service => Service,
-                        module => Module,
-                        messages_module => MessagesModule,
-                        format => Format,
-                        messages => Messages
-                    },
-                    {<<Module/binary, ".erl">>, trevrpc_gen_service:generate(Name, Context)}
-                end
-             || #{name := ServiceName} = Service <- Services
-            ],
-            generated(Rest, Defs, Messages, Format, Options, [MessageFiles ++ ServiceFiles | Acc]);
-        {error, Message} ->
-            {error, <<Name/binary, ": ", Message/binary>>}
-    end.
+service_files(Files, Messages, #{msg_format := Format} = Options) ->
+    [
+        begin
+            Module = trevrpc_gen_names:service_module(Package, ServiceName, Options),
+            Context = #{
+                file => File,
+                service => Service,
+                module => Module,
+                messages_module => trevrpc_gen_names:message_module(Name, Options),
+                format => Format,
+                messages => Messages
+            },
+            {<<Module/binary, ".erl">>, trevrpc_gen_service:generate(Name, Context)}
+        end
+     || #{name := Name, package := Package, services := Services} = File <- Files,
+        #{name := ServiceName} = Service <- Services
+    ].
