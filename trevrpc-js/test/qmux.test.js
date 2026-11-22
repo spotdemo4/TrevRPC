@@ -108,6 +108,7 @@ test("invalid frames and parameters are rejected", async () => {
   const vectors = await goldenVectors();
   const codes = {
     frame_encoding: TransportError.FrameEncodingError,
+    protocol_violation: TransportError.ProtocolViolation,
     transport_parameter: TransportError.TransportParameterError,
   };
   let tested = 0;

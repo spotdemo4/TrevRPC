@@ -47,6 +47,9 @@
 -define(STREAMS_BLOCKED_UNI, 16#17).
 -define(CONNECTION_CLOSE, 16#1c).
 -define(APPLICATION_CLOSE, 16#1d).
+%% RFC 9221 DATAGRAM, without and with a Length field. Never negotiated.
+-define(DATAGRAM, 16#30).
+-define(DATAGRAM_LEN, 16#31).
 %% draft-ietf-quic-qmux-02 codepoints.
 -define(TRANSPORT_PARAMETERS, 16#3f5153300d0a0d0a).
 -define(PING, 16#348c67529ef8c7bd).
@@ -304,6 +307,9 @@ frame(?PING, Bin) ->
     fields(?PING, 1, Bin, fun([Sequence]) -> {ping, Sequence} end);
 frame(?PING_RESPONSE, Bin) ->
     fields(?PING_RESPONSE, 1, Bin, fun([Sequence]) -> {ping_response, Sequence} end);
+frame(Type, _Bin) when Type =:= ?DATAGRAM; Type =:= ?DATAGRAM_LEN ->
+    %% RFC 9221 §3: a DATAGRAM frame without max_datagram_frame_size.
+    {error, {protocol_violation, Type, <<"DATAGRAM frame without max_datagram_frame_size">>}};
 frame(Type, _Bin) ->
     {error,
         {frame_encoding, Type,

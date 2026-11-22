@@ -29,11 +29,13 @@ require (
 	golang.org/x/text v0.44.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
+	trev.zip/llc/trevrpc/trevrpc-go/qmux v1.12.0 // indirect
 )
 
 replace (
 	trev.zip/llc/trevrpc/trevrpc-go => ../../
 	trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc => ../../protovalidatetrevrpc
+	trev.zip/llc/trevrpc/trevrpc-go/qmux => ../../qmux
 )
 
 tool google.golang.org/protobuf/cmd/protoc-gen-go

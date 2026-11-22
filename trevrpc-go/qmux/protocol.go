@@ -1,9 +1,23 @@
-// Package qmux implements the subset of QMux (draft-ietf-quic-qmux) that
-// TrevRPC needs: bidirectional streams with QUIC flow control and stream
-// limits, carried over a reliable byte stream (TLS over TCP) or over
-// WebSocket messages (draft-lcurley-qmux-websocket). Unidirectional streams,
-// datagrams and 0-RTT are not supported; a peer that tries to use them is
-// refused through the transport parameters.
+// Package qmux implements QMux (draft-ietf-quic-qmux): QUIC's streams,
+// flow control, stream limits and datagrams carried over a reliable byte
+// stream such as TLS over TCP, or over WebSocket messages
+// (draft-lcurley-qmux-websocket).
+//
+// A [Session] is opened over a [RecordConn], which frames records: use
+// [NewStreamConn] for a byte stream and [NewMessageConn] for a message
+// transport. Its API follows quic-go's: [Session.OpenStreamSync] and
+// [Session.AcceptStream] for bidirectional streams,
+// [Session.OpenUniStreamSync] and [Session.AcceptUniStream] for
+// unidirectional ones, and [Session.SendDatagram] and
+// [Session.ReceiveDatagram] for datagrams (RFC 9221) when both endpoints
+// advertise max_datagram_frame_size.
+//
+// QMux is not an application protocol and has no ALPN identifier of its own:
+// the application defines one, such as "myapp-qmux-02", and negotiates it
+// with TLS ALPN or as the WebSocket subprotocol before opening the session.
+//
+// Not supported: 0-RTT and the RESET_STREAM_AT extension. A peer may not
+// assume either, since neither is advertised.
 package qmux
 
 import "fmt"
@@ -54,6 +68,8 @@ const (
 	frameTypeStreamsBlockedUni         = 0x17
 	frameTypeConnectionClose           = 0x1c
 	frameTypeApplicationClose          = 0x1d
+	frameTypeDatagram                  = 0x30 // RFC 9221, to the end of the record
+	frameTypeDatagramLen               = 0x31 // RFC 9221, with a Length field
 	streamFlagFin                      = 0x01
 	streamFlagLen                      = 0x02
 	streamFlagOff                      = 0x04
@@ -79,6 +95,7 @@ const (
 	paramActiveConnectionIDLimit         = 0x0e
 	paramInitialSourceConnectionID       = 0x0f
 	paramRetrySourceConnectionID         = 0x10
+	paramMaxDatagramFrameSize            = 0x20 // RFC 9221 §3
 )
 
 // TransportErrorCode is a QUIC transport error code (RFC 9000 §20.1).

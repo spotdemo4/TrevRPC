@@ -16,6 +16,14 @@ in
     '';
   };
 
+  qmux-lint = {
+    src = packages.trevrpc-go-qmux;
+    packages = [ golangci-lint ];
+    script = ''
+      golangci-lint run ./...
+    '';
+  };
+
   otel-lint = {
     src = packages.trevrpc-go-otel;
     packages = [ golangci-lint ];

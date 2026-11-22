@@ -17,7 +17,7 @@ import (
 	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/quic-go/webtransport-go"
 
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/qmux"
+	"trev.zip/llc/trevrpc/trevrpc-go/qmux"
 )
 
 // The library ships native QUIC and QMux clients only. These test-only

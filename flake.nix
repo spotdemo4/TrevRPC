@@ -223,7 +223,7 @@
               gomod2nix.packages.${system}.default
             ];
             script = ''
-              for module in trevrpc-go trevrpc-go/oteltrevrpc trevrpc-go/protovalidatetrevrpc trevrpc-go/cmd/trevrpc-interop bench/baseline; do
+              for module in trevrpc-go trevrpc-go/qmux trevrpc-go/oteltrevrpc trevrpc-go/protovalidatetrevrpc trevrpc-go/cmd/trevrpc-interop bench/baseline; do
                 go -C "$module" mod tidy
                 gomod2nix generate --with-deps --dir "$module"
               done
@@ -296,11 +296,11 @@
             trevrpc-go = pkgs.callPackage ./trevrpc-go {
               inherit
                 wireGolden
-                qmuxGolden
                 zstdGolden
                 trevrpcProto
                 ;
             };
+            trevrpc-go-qmux = pkgs.callPackage ./trevrpc-go/qmux { inherit qmuxGolden; };
             trevrpc-go-otel = pkgs.callPackage ./trevrpc-go/oteltrevrpc { };
             trevrpc-erlang = pkgs.callPackage ./trevrpc-erlang {
               inherit

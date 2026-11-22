@@ -155,6 +155,8 @@ invalid_test_() ->
 
 check_invalid(<<"invalid.frame_encoding.", _/binary>>, Bin) ->
     ?assertMatch({error, {frame_encoding, _, _}}, trevrpc_qmux_frame:decode_frames(Bin));
+check_invalid(<<"invalid.protocol_violation.", _/binary>>, Bin) ->
+    ?assertMatch({error, {protocol_violation, _, _}}, trevrpc_qmux_frame:decode_frames(Bin));
 check_invalid(<<"invalid.transport_parameter.", _/binary>>, Bin) ->
     {ok, [{transport_parameters, Body}]} = trevrpc_qmux_frame:decode_frames(Bin),
     ?assertMatch({error, {transport_parameter, _, _}}, trevrpc_qmux_frame:decode_parameters(Body)).

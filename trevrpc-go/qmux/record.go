@@ -6,8 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-
-	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // RecordConn carries QMux records. ReadRecord is called by one goroutine and
@@ -57,8 +55,13 @@ type streamConn struct {
 }
 
 // NewStreamConn carries records over a reliable byte stream such as a TLS
-// connection. Records larger than maxRecordSize are refused.
+// connection. Records larger than maxRecordSize are refused, so it must be the
+// max_record_size the session advertises: Parameters.MaxRecordSize, or
+// DefaultMaxRecordSize when that is zero, as it is here.
 func NewStreamConn(conn net.Conn, maxRecordSize uint64) RecordConn {
+	if maxRecordSize == 0 {
+		maxRecordSize = DefaultMaxRecordSize
+	}
 	return &streamConn{
 		conn:          conn,
 		reader:        bufio.NewReaderSize(conn, streamConnBufferSize),
@@ -103,12 +106,12 @@ func (c *streamConn) readSize() (uint64, error) {
 		}
 		return 0, err
 	}
-	size, _, err := quicvarint.Parse(c.readHeader[:length])
+	size, _, err := parseVarint(c.readHeader[:length])
 	return size, err
 }
 
 func (c *streamConn) WriteRecord(frames []byte) error {
-	header := quicvarint.Append(c.writeHeader[:0], uint64(len(frames)))
+	header := appendVarint(c.writeHeader[:0], uint64(len(frames)))
 	if _, err := c.writer.Write(header); err != nil {
 		return err
 	}
@@ -150,8 +153,13 @@ type messageConn struct {
 }
 
 // NewMessageConn carries records as messages, as the WebSocket binding does.
-// Messages larger than maxRecordSize are refused.
+// Messages larger than maxRecordSize are refused, so it must be the
+// max_record_size the session advertises: Parameters.MaxRecordSize, or
+// DefaultMaxRecordSize when that is zero, as it is here.
 func NewMessageConn(conn MessageConn, maxRecordSize uint64) RecordConn {
+	if maxRecordSize == 0 {
+		maxRecordSize = DefaultMaxRecordSize
+	}
 	return &messageConn{conn: conn, maxRecordSize: maxRecordSize}
 }
 

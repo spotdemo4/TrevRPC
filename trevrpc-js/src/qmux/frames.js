@@ -17,6 +17,9 @@ export const FrameType = Object.freeze({
   StreamsBlockedUni: 0x17,
   ConnectionClose: 0x1c,
   ApplicationClose: 0x1d,
+  /** RFC 9221 DATAGRAM, without and with a Length field. Never negotiated. */
+  Datagram: 0x30,
+  DatagramLen: 0x31,
   TransportParameters: 0x3f51_5330_0d0a_0d0an,
   Ping: 0x348c_6752_9ef8_c7bdn,
   PingResponse: 0x348c_6752_9ef8_c7ben,
@@ -235,6 +238,14 @@ export class FrameParser {
         const reason = new TextDecoder().decode(this.#take(type, this.#number(type)));
         return { type, code, frameType, reason };
       }
+      case FrameType.Datagram:
+      case FrameType.DatagramLen:
+        // RFC 9221 section 3: a DATAGRAM frame without max_datagram_frame_size.
+        throw new QMuxProtocolError(
+          TransportError.ProtocolViolation,
+          "DATAGRAM frame without max_datagram_frame_size",
+          type,
+        );
       default:
         if (type >= FrameType.Stream && type <= (FrameType.Stream | 0x07)) {
           return this.#stream(type);

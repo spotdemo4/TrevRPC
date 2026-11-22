@@ -99,12 +99,12 @@ func TestEmptyFrameOnReleasedStreamIsIgnored(t *testing.T) {
 
 // checkStreamInvariantsLocked verifies the implicit send and receive state
 // machines of every stream, and the credit accounting that ties them to the
-// session. The caller holds s.mu. initialMaxRemote is the stream limit the
-// session advertised at the start and removedRemote the number of peer streams
-// it saw complete.
-func checkStreamInvariantsLocked(s *Session, streams []*Stream, initialMaxRemote uint64) error {
+// session. The caller holds s.mu. initialMaxRemote holds the stream limits
+// the session advertised at the start, by direction; each peer stream that
+// completes raises its direction's limit by one.
+func checkStreamInvariantsLocked(s *Session, streams []*Stream, initialMaxRemote [2]uint64) error {
 	var unread uint64
-	removedRemote := uint64(0)
+	var removedRemote [2]uint64
 	for _, st := range streams {
 		switch {
 		case st.finSent && st.resetSent:
@@ -133,15 +133,17 @@ func checkStreamInvariantsLocked(s *Session, streams []*Stream, initialMaxRemote
 			return fmt.Errorf("stream %d: inReady but not queued", st.id)
 		}
 		if !s.isLocal(st.id) && st.removed {
-			removedRemote++
+			removedRemote[streamDir(st.id)]++
 		}
 		unread += st.received - st.read
 	}
 	if got := s.connReceived - s.connConsumed; got != unread {
 		return fmt.Errorf("connection credit: received-consumed = %d, but streams hold %d unread bytes", got, unread)
 	}
-	if s.maxRemote != initialMaxRemote+removedRemote {
-		return fmt.Errorf("maxRemote = %d, want %d + %d completed", s.maxRemote, initialMaxRemote, removedRemote)
+	for dir := range s.incoming {
+		if got, want := s.incoming[dir].max, initialMaxRemote[dir]+removedRemote[dir]; got != want {
+			return fmt.Errorf("incoming stream limit (direction %d) = %d, want %d + %d completed", dir, got, initialMaxRemote[dir], removedRemote[dir])
+		}
 	}
 	seen := map[*Stream]bool{}
 	for _, st := range s.ready {
@@ -176,6 +178,7 @@ func TestStreamStateMachineInvariants(t *testing.T) {
 		fail := func(err error) {
 			t.Fatalf("run %d: %v\ntrace:\n%v", run, err, trace)
 		}
+		initialLimits := [2]uint64{testParameters().InitialMaxStreamsBidi, testParameters().InitialMaxStreamsUni}
 		cancelled, cancel := context.WithCancel(context.Background())
 		cancel()
 		// Every stream the session creates for the peer lands in the accept
@@ -185,9 +188,23 @@ func TestStreamStateMachineInvariants(t *testing.T) {
 			for _, st := range session.streams {
 				track(st)
 			}
+			// A peer unidirectional stream may complete with its first frame,
+			// leaving the map before it is ever accepted.
+			for dir := range session.incoming {
+				for _, st := range session.incoming[dir].accept {
+					track(st)
+				}
+			}
 			session.mu.Unlock()
 		}
-		peerIDs := []uint64{1, 5, 9}
+		// Peer bidirectional streams 1, 5 and 9 and unidirectional 3 and 7.
+		peerIDs := []uint64{1, 5, 9, 3, 7}
+		// Whether the peer may send on a stream, and whether it may receive.
+		// Frames for the other direction are mostly skipped, so that runs go on,
+		// but sometimes sent to check that they end the session.
+		peerSends := func(id uint64) bool { return streamDir(id) == dirBidi || id&1 == 1 }
+		peerReceives := func(id uint64) bool { return streamDir(id) == dirBidi || id&1 == 0 }
+		allowed := func(ok bool) bool { return ok || rng.IntN(10) == 0 }
 		steps := func() {
 			for range 40 {
 				// Choose a stream: peer-opened or local.
@@ -196,7 +213,7 @@ func TestStreamStateMachineInvariants(t *testing.T) {
 				if rng.IntN(2) == 0 {
 					id = peerIDs[rng.IntN(len(peerIDs))]
 				} else {
-					id = uint64(rng.IntN(3)) << 2
+					id = uint64(rng.IntN(3))<<2 | uint64(rng.IntN(2))<<1
 				}
 				session.mu.Lock()
 				st = session.streams[id]
@@ -221,7 +238,15 @@ func TestStreamStateMachineInvariants(t *testing.T) {
 						session.mu.Unlock()
 					}
 				}
-				switch op := rng.IntN(11); op {
+				op := rng.IntN(11)
+				switch {
+				case op <= 3 && !allowed(peerSends(id)), (op == 4 || op == 5) && !allowed(peerReceives(id)):
+					op = -1
+				case op >= 6 && op <= 8 && !peerReceives(id), op >= 9 && !peerSends(id):
+					// The local API has no such call for the stream's direction.
+					op = -1
+				}
+				switch op {
 				case 0, 1, 2:
 					offset := received
 					if rng.IntN(10) == 0 {
@@ -293,6 +318,12 @@ func TestStreamStateMachineInvariants(t *testing.T) {
 						track(opened)
 					}
 				}
+				if rng.IntN(5) == 0 {
+					if opened, err := session.OpenUniStream(); err == nil {
+						note("local open id=%d", opened.StreamID())
+						track(opened.st)
+					}
+				}
 				// Let the writer frame pending FINs so that Data Sent is reached.
 				for range 200 {
 					session.mu.Lock()
@@ -308,7 +339,7 @@ func TestStreamStateMachineInvariants(t *testing.T) {
 				}
 				syncTracked()
 				session.mu.Lock()
-				err := checkStreamInvariantsLocked(session, all, testParameters().InitialMaxStreamsBidi)
+				err := checkStreamInvariantsLocked(session, all, initialLimits)
 				session.mu.Unlock()
 				if err != nil {
 					fail(err)
@@ -318,7 +349,7 @@ func TestStreamStateMachineInvariants(t *testing.T) {
 		steps()
 		syncTracked()
 		session.mu.Lock()
-		err := checkStreamInvariantsLocked(session, all, testParameters().InitialMaxStreamsBidi)
+		err := checkStreamInvariantsLocked(session, all, initialLimits)
 		session.mu.Unlock()
 		if err != nil {
 			fail(err)

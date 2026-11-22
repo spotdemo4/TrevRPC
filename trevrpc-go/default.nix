@@ -4,7 +4,6 @@
   protobuf,
   pebble,
   wireGolden,
-  qmuxGolden,
   zstdGolden,
   trevrpcProto,
 }:
@@ -13,12 +12,12 @@ callPackage ./module.nix { } rec {
   version = "1.12.0";
 
   directory = ./.;
-  # The module itself plus the shared files its tests read: the wire, QMux and
-  # compression golden vectors, and the TrevRPC option protos the generated
-  # bindings must match.
+  # The module itself, including the QMux module its go.mod replaces with
+  # ./qmux, plus the shared files its tests read: the wire and compression
+  # golden vectors, and the TrevRPC option protos the generated bindings must
+  # match.
   fileset = lib.fileset.unions [
     wireGolden
-    qmuxGolden
     zstdGolden
     trevrpcProto
     (lib.fileset.difference ./. (

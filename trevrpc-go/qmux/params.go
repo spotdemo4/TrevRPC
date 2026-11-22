@@ -2,12 +2,11 @@ package qmux
 
 import (
 	"time"
-
-	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // Parameters are the transport parameters an endpoint advertises in its
-// QX_TRANSPORT_PARAMETERS frame. Unidirectional streams are never offered.
+// QX_TRANSPORT_PARAMETERS frame. A zero field is left out of the frame, so it
+// takes the protocol default: no credit, no streams and no datagrams.
 type Parameters struct {
 	// MaxIdleTimeout closes a session after this long without a record in
 	// either direction. Zero disables the local timeout.
@@ -20,8 +19,20 @@ type Parameters struct {
 	// InitialMaxStreamDataBidiRemote is the receive window of streams the peer
 	// opens.
 	InitialMaxStreamDataBidiRemote uint64
-	// InitialMaxStreamsBidi is how many bidirectional streams the peer may open.
+	// InitialMaxStreamDataUni is the receive window of unidirectional streams
+	// the peer opens.
+	InitialMaxStreamDataUni uint64
+	// InitialMaxStreamsBidi is how many bidirectional streams the peer may open
+	// at once. The limit rises as they complete.
 	InitialMaxStreamsBidi uint64
+	// InitialMaxStreamsUni is how many unidirectional streams the peer may open
+	// at once. The limit rises as they complete.
+	InitialMaxStreamsUni uint64
+	// MaxDatagramFrameSize is the largest DATAGRAM frame this endpoint accepts,
+	// including its type and length fields (RFC 9221). Zero refuses datagrams.
+	// The frame must also fit in a record, so values above MaxRecordSize act as
+	// MaxRecordSize.
+	MaxDatagramFrameSize uint64
 	// MaxRecordSize is the largest record this endpoint accepts. Zero means
 	// DefaultMaxRecordSize.
 	MaxRecordSize uint64
@@ -42,19 +53,22 @@ func appendTransportParameters(b []byte, version *Version, p Parameters) []byte 
 		if value == 0 {
 			return
 		}
-		body = quicvarint.Append(body, id)
-		body = quicvarint.Append(body, uint64(quicvarint.Len(value)))
-		body = quicvarint.Append(body, value)
+		body = appendVarint(body, id)
+		body = appendVarint(body, uint64(varintLen(value)))
+		body = appendVarint(body, value)
 	}
 	integer(paramMaxIdleTimeout, uint64(p.MaxIdleTimeout/time.Millisecond))
 	integer(paramInitialMaxData, p.InitialMaxData)
 	integer(paramInitialMaxStreamDataBidiLocal, p.InitialMaxStreamDataBidiLocal)
 	integer(paramInitialMaxStreamDataBidiRemote, p.InitialMaxStreamDataBidiRemote)
+	integer(paramInitialMaxStreamDataUni, p.InitialMaxStreamDataUni)
 	integer(paramInitialMaxStreamsBidi, p.InitialMaxStreamsBidi)
+	integer(paramInitialMaxStreamsUni, p.InitialMaxStreamsUni)
+	integer(paramMaxDatagramFrameSize, p.MaxDatagramFrameSize)
 	integer(version.MaxRecordSizeParameter, p.maxRecordSize())
 
-	b = quicvarint.Append(b, version.TransportParametersType)
-	b = quicvarint.Append(b, uint64(len(body)))
+	b = appendVarint(b, version.TransportParametersType)
+	b = appendVarint(b, uint64(len(body)))
 	return append(b, body...)
 }
 
@@ -69,12 +83,12 @@ func decodeParameters(body []byte, version *Version) (Parameters, error) {
 	p := Parameters{MaxRecordSize: DefaultMaxRecordSize}
 	seen := map[uint64]bool{}
 	for len(body) > 0 {
-		id, n, err := quicvarint.Parse(body)
+		id, n, err := parseVarint(body)
 		if err != nil {
 			return p, paramErr("truncated transport parameter ID")
 		}
 		body = body[n:]
-		length, n, err := quicvarint.Parse(body)
+		length, n, err := parseVarint(body)
 		if err != nil || length > uint64(len(body)-n) {
 			return p, paramErr("truncated transport parameter 0x%x", id)
 		}
@@ -100,18 +114,20 @@ func decodeParameters(body []byte, version *Version) (Parameters, error) {
 			field = &p.InitialMaxStreamDataBidiLocal
 		case paramInitialMaxStreamDataBidiRemote:
 			field = &p.InitialMaxStreamDataBidiRemote
+		case paramInitialMaxStreamDataUni:
+			field = &p.InitialMaxStreamDataUni
 		case paramInitialMaxStreamsBidi:
 			field = &p.InitialMaxStreamsBidi
+		case paramInitialMaxStreamsUni:
+			field = &p.InitialMaxStreamsUni
+		case paramMaxDatagramFrameSize:
+			field = &p.MaxDatagramFrameSize
 		case version.MaxRecordSizeParameter:
 			field = &p.MaxRecordSize
-		case paramInitialMaxStreamDataUni, paramInitialMaxStreamsUni:
-			// TrevRPC never opens unidirectional streams, so these do not matter,
-			// but they must still be well formed.
-			field = new(uint64)
 		default:
 			continue
 		}
-		parsed, n, err := quicvarint.Parse(value)
+		parsed, n, err := parseVarint(value)
 		if err != nil || n != len(value) {
 			return p, paramErr("malformed transport parameter 0x%x", id)
 		}
@@ -128,6 +144,9 @@ func decodeParameters(body []byte, version *Version) (Parameters, error) {
 	}
 	if p.InitialMaxStreamsBidi > maxStreamsLimit {
 		return p, paramErr("initial_max_streams_bidi %d exceeds 2^60", p.InitialMaxStreamsBidi)
+	}
+	if p.InitialMaxStreamsUni > maxStreamsLimit {
+		return p, paramErr("initial_max_streams_uni %d exceeds 2^60", p.InitialMaxStreamsUni)
 	}
 	return p, nil
 }

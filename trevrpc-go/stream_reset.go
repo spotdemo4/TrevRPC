@@ -6,7 +6,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/webtransport-go"
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/qmux"
+	"trev.zip/llc/trevrpc/trevrpc-go/qmux"
 )
 
 // resetByPeer reports whether err is the reset of a stream by the peer, over

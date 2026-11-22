@@ -71,4 +71,13 @@ var (
 	// ErrConnectionLost reports that the underlying transport failed or ended
 	// without a CONNECTION_CLOSE.
 	ErrConnectionLost = errors.New("QMux connection lost")
+	// ErrStreamLimitReached reports that OpenStream or OpenUniStream found the
+	// peer's stream limit used up.
+	ErrStreamLimitReached = errors.New("QMux stream limit reached")
+	// ErrDatagramsDisabled reports that the peer did not advertise
+	// max_datagram_frame_size, so it accepts no datagrams.
+	ErrDatagramsDisabled = errors.New("QMux peer does not accept datagrams")
+	// ErrDatagramTooLarge reports a datagram that does not fit in one DATAGRAM
+	// frame the peer accepts.
+	ErrDatagramTooLarge = errors.New("QMux datagram too large")
 )

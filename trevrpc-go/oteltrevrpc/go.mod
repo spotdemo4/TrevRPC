@@ -30,6 +30,10 @@ require (
 	golang.org/x/net v0.63.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
+	trev.zip/llc/trevrpc/trevrpc-go/qmux v1.12.0 // indirect
 )
 
-replace trev.zip/llc/trevrpc/trevrpc-go => ../
+replace (
+	trev.zip/llc/trevrpc/trevrpc-go => ../
+	trev.zip/llc/trevrpc/trevrpc-go/qmux => ../qmux
+)

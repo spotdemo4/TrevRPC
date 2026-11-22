@@ -1,6 +1,7 @@
 package qmux
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,12 +25,13 @@ const (
 const (
 	defaultStreamSendBuffer = 64 << 10
 	defaultCloseTimeout     = time.Second
-	// maxSendRecordSize bounds the records this endpoint builds, whatever the
-	// peer accepts.
-	maxSendRecordSize = 64 << 10
+	defaultSendRecordSize   = 64 << 10
 	// streamQuantum is how much one stream may send before the others get a
 	// turn.
 	streamQuantum = 16 << 10
+	// datagramQueueLen bounds the datagrams queued in each direction. Past it,
+	// new datagrams are dropped, as RFC 9221 lets both ends do.
+	datagramQueueLen = 128
 )
 
 // Config configures a session.
@@ -44,6 +46,12 @@ type Config struct {
 	// StreamSendBuffer bounds the bytes Write buffers per stream before it
 	// blocks. It defaults to 64 KiB.
 	StreamSendBuffer int
+	// MaxSendRecordSize bounds the records this endpoint builds, below the
+	// peer's max_record_size. Larger records cost fewer headers and writes;
+	// smaller ones let other streams in sooner. It defaults to 64 KiB, and
+	// smaller values are raised to DefaultMaxRecordSize, which every peer
+	// accepts.
+	MaxSendRecordSize int
 	// CloseTimeout bounds how long a closing session waits for the peer to end
 	// the connection. It defaults to one second.
 	CloseTimeout time.Duration
@@ -63,13 +71,43 @@ const (
 	modeAbort
 )
 
-// Session is a QMux connection carrying bidirectional streams.
+// Stream directions, the second bit of a stream ID, which index the
+// per-direction stream state.
+const (
+	dirBidi = 0
+	dirUni  = 1
+)
+
+func streamDir(id uint64) int { return int(id>>1) & 1 }
+
+// outgoingStreams counts the streams of one direction that this endpoint
+// opens.
+type outgoingStreams struct {
+	opened uint64
+	// max is the peer's stream limit.
+	max    uint64
+	notify notifier
+}
+
+// incomingStreams counts the streams of one direction that the peer opens.
+type incomingStreams struct {
+	opened uint64
+	// max is the stream limit advertised to the peer, and sendMax whether it
+	// rose since the last MAX_STREAMS.
+	max     uint64
+	sendMax bool
+	accept  []*Stream
+	notify  notifier
+}
+
+// Session is a QMux connection carrying streams and datagrams.
 type Session struct {
-	conn      RecordConn
-	role      Role
-	version   *Version
-	local     Parameters
-	keepAlive time.Duration
+	conn       RecordConn
+	role       Role
+	version    *Version
+	local      Parameters
+	keepAlive  time.Duration
+	recordSize int
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -93,17 +131,10 @@ type Session struct {
 	mode       closeMode
 	closeFrame []byte
 
-	streams map[uint64]*Stream
-	// Streams this endpoint opened and may open.
-	openedLocal uint64
-	maxLocal    uint64
-	openNotify  notifier
-	// Streams the peer opened and may open.
-	openedRemote   uint64
-	maxRemote      uint64
-	sendMaxStreams bool
-	acceptQueue    []*Stream
-	acceptNotify   notifier
+	streams  map[uint64]*Stream
+	outgoing [2]outgoingStreams
+	incoming [2]incomingStreams
+
 	connSendMax    uint64
 	connSent       uint64
 	connRecvMax    uint64
@@ -113,6 +144,14 @@ type Session struct {
 	sendMaxData    bool
 	control        [][]byte
 	ready          []*Stream
+	// datagramsOut holds encoded DATAGRAM frames to send, datagramsIn received
+	// payloads.
+	datagramsOut   [][]byte
+	datagramsIn    [][]byte
+	datagramNotify notifier
+	// streamsFirst puts stream data before datagrams in the next record that
+	// has both to send.
+	streamsFirst   bool
 	pingSent       uint64
 	pingReceived   uint64 // the highest QX_PING request sequence, once receivedPing
 	receivedPing   bool
@@ -139,6 +178,18 @@ func Open(ctx context.Context, conn RecordConn, role Role, config Config) (*Sess
 }
 
 func newSession(conn RecordConn, role Role, config Config) *Session {
+	s := newSessionState(conn, role, config)
+	// The transport parameters must be the first frame on the wire.
+	s.control = append(s.control, appendTransportParameters(nil, s.version, s.local))
+	s.wakeWriter()
+	go s.readLoop()
+	go s.writeLoop()
+	return s
+}
+
+// newSessionState returns a session that has neither sent nor received
+// anything yet, with no goroutines running.
+func newSessionState(conn RecordConn, role Role, config Config) *Session {
 	version := config.Version
 	if version == nil {
 		version = &Draft02
@@ -147,6 +198,11 @@ func newSession(conn RecordConn, role Role, config Config) *Session {
 	if sendBuffer <= 0 {
 		sendBuffer = defaultStreamSendBuffer
 	}
+	recordSize := config.MaxSendRecordSize
+	if recordSize <= 0 {
+		recordSize = defaultSendRecordSize
+	}
+	recordSize = max(recordSize, DefaultMaxRecordSize)
 	closeWait := config.CloseTimeout
 	if closeWait <= 0 {
 		closeWait = defaultCloseTimeout
@@ -158,6 +214,7 @@ func newSession(conn RecordConn, role Role, config Config) *Session {
 		version:        version,
 		local:          config.Parameters,
 		keepAlive:      config.KeepAlivePeriod,
+		recordSize:     recordSize,
 		ctx:            ctx,
 		cancel:         cancel,
 		handshakeDone:  make(chan struct{}),
@@ -167,19 +224,15 @@ func newSession(conn RecordConn, role Role, config Config) *Session {
 		sendBuffer:     sendBuffer,
 		closeWait:      closeWait,
 		streams:        map[uint64]*Stream{},
-		maxRemote:      config.Parameters.InitialMaxStreamsBidi,
 		connRecvMax:    config.Parameters.InitialMaxData,
 		connRecvWindow: config.Parameters.InitialMaxData,
 		peer:           Parameters{MaxRecordSize: DefaultMaxRecordSize},
 	}
+	s.incoming[dirBidi].max = config.Parameters.InitialMaxStreamsBidi
+	s.incoming[dirUni].max = config.Parameters.InitialMaxStreamsUni
 	now := time.Now().UnixNano()
 	s.lastReceived.Store(now)
 	s.lastSent.Store(now)
-	// The transport parameters must be the first frame on the wire.
-	s.control = append(s.control, appendTransportParameters(nil, version, s.local))
-	s.wakeWriter()
-	go s.readLoop()
-	go s.writeLoop()
 	return s
 }
 
@@ -190,22 +243,44 @@ func (s *Session) Context() context.Context { return s.ctx }
 func (s *Session) Done() <-chan struct{} { return s.writerDone }
 
 // CloseWithError closes the session with an application error code and
-// message. Data already written to streams is sent first when flow control
-// allows.
+// message, of which the peer receives the first 256 bytes. Data already
+// written to streams is sent first when flow control allows; queued datagrams
+// are dropped.
 func (s *Session) CloseWithError(code uint64, message string) error {
 	err := &ApplicationError{ErrorCode: code, ErrorMessage: message}
 	s.closeWith(err, func(b []byte) []byte { return appendConnectionClose(b, nil, code, message) }, modeClose)
 	return nil
 }
 
-// AcceptStream returns the next stream opened by the peer.
+// PeerParameters returns the transport parameters the peer advertised.
+func (s *Session) PeerParameters() Parameters {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peer
+}
+
+// AcceptStream returns the next bidirectional stream opened by the peer.
 func (s *Session) AcceptStream(ctx context.Context) (*Stream, error) {
+	return s.accept(ctx, dirBidi)
+}
+
+// AcceptUniStream returns the next unidirectional stream opened by the peer.
+func (s *Session) AcceptUniStream(ctx context.Context) (*ReceiveStream, error) {
+	stream, err := s.accept(ctx, dirUni)
+	if err != nil {
+		return nil, err
+	}
+	return &ReceiveStream{stream}, nil
+}
+
+func (s *Session) accept(ctx context.Context, dir int) (*Stream, error) {
+	in := &s.incoming[dir]
 	s.mu.Lock()
 	for {
-		if len(s.acceptQueue) > 0 {
-			stream := s.acceptQueue[0]
-			s.acceptQueue[0] = nil
-			s.acceptQueue = s.acceptQueue[1:]
+		if len(in.accept) > 0 {
+			stream := in.accept[0]
+			in.accept[0] = nil
+			in.accept = in.accept[1:]
 			s.mu.Unlock()
 			return stream, nil
 		}
@@ -214,7 +289,7 @@ func (s *Session) AcceptStream(ctx context.Context) (*Stream, error) {
 			s.mu.Unlock()
 			return nil, err
 		}
-		changed := s.acceptNotify.wait()
+		changed := in.notify.wait()
 		s.mu.Unlock()
 		select {
 		case <-changed:
@@ -225,9 +300,42 @@ func (s *Session) AcceptStream(ctx context.Context) (*Stream, error) {
 	}
 }
 
-// OpenStreamSync opens a stream, waiting until the peer's stream limit allows
-// it.
+// OpenStream opens a bidirectional stream, failing with
+// ErrStreamLimitReached if the peer's stream limit does not allow it now.
+func (s *Session) OpenStream() (*Stream, error) {
+	return s.open(context.Background(), dirBidi, false)
+}
+
+// OpenStreamSync opens a bidirectional stream, waiting until the peer's
+// stream limit allows it.
 func (s *Session) OpenStreamSync(ctx context.Context) (*Stream, error) {
+	return s.open(ctx, dirBidi, true)
+}
+
+// OpenUniStream opens a unidirectional stream, failing with
+// ErrStreamLimitReached if the peer's stream limit does not allow it now.
+func (s *Session) OpenUniStream() (*SendStream, error) {
+	stream, err := s.open(context.Background(), dirUni, false)
+	if err != nil {
+		return nil, err
+	}
+	return &SendStream{stream}, nil
+}
+
+// OpenUniStreamSync opens a unidirectional stream, waiting until the peer's
+// stream limit allows it.
+func (s *Session) OpenUniStreamSync(ctx context.Context) (*SendStream, error) {
+	stream, err := s.open(ctx, dirUni, true)
+	if err != nil {
+		return nil, err
+	}
+	return &SendStream{stream}, nil
+}
+
+// open opens a stream of direction dir. When the peer's limit is used up, it
+// waits for the limit to rise if wait is set, and fails at once otherwise.
+func (s *Session) open(ctx context.Context, dir int, wait bool) (*Stream, error) {
+	out := &s.outgoing[dir]
 	s.mu.Lock()
 	for {
 		if s.closeErr != nil {
@@ -235,15 +343,117 @@ func (s *Session) OpenStreamSync(ctx context.Context) (*Stream, error) {
 			s.mu.Unlock()
 			return nil, err
 		}
-		if s.openedLocal < s.maxLocal {
-			id := s.openedLocal<<2 | uint64(s.role)
-			s.openedLocal++
-			stream := newStream(s, id, s.peer.InitialMaxStreamDataBidiRemote, s.local.InitialMaxStreamDataBidiLocal)
-			s.streams[id] = stream
+		if out.opened < out.max {
+			id := out.opened<<2 | uint64(dir)<<1 | uint64(s.role)
+			out.opened++
+			stream := s.newStreamLocked(id)
 			s.mu.Unlock()
 			return stream, nil
 		}
-		changed := s.openNotify.wait()
+		if !wait {
+			s.mu.Unlock()
+			return nil, ErrStreamLimitReached
+		}
+		changed := out.notify.wait()
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		s.mu.Lock()
+	}
+}
+
+// newStreamLocked creates and registers the stream id with the windows its
+// initiator and direction call for. The direction a unidirectional stream
+// does not use starts out ended.
+func (s *Session) newStreamLocked(id uint64) *Stream {
+	var sendMax, recvWindow uint64
+	switch {
+	case streamDir(id) == dirUni && s.isLocal(id):
+		sendMax = s.peer.InitialMaxStreamDataUni
+	case streamDir(id) == dirUni:
+		recvWindow = s.local.InitialMaxStreamDataUni
+	case s.isLocal(id):
+		sendMax, recvWindow = s.peer.InitialMaxStreamDataBidiRemote, s.local.InitialMaxStreamDataBidiLocal
+	default:
+		sendMax, recvWindow = s.peer.InitialMaxStreamDataBidiLocal, s.local.InitialMaxStreamDataBidiRemote
+	}
+	stream := newStream(s, id, sendMax, recvWindow)
+	if streamDir(id) == dirUni {
+		if s.isLocal(id) {
+			stream.finalKnown, stream.finReceived = true, true
+		} else {
+			stream.finSent, stream.writeErr = true, errReceiveOnly
+			stream.cancel()
+		}
+	}
+	s.streams[id] = stream
+	return stream
+}
+
+// SendDatagram queues data to be sent in a DATAGRAM frame (RFC 9221). The
+// peer must have advertised max_datagram_frame_size, or it fails with
+// ErrDatagramsDisabled, and data must fit in one frame and one record, or it
+// fails with ErrDatagramTooLarge; see MaxDatagramSize. Like a datagram over
+// QUIC, it may be dropped: when too many datagrams wait to be sent, or when
+// the peer has too many waiting to be received. It does not retain data.
+func (s *Session) SendDatagram(data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeErr != nil {
+		return s.closeErr
+	}
+	limit := s.maxDatagramSizeLocked()
+	if limit < 0 {
+		return ErrDatagramsDisabled
+	}
+	if len(data) > limit {
+		return fmt.Errorf("%w: %d bytes, at most %d", ErrDatagramTooLarge, len(data), limit)
+	}
+	if len(s.datagramsOut) >= datagramQueueLen {
+		return nil
+	}
+	s.datagramsOut = append(s.datagramsOut, appendDatagram(nil, data))
+	s.wakeWriter()
+	return nil
+}
+
+// MaxDatagramSize returns the largest payload SendDatagram accepts, or -1 if
+// the peer does not accept datagrams.
+func (s *Session) MaxDatagramSize() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxDatagramSizeLocked()
+}
+
+func (s *Session) maxDatagramSizeLocked() int {
+	if s.peer.MaxDatagramFrameSize == 0 {
+		return -1
+	}
+	frameSize := min(s.peer.MaxDatagramFrameSize, uint64(s.sendRecordLimitLocked()))
+	return maxDatagramPayload(int(frameSize))
+}
+
+// ReceiveDatagram returns the payload of the next DATAGRAM frame. Datagrams
+// that arrive while too many wait to be received are dropped.
+func (s *Session) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	s.mu.Lock()
+	for {
+		if len(s.datagramsIn) > 0 {
+			data := s.datagramsIn[0]
+			s.datagramsIn[0] = nil
+			s.datagramsIn = s.datagramsIn[1:]
+			s.mu.Unlock()
+			return data, nil
+		}
+		if s.closeErr != nil {
+			err := s.closeErr
+			s.mu.Unlock()
+			return nil, err
+		}
+		changed := s.datagramNotify.wait()
 		s.mu.Unlock()
 		select {
 		case <-changed:
@@ -268,8 +478,12 @@ func (s *Session) closeWith(err error, frame func([]byte) []byte, mode closeMode
 		s.closeFrame = frame(nil)
 	}
 	s.cancel(err)
-	s.acceptNotify.notify()
-	s.openNotify.notify()
+	for dir := range s.incoming {
+		s.incoming[dir].notify.notify()
+		s.outgoing[dir].notify.notify()
+	}
+	s.datagramNotify.notify()
+	s.datagramsOut = nil
 	for _, stream := range s.streams {
 		stream.readNotify.notify()
 		stream.writeNotify.notify()
@@ -283,13 +497,7 @@ func (s *Session) closeWith(err error, frame func([]byte) []byte, mode closeMode
 
 // fail closes the session after a local protocol error.
 func (s *Session) fail(err *TransportError) {
-	s.closeWith(err, func(b []byte) []byte {
-		reason := err.ErrorMessage
-		if len(reason) > 256 {
-			reason = reason[:256]
-		}
-		return appendConnectionClose(b, err, 0, reason)
-	}, modeClose)
+	s.closeWith(err, func(b []byte) []byte { return appendConnectionClose(b, err, 0, err.ErrorMessage) }, modeClose)
 }
 
 func (s *Session) wakeWriter() {
@@ -372,6 +580,8 @@ func (s *Session) handleFrameLocked(f *frame) *TransportError {
 		return nil
 	case f.typ >= frameTypeStream && f.typ <= frameTypeStream|0x07:
 		return s.handleStreamLocked(f)
+	case f.typ == frameTypeDatagram, f.typ == frameTypeDatagramLen:
+		return s.handleDatagramLocked(f)
 	case f.typ == frameTypeResetStream:
 		return s.handleResetStreamLocked(f)
 	case f.typ == frameTypeStopSending:
@@ -388,9 +598,10 @@ func (s *Session) handleFrameLocked(f *frame) *TransportError {
 		if f.maximum > maxStreamsLimit {
 			return protocolError(FrameEncodingError, f.typ, "MAX_STREAMS %d exceeds 2^60", f.maximum)
 		}
-		if f.typ == frameTypeMaxStreamsBidi && f.maximum > s.maxLocal {
-			s.maxLocal = f.maximum
-			s.openNotify.notify()
+		out := &s.outgoing[int(f.typ-frameTypeMaxStreamsBidi)]
+		if f.maximum > out.max {
+			out.max = f.maximum
+			out.notify.notify()
 		}
 		return nil
 	case f.typ == frameTypeStreamsBlockedBidi, f.typ == frameTypeStreamsBlockedUni:
@@ -401,7 +612,7 @@ func (s *Session) handleFrameLocked(f *frame) *TransportError {
 	case f.typ == frameTypeDataBlocked:
 		return nil
 	case f.typ == frameTypeStreamDataBlocked:
-		_, err := s.streamLocked(f.streamID, f.typ)
+		_, err := s.receivingStreamLocked(f.streamID, f.typ)
 		return err
 	case f.typ == frameTypeConnectionClose, f.typ == frameTypeApplicationClose:
 		s.handleConnectionCloseLocked(f)
@@ -439,7 +650,8 @@ func (s *Session) handleParametersLocked(f *frame) *TransportError {
 	}
 	s.paramsReceived = true
 	s.peer = peer
-	s.maxLocal = peer.InitialMaxStreamsBidi
+	s.outgoing[dirBidi].max = peer.InitialMaxStreamsBidi
+	s.outgoing[dirUni].max = peer.InitialMaxStreamsUni
 	s.connSendMax = peer.InitialMaxData
 	s.idleTimeout = s.local.MaxIdleTimeout
 	if peer.MaxIdleTimeout > 0 && (s.idleTimeout == 0 || peer.MaxIdleTimeout < s.idleTimeout) {
@@ -470,36 +682,50 @@ func (s *Session) isLocal(id uint64) bool { return id&1 == uint64(s.role) }
 // to it. It returns nil for a stream that was opened and has been released.
 func (s *Session) streamLocked(id uint64, frameType uint64) (*Stream, *TransportError) {
 	num := id >> 2
-	if id&2 != 0 {
-		if s.isLocal(id) {
-			return nil, protocolError(StreamStateError, frameType, "unidirectional stream %d was never opened", id)
-		}
-		return nil, protocolError(StreamLimitError, frameType, "unidirectional streams are not allowed")
-	}
+	dir := streamDir(id)
 	if s.isLocal(id) {
-		if num >= s.openedLocal {
+		if num >= s.outgoing[dir].opened {
 			return nil, protocolError(StreamStateError, frameType, "stream %d was never opened", id)
 		}
 		return s.streams[id], nil
 	}
-	if num < s.openedRemote {
+	in := &s.incoming[dir]
+	if num < in.opened {
 		return s.streams[id], nil
 	}
-	if num >= s.maxRemote {
-		return nil, protocolError(StreamLimitError, frameType, "stream %d exceeds the stream limit %d", id, s.maxRemote)
+	if num >= in.max {
+		return nil, protocolError(StreamLimitError, frameType, "stream %d exceeds the stream limit %d", id, in.max)
 	}
-	for ; s.openedRemote <= num; s.openedRemote++ {
-		streamID := s.openedRemote<<2 | uint64(1-s.role)
-		stream := newStream(s, streamID, s.peer.InitialMaxStreamDataBidiLocal, s.local.InitialMaxStreamDataBidiRemote)
-		s.streams[streamID] = stream
-		s.acceptQueue = append(s.acceptQueue, stream)
+	for ; in.opened <= num; in.opened++ {
+		streamID := in.opened<<2 | uint64(dir)<<1 | uint64(1-s.role)
+		in.accept = append(in.accept, s.newStreamLocked(streamID))
 	}
-	s.acceptNotify.notify()
+	in.notify.notify()
 	return s.streams[id], nil
 }
 
+// receivingStreamLocked is streamLocked for a frame only the sending side of
+// a stream sends, which must not name a unidirectional stream this endpoint
+// opened.
+func (s *Session) receivingStreamLocked(id uint64, frameType uint64) (*Stream, *TransportError) {
+	if streamDir(id) == dirUni && s.isLocal(id) {
+		return nil, protocolError(StreamStateError, frameType, "frame 0x%x for send-only stream %d", frameType, id)
+	}
+	return s.streamLocked(id, frameType)
+}
+
+// sendingStreamLocked is streamLocked for a frame only the receiving side of
+// a stream sends, which must not name a unidirectional stream the peer
+// opened.
+func (s *Session) sendingStreamLocked(id uint64, frameType uint64) (*Stream, *TransportError) {
+	if streamDir(id) == dirUni && !s.isLocal(id) {
+		return nil, protocolError(StreamStateError, frameType, "frame 0x%x for receive-only stream %d", frameType, id)
+	}
+	return s.streamLocked(id, frameType)
+}
+
 func (s *Session) handleStreamLocked(f *frame) *TransportError {
-	stream, err := s.streamLocked(f.streamID, f.typ)
+	stream, err := s.receivingStreamLocked(f.streamID, f.typ)
 	if err != nil {
 		return err
 	}
@@ -545,7 +771,7 @@ func (s *Session) handleStreamLocked(f *frame) *TransportError {
 }
 
 func (s *Session) handleResetStreamLocked(f *frame) *TransportError {
-	stream, err := s.streamLocked(f.streamID, f.typ)
+	stream, err := s.receivingStreamLocked(f.streamID, f.typ)
 	if err != nil || stream == nil {
 		return err
 	}
@@ -580,7 +806,7 @@ func (s *Session) handleResetStreamLocked(f *frame) *TransportError {
 }
 
 func (s *Session) handleStopSendingLocked(f *frame) *TransportError {
-	stream, err := s.streamLocked(f.streamID, f.typ)
+	stream, err := s.sendingStreamLocked(f.streamID, f.typ)
 	if err != nil || stream == nil {
 		return err
 	}
@@ -592,13 +818,29 @@ func (s *Session) handleStopSendingLocked(f *frame) *TransportError {
 }
 
 func (s *Session) handleMaxStreamDataLocked(f *frame) *TransportError {
-	stream, err := s.streamLocked(f.streamID, f.typ)
+	stream, err := s.sendingStreamLocked(f.streamID, f.typ)
 	if err != nil || stream == nil {
 		return err
 	}
 	if f.maximum > stream.sendMax {
 		stream.sendMax = f.maximum
 		stream.markReadyLocked()
+	}
+	return nil
+}
+
+// handleDatagramLocked queues a received datagram, or drops it when too many
+// wait to be received.
+func (s *Session) handleDatagramLocked(f *frame) *TransportError {
+	if s.local.MaxDatagramFrameSize == 0 {
+		return protocolError(ProtocolViolation, f.typ, "DATAGRAM frame without max_datagram_frame_size")
+	}
+	if uint64(f.size) > s.local.MaxDatagramFrameSize {
+		return protocolError(ProtocolViolation, f.typ, "DATAGRAM frame of %d bytes exceeds max_datagram_frame_size %d", f.size, s.local.MaxDatagramFrameSize)
+	}
+	if len(s.datagramsIn) < datagramQueueLen {
+		s.datagramsIn = append(s.datagramsIn, bytes.Clone(f.data))
+		s.datagramNotify.notify()
 	}
 	return nil
 }
@@ -618,8 +860,9 @@ func (s *Session) consumedLocked(n uint64) {
 func (s *Session) streamCompletedLocked(stream *Stream) {
 	delete(s.streams, stream.id)
 	if !s.isLocal(stream.id) {
-		s.maxRemote++
-		s.sendMaxStreams = true
+		in := &s.incoming[streamDir(stream.id)]
+		in.max++
+		in.sendMax = true
 		s.wakeWriter()
 	}
 }
@@ -631,7 +874,7 @@ func (s *Session) queueControlLocked(frame []byte) {
 
 func (s *Session) writeLoop() {
 	defer close(s.writerDone)
-	record := make([]byte, 0, maxSendRecordSize)
+	record := make([]byte, 0, s.recordSize)
 	for {
 		select {
 		case <-s.wake:
@@ -684,7 +927,7 @@ func (s *Session) finish(mode closeMode) {
 // the record ran out of space with more to send. A mode other than modeOpen
 // means the session is done sending once these frames are written.
 func (s *Session) buildRecordLocked(b []byte) (frames []byte, full bool, mode closeMode) {
-	limit := min(int(min(s.peer.maxRecordSize(), uint64(maxSendRecordSize))), cap(b))
+	limit := min(s.sendRecordLimitLocked(), cap(b))
 	if s.mode == modeAbort {
 		return nil, false, modeAbort
 	}
@@ -706,7 +949,21 @@ func (s *Session) buildRecordLocked(b []byte) (frames []byte, full bool, mode cl
 		return b, true, modeOpen
 	}
 	b = s.appendFlowControlLocked(b, limit)
-	b, full = s.appendStreamDataLocked(b, limit)
+	// While both wait, datagrams and stream data take turns at the front of
+	// the record, so that neither can crowd the other out.
+	var moreDatagrams, moreStreams bool
+	streamsFirst := s.streamsFirst
+	if len(s.datagramsOut) > 0 && len(s.ready) > 0 {
+		s.streamsFirst = !s.streamsFirst
+	}
+	if streamsFirst {
+		b, moreStreams = s.appendStreamDataLocked(b, limit)
+		b, moreDatagrams = s.appendDatagramsLocked(b, limit)
+	} else {
+		b, moreDatagrams = s.appendDatagramsLocked(b, limit)
+		b, moreStreams = s.appendStreamDataLocked(b, limit)
+	}
+	full = moreDatagrams || moreStreams
 	if full || s.mode == modeOpen {
 		return b, full, modeOpen
 	}
@@ -723,9 +980,11 @@ func (s *Session) appendFlowControlLocked(b []byte, limit int) []byte {
 		b = appendMaxData(b, s.connRecvMax)
 		s.sendMaxData = false
 	}
-	if s.sendMaxStreams && len(b)+maxFrame <= limit {
-		b = appendMaxStreamsBidi(b, s.maxRemote)
-		s.sendMaxStreams = false
+	for dir := range s.incoming {
+		if in := &s.incoming[dir]; in.sendMax && len(b)+maxFrame <= limit {
+			b = appendMaxStreams(b, dir, in.max)
+			in.sendMax = false
+		}
 	}
 	if s.sendPingReply && len(b)+maxFrame+8 <= limit {
 		b = appendPing(b, s.version.PingResponseType, s.pingReceived)
@@ -737,6 +996,27 @@ func (s *Session) appendFlowControlLocked(b []byte, limit int) []byte {
 		s.sendPing = false
 	}
 	return b
+}
+
+// sendRecordLimitLocked is the largest record this endpoint sends.
+func (s *Session) sendRecordLimitLocked() int {
+	return int(min(s.peer.maxRecordSize(), uint64(s.recordSize)))
+}
+
+// appendDatagramsLocked appends queued DATAGRAM frames until the record is
+// full. It reports whether another record has datagrams to send.
+func (s *Session) appendDatagramsLocked(b []byte, limit int) ([]byte, bool) {
+	sent := 0
+	for _, frame := range s.datagramsOut {
+		if len(b)+len(frame) > limit {
+			break
+		}
+		b = append(b, frame...)
+		sent++
+	}
+	clear(s.datagramsOut[:sent])
+	s.datagramsOut = s.datagramsOut[sent:]
+	return b, len(s.datagramsOut) > 0
 }
 
 // appendStreamDataLocked appends STREAM frames for ready streams in turn until

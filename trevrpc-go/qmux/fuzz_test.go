@@ -1,7 +1,6 @@
 package qmux
 
 import (
-	"context"
 	"testing"
 )
 
@@ -15,26 +14,7 @@ func (nopRecordConn) Close() error                { return nil }
 
 // fuzzSession is a server session whose records are fed by the test.
 func fuzzSession() *Session {
-	ctx, cancel := context.WithCancelCause(context.Background())
-	params := testParameters()
-	return &Session{
-		conn:           nopRecordConn{},
-		role:           RoleServer,
-		version:        &Draft02,
-		local:          params,
-		ctx:            ctx,
-		cancel:         cancel,
-		handshakeDone:  make(chan struct{}),
-		wake:           make(chan struct{}, 1),
-		readerDone:     make(chan struct{}),
-		writerDone:     make(chan struct{}),
-		sendBuffer:     defaultStreamSendBuffer,
-		streams:        map[uint64]*Stream{},
-		maxRemote:      params.InitialMaxStreamsBidi,
-		connRecvMax:    params.InitialMaxData,
-		connRecvWindow: params.InitialMaxData,
-		peer:           Parameters{MaxRecordSize: DefaultMaxRecordSize},
-	}
+	return newSessionState(nopRecordConn{}, RoleServer, Config{Parameters: testParameters()})
 }
 
 func FuzzRecord(f *testing.F) {
@@ -44,6 +24,8 @@ func FuzzRecord(f *testing.F) {
 	f.Add(params, appendStopSending(appendMaxStreamData(nil, 0, 10), 0, 1))
 	f.Add(params, appendConnectionClose(nil, nil, 0, "bye"))
 	f.Add(params, appendPing(appendMaxData(nil, 1<<30), Draft02.PingType, 1))
+	f.Add(params, appendResetStream(appendStreamFrame(nil, 2, 0, []byte("uni"), false), 2, 1, 3))
+	f.Add(params, appendMaxStreams(appendDatagram(nil, []byte("datagram")), dirUni, 4))
 	f.Add([]byte{0x02}, []byte{})
 
 	f.Fuzz(func(t *testing.T, first, second []byte) {

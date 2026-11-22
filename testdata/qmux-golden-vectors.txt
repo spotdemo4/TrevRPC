@@ -8,7 +8,8 @@
 # record.*      Size-prefixed records (QMux over TLS).
 # message.*     the same frames as one WebSocket message (no Size).
 # invalid.<error>.*  frames that must be rejected with <error>
-#               (frame_encoding or transport_parameter).
+#               (frame_encoding, protocol_violation or transport_parameter),
+#               by an endpoint that advertised no max_datagram_frame_size.
 
 varint.1byte = 25
 varint.2byte = 7bbd
@@ -52,9 +53,10 @@ invalid.frame_encoding.ack = 0200000000
 invalid.frame_encoding.quic_ping = 01
 invalid.frame_encoding.crypto = 06000000
 invalid.frame_encoding.new_token = 0700
-invalid.frame_encoding.datagram = 3000
 invalid.frame_encoding.truncated_stream = 0b00056869
 invalid.frame_encoding.truncated_varint = 1040
+# DATAGRAM (RFC 9221 §3) without max_datagram_frame_size.
+invalid.protocol_violation.datagram = 3000
 invalid.transport_parameter.original_destination_connection_id = ff5153300d0a0d0a020000
 invalid.transport_parameter.small_max_record_size = ff5153300d0a0d0a0bc571c59429cd08450243e8
 invalid.transport_parameter.duplicate = ff5153300d0a0d0a06040101040102

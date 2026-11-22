@@ -10,7 +10,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/qmux"
+	"trev.zip/llc/trevrpc/trevrpc-go/qmux"
 )
 
 // isWebSocketUpgrade reports whether r asks to open a WebSocket.

@@ -68,6 +68,7 @@ jobs:
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: |
             packages.x86_64-linux.trevrpc-go
+            packages.x86_64-linux.trevrpc-go-qmux
             packages.x86_64-linux.trevrpc-go-otel
             packages.x86_64-linux.trevrpc-go-protovalidate
 

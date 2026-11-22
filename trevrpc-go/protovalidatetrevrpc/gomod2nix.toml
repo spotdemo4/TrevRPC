@@ -83,7 +83,8 @@ cachePackages = [
   'google.golang.org/protobuf/types/known/structpb',
   'google.golang.org/protobuf/types/known/timestamppb',
   'google.golang.org/protobuf/types/known/wrapperspb',
-  'trev.zip/llc/trevrpc/trevrpc-go'
+  'trev.zip/llc/trevrpc/trevrpc-go',
+  'trev.zip/llc/trevrpc/trevrpc-go/qmux'
 ]
 
 [mod]

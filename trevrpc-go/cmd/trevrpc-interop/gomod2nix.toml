@@ -90,6 +90,7 @@ cachePackages = [
   'google.golang.org/protobuf/types/pluginpb',
   'trev.zip/llc/trevrpc/trevrpc-go',
   'trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc',
+  'trev.zip/llc/trevrpc/trevrpc-go/qmux',
   'trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb'
 ]
 

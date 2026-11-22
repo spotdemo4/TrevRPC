@@ -17,7 +17,9 @@ func testParameters() Parameters {
 		InitialMaxData:                 1 << 20,
 		InitialMaxStreamDataBidiLocal:  256 << 10,
 		InitialMaxStreamDataBidiRemote: 256 << 10,
+		InitialMaxStreamDataUni:        256 << 10,
 		InitialMaxStreamsBidi:          16,
+		InitialMaxStreamsUni:           16,
 		MaxRecordSize:                  64 << 10,
 	}
 }
@@ -56,6 +58,14 @@ func tcpPair(t *testing.T) (net.Conn, net.Conn) {
 
 func openPair(t *testing.T, clientConn, serverConn net.Conn, client, server Config) (*Session, *Session) {
 	t.Helper()
+	return openRecordPair(t, NewStreamConn(clientConn, client.Parameters.maxRecordSize()),
+		NewStreamConn(serverConn, server.Parameters.maxRecordSize()), client, server)
+}
+
+// openRecordPair opens a client and a server session over the given record
+// connections, and closes both when the test ends.
+func openRecordPair(t *testing.T, clientConn, serverConn RecordConn, client, server Config) (*Session, *Session) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	var serverSession *Session
@@ -63,9 +73,9 @@ func openPair(t *testing.T, clientConn, serverConn net.Conn, client, server Conf
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serverSession, serverErr = Open(ctx, NewStreamConn(serverConn, server.Parameters.maxRecordSize()), RoleServer, server)
+		serverSession, serverErr = Open(ctx, serverConn, RoleServer, server)
 	}()
-	clientSession, err := Open(ctx, NewStreamConn(clientConn, client.Parameters.maxRecordSize()), RoleClient, client)
+	clientSession, err := Open(ctx, clientConn, RoleClient, client)
 	<-done
 	if err != nil || serverErr != nil {
 		t.Fatalf("open: client %v, server %v", err, serverErr)
@@ -558,5 +568,14 @@ func TestSessionLossFailsPendingOperations(t *testing.T) {
 	case <-reading.Context().Done():
 	case <-time.After(time.Second):
 		t.Error("the stream context outlived the session")
+	}
+}
+
+func TestZeroMaxRecordSizeIsTheDefault(t *testing.T) {
+	if got := NewStreamConn(nil, 0).(*streamConn).maxRecordSize; got != DefaultMaxRecordSize {
+		t.Errorf("NewStreamConn with 0 accepts %d-byte records, want %d", got, DefaultMaxRecordSize)
+	}
+	if got := NewMessageConn(nil, 0).(*messageConn).maxRecordSize; got != DefaultMaxRecordSize {
+		t.Errorf("NewMessageConn with 0 accepts %d-byte records, want %d", got, DefaultMaxRecordSize)
 	}
 }

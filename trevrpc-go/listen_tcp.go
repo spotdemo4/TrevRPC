@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/qmux"
+	"trev.zip/llc/trevrpc/trevrpc-go/qmux"
 )
 
 const (

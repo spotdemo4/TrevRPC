@@ -1,13 +1,11 @@
 package qmux
 
-import (
-	"github.com/quic-go/quic-go/quicvarint"
-)
-
 // frame is one decoded QMux frame. Only the fields of its type are set. data,
 // reason and params alias the record they were parsed from.
 type frame struct {
-	typ       uint64
+	typ uint64
+	// size is the encoded size of the whole frame, set for DATAGRAM frames.
+	size      int
 	streamID  uint64
 	offset    uint64
 	data      []byte
@@ -33,7 +31,7 @@ type frameParser struct {
 func (p *frameParser) more() bool { return p.pos < len(p.buf) }
 
 func (p *frameParser) varint(frameType uint64) (uint64, error) {
-	value, n, err := quicvarint.Parse(p.buf[p.pos:])
+	value, n, err := parseVarint(p.buf[p.pos:])
 	if err != nil {
 		return 0, protocolError(FrameEncodingError, frameType, "truncated frame")
 	}
@@ -50,9 +48,10 @@ func (p *frameParser) bytes(frameType uint64, length uint64) ([]byte, error) {
 	return b, nil
 }
 
-// next decodes the next frame. Frames that QMux forbids, and extensions that
-// TrevRPC never negotiates, are FRAME_ENCODING_ERRORs.
+// next decodes the next frame. Frames that QMux forbids, and extensions it
+// does not implement, are FRAME_ENCODING_ERRORs.
 func (p *frameParser) next() (frame, error) {
+	start := p.pos
 	typ, err := p.varint(0)
 	if err != nil {
 		return frame{}, err
@@ -75,6 +74,16 @@ func (p *frameParser) next() (frame, error) {
 		return p.fields(&f, &f.streamID, &f.maximum)
 	case typ == frameTypeConnectionClose, typ == frameTypeApplicationClose:
 		return p.closeFrame(f)
+	case typ == frameTypeDatagram, typ == frameTypeDatagramLen:
+		length := uint64(len(p.buf) - p.pos)
+		if typ == frameTypeDatagramLen {
+			if length, err = p.varint(typ); err != nil {
+				return f, err
+			}
+		}
+		f.data, err = p.bytes(typ, length)
+		f.size = p.pos - start
+		return f, err
 	case typ == p.version.TransportParametersType:
 		length, err := p.varint(typ)
 		if err != nil {
@@ -120,7 +129,7 @@ func (p *frameParser) streamFrame(f frame) (frame, error) {
 	if f.data, err = p.bytes(f.typ, length); err != nil {
 		return f, err
 	}
-	if f.offset+uint64(len(f.data)) > quicvarint.Max {
+	if f.offset+uint64(len(f.data)) > maxVarint {
 		return f, protocolError(FrameEncodingError, f.typ, "stream data beyond the maximum offset")
 	}
 	f.fin = f.typ&streamFlagFin != 0
@@ -148,9 +157,9 @@ func (p *frameParser) closeFrame(f frame) (frame, error) {
 // streamFrameOverhead is the size of a STREAM frame header carrying length
 // bytes of data at offset.
 func streamFrameOverhead(streamID, offset uint64, length int) int {
-	n := 1 + quicvarint.Len(streamID) + quicvarint.Len(uint64(length))
+	n := 1 + varintLen(streamID) + varintLen(uint64(length))
 	if offset > 0 {
-		n += quicvarint.Len(offset)
+		n += varintLen(offset)
 	}
 	return n
 }
@@ -165,60 +174,95 @@ func appendStreamFrame(b []byte, streamID, offset uint64, data []byte, fin bool)
 	if fin {
 		typ |= streamFlagFin
 	}
-	b = quicvarint.Append(b, typ)
-	b = quicvarint.Append(b, streamID)
+	b = appendVarint(b, typ)
+	b = appendVarint(b, streamID)
 	if offset > 0 {
-		b = quicvarint.Append(b, offset)
+		b = appendVarint(b, offset)
 	}
-	b = quicvarint.Append(b, uint64(len(data)))
+	b = appendVarint(b, uint64(len(data)))
 	return append(b, data...)
 }
 
 func appendResetStream(b []byte, streamID, errorCode, finalSize uint64) []byte {
-	b = quicvarint.Append(b, frameTypeResetStream)
-	b = quicvarint.Append(b, streamID)
-	b = quicvarint.Append(b, errorCode)
-	return quicvarint.Append(b, finalSize)
+	b = appendVarint(b, frameTypeResetStream)
+	b = appendVarint(b, streamID)
+	b = appendVarint(b, errorCode)
+	return appendVarint(b, finalSize)
 }
 
 func appendStopSending(b []byte, streamID, errorCode uint64) []byte {
-	b = quicvarint.Append(b, frameTypeStopSending)
-	b = quicvarint.Append(b, streamID)
-	return quicvarint.Append(b, errorCode)
+	b = appendVarint(b, frameTypeStopSending)
+	b = appendVarint(b, streamID)
+	return appendVarint(b, errorCode)
 }
 
 func appendMaxData(b []byte, maximum uint64) []byte {
-	b = quicvarint.Append(b, frameTypeMaxData)
-	return quicvarint.Append(b, maximum)
+	b = appendVarint(b, frameTypeMaxData)
+	return appendVarint(b, maximum)
 }
 
 func appendMaxStreamData(b []byte, streamID, maximum uint64) []byte {
-	b = quicvarint.Append(b, frameTypeMaxStreamData)
-	b = quicvarint.Append(b, streamID)
-	return quicvarint.Append(b, maximum)
+	b = appendVarint(b, frameTypeMaxStreamData)
+	b = appendVarint(b, streamID)
+	return appendVarint(b, maximum)
 }
 
-func appendMaxStreamsBidi(b []byte, maximum uint64) []byte {
-	b = quicvarint.Append(b, frameTypeMaxStreamsBidi)
-	return quicvarint.Append(b, maximum)
+// appendMaxStreams appends MAX_STREAMS for bidirectional streams (dir
+// dirBidi) or unidirectional ones (dirUni).
+func appendMaxStreams(b []byte, dir int, maximum uint64) []byte {
+	b = appendVarint(b, frameTypeMaxStreamsBidi+uint64(dir))
+	return appendVarint(b, maximum)
 }
+
+// datagramFrameSize is the size of the DATAGRAM frame appendDatagram encodes
+// for a payload of length bytes.
+func datagramFrameSize(length int) int { return 1 + varintLen(uint64(length)) + length }
+
+// maxDatagramPayload is the largest payload whose DATAGRAM frame fits in
+// frameSize bytes, or -1 if none does.
+func maxDatagramPayload(frameSize int) int {
+	if frameSize < datagramFrameSize(0) {
+		return -1
+	}
+	// The length field of frameSize is at least as long as the payload's, so
+	// this payload fits; a shorter length field may leave room for more.
+	n := frameSize - 1 - varintLen(uint64(frameSize))
+	for datagramFrameSize(n+1) <= frameSize {
+		n++
+	}
+	return n
+}
+
+// appendDatagram appends a DATAGRAM frame. It always carries an explicit
+// length so that more frames may follow in the same record.
+func appendDatagram(b []byte, data []byte) []byte {
+	b = appendVarint(b, frameTypeDatagramLen)
+	b = appendVarint(b, uint64(len(data)))
+	return append(b, data...)
+}
+
+// maxReasonLength bounds the reason phrase of a CONNECTION_CLOSE frame, so
+// that the frame always fits in a record.
+const maxReasonLength = 256
 
 // appendConnectionClose appends an application CONNECTION_CLOSE, or a
-// transport one when transportErr is set.
+// transport one when transportErr is set. The reason is cut to
+// maxReasonLength bytes.
 func appendConnectionClose(b []byte, transportErr *TransportError, errorCode uint64, reason string) []byte {
+	reason = reason[:min(len(reason), maxReasonLength)]
 	if transportErr != nil {
-		b = quicvarint.Append(b, frameTypeConnectionClose)
-		b = quicvarint.Append(b, uint64(transportErr.ErrorCode))
-		b = quicvarint.Append(b, transportErr.FrameType)
+		b = appendVarint(b, frameTypeConnectionClose)
+		b = appendVarint(b, uint64(transportErr.ErrorCode))
+		b = appendVarint(b, transportErr.FrameType)
 	} else {
-		b = quicvarint.Append(b, frameTypeApplicationClose)
-		b = quicvarint.Append(b, errorCode)
+		b = appendVarint(b, frameTypeApplicationClose)
+		b = appendVarint(b, errorCode)
 	}
-	b = quicvarint.Append(b, uint64(len(reason)))
+	b = appendVarint(b, uint64(len(reason)))
 	return append(b, reason...)
 }
 
 func appendPing(b []byte, frameType, sequence uint64) []byte {
-	b = quicvarint.Append(b, frameType)
-	return quicvarint.Append(b, sequence)
+	b = appendVarint(b, frameType)
+	return appendVarint(b, sequence)
 }

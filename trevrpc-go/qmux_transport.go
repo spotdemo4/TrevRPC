@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/netip"
 
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/qmux"
+	"trev.zip/llc/trevrpc/trevrpc-go/qmux"
 )
 
 // qmuxMaxRecordSize is the largest QMux record a TrevRPC endpoint accepts.

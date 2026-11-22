@@ -4,18 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
-	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/quic-go/quic-go/quicvarint"
 )
 
 func loadGoldenVectors(t *testing.T) map[string][]byte {
 	t.Helper()
-	data, err := os.ReadFile("../../../testdata/qmux-golden-vectors.txt")
+	data, err := os.ReadFile("../../testdata/qmux-golden-vectors.txt")
 	if err != nil {
 		t.Fatalf("read QMux golden vectors: %v", err)
 	}
@@ -50,8 +47,11 @@ func TestGoldenVarints(t *testing.T) {
 		"varint.4byte": 494878333,
 		"varint.8byte": 151288809941952652,
 	} {
-		if got := quicvarint.Append(nil, value); !bytes.Equal(got, vectors[name]) {
+		if got := appendVarint(nil, value); !bytes.Equal(got, vectors[name]) {
 			t.Errorf("%s encodes as %x, want %x", name, got, vectors[name])
+		}
+		if got, n, err := parseVarint(vectors[name]); err != nil || got != value || n != len(vectors[name]) {
+			t.Errorf("%s decodes as %d, %d, %v", name, got, n, err)
 		}
 	}
 }
@@ -82,7 +82,7 @@ func TestGoldenFrames(t *testing.T) {
 		"frame.stop_sending":          appendStopSending(nil, 0, 1),
 		"frame.max_data":              appendMaxData(nil, 65),
 		"frame.max_stream_data":       appendMaxStreamData(nil, 4, 1028),
-		"frame.max_streams_bidi":      appendMaxStreamsBidi(nil, 65),
+		"frame.max_streams_bidi":      appendMaxStreams(nil, dirBidi, 65),
 		"frame.application_close":     appendConnectionClose(nil, nil, 0, "bye"),
 		"frame.transport_close":       appendConnectionClose(nil, &TransportError{ErrorCode: ProtocolViolation, FrameType: 0x08}, 0, ""),
 		"frame.ping":                  appendPing(nil, Draft02.PingType, 1),
@@ -148,12 +148,17 @@ func TestGoldenRecords(t *testing.T) {
 	}
 }
 
+// TestGoldenInvalid feeds each invalid vector to a server session, after its
+// peer's transport parameters unless the vector is a transport parameters
+// frame itself.
 func TestGoldenInvalid(t *testing.T) {
 	vectors := loadGoldenVectors(t)
 	codes := map[string]TransportErrorCode{
 		"frame_encoding":      FrameEncodingError,
+		"protocol_violation":  ProtocolViolation,
 		"transport_parameter": TransportParameterError,
 	}
+	params := appendTransportParameters(nil, &Draft02, testParameters())
 	tested := 0
 	for name, input := range vectors {
 		rest, ok := strings.CutPrefix(name, "invalid.")
@@ -166,18 +171,17 @@ func TestGoldenInvalid(t *testing.T) {
 			t.Fatalf("%s has unknown error class %q", name, class)
 		}
 		tested++
-		parser := frameParser{buf: input, version: &Draft02}
-		var err error
-		for parser.more() && err == nil {
-			var f frame
-			f, err = parser.next()
-			if err == nil && f.typ == Draft02.TransportParametersType {
-				_, err = decodeParameters(f.params, &Draft02)
+		session := fuzzSession()
+		var err *TransportError
+		if want != TransportParameterError {
+			if err := session.handleRecord(params); err != nil {
+				t.Fatalf("transport parameters: %v", err)
 			}
 		}
-		var transportErr *TransportError
-		if !errors.As(err, &transportErr) || transportErr.ErrorCode != want {
-			t.Errorf("%s decodes with %v, want %s", name, err, want)
+		err = session.handleRecord(input)
+		session.cancel(nil)
+		if err == nil || err.ErrorCode != want {
+			t.Errorf("%s is rejected with %v, want %s", name, err, want)
 		}
 	}
 	if tested == 0 {

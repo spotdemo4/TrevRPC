@@ -12,6 +12,7 @@ require (
 	golang.org/x/net v0.63.0
 	golang.org/x/sys v0.50.0
 	google.golang.org/protobuf v1.36.12
+	trev.zip/llc/trevrpc/trevrpc-go/qmux v1.12.0
 )
 
 require (
@@ -19,5 +20,7 @@ require (
 	github.com/quic-go/qpack v0.6.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 )
+
+replace trev.zip/llc/trevrpc/trevrpc-go/qmux => ./qmux
 
 tool google.golang.org/protobuf/cmd/protoc-gen-go

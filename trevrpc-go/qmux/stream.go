@@ -9,6 +9,10 @@ import (
 
 // Stream is a bidirectional QMux stream. Read and Write may be used
 // concurrently with each other and with the cancel and deadline methods.
+//
+// Unidirectional streams use the same state with the direction they lack
+// ended from the start, and are handed out as a SendStream or a
+// ReceiveStream.
 type Stream struct {
 	id      uint64
 	session *Session
@@ -171,7 +175,7 @@ func (st *Stream) Close() error {
 	s := st.session
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st.finRequested || st.resetSent {
+	if st.finRequested || st.sendDone() {
 		return nil
 	}
 	st.finRequested = true
@@ -182,7 +186,10 @@ func (st *Stream) Close() error {
 	return nil
 }
 
-var errWriteClosed = &closedError{"write on closed stream"}
+var (
+	errWriteClosed = &closedError{"write on closed stream"}
+	errReceiveOnly = &closedError{"write on receive-only stream"}
+)
 
 type closedError struct{ message string }
 
@@ -325,3 +332,45 @@ func (st *Stream) appendReceivedLocked(data []byte) {
 	}
 	st.recvBuf = append(st.recvBuf, data...)
 }
+
+// SendStream is a unidirectional stream this endpoint opened, which only
+// sends. Write may be used concurrently with the other methods.
+type SendStream struct{ st *Stream }
+
+// StreamID returns the QUIC stream ID.
+func (s *SendStream) StreamID() uint64 { return s.st.id }
+
+// Context is cancelled when the stream ends: after Close or CancelWrite, when
+// the peer sends STOP_SENDING, or when the session ends.
+func (s *SendStream) Context() context.Context { return s.st.ctx }
+
+// Write buffers p for sending, blocking while the stream's send buffer is
+// full.
+func (s *SendStream) Write(p []byte) (int, error) { return s.st.Write(p) }
+
+// Close ends the stream with a FIN once buffered data is sent.
+func (s *SendStream) Close() error { return s.st.Close() }
+
+// CancelWrite abandons the stream with RESET_STREAM.
+func (s *SendStream) CancelWrite(code uint64) { s.st.CancelWrite(code) }
+
+// SetWriteDeadline bounds Write. A zero time disables the deadline.
+func (s *SendStream) SetWriteDeadline(t time.Time) error { return s.st.SetWriteDeadline(t) }
+
+// ReceiveStream is a unidirectional stream the peer opened, which only
+// receives. Read may be used concurrently with the other methods.
+type ReceiveStream struct{ st *Stream }
+
+// StreamID returns the QUIC stream ID.
+func (s *ReceiveStream) StreamID() uint64 { return s.st.id }
+
+// Read reads stream data. It returns io.EOF after the peer's FIN, and a
+// *StreamError after a reset or CancelRead.
+func (s *ReceiveStream) Read(p []byte) (int, error) { return s.st.Read(p) }
+
+// CancelRead abandons the stream with STOP_SENDING. Data that still arrives is
+// discarded.
+func (s *ReceiveStream) CancelRead(code uint64) { s.st.CancelRead(code) }
+
+// SetReadDeadline bounds Read. A zero time disables the deadline.
+func (s *ReceiveStream) SetReadDeadline(t time.Time) error { return s.st.SetReadDeadline(t) }
