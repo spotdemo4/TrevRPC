@@ -133,21 +133,10 @@ export class QMuxSession {
   #closedError = null;
   /** Whether the WebSocket opened (with an accepted subprotocol). */
   #open = false;
-  #lastReceived = Date.now();
+  #lastActivity = Date.now();
   #lastSent = Date.now();
-  /**
-   * When the idle timeout counts from: the last record received, or the first one sent after it
-   * (RFC 9000 section 10.1).
-   */
-  #idleSince = Date.now();
-  /**
-   * Whether a record went out since one last came in, whether stream data or a datagram did, and
-   * whether a QX_PING probe did.
-   */
-  #sentSinceReceived = false;
-  #dataSinceReceived = false;
-  #probed = false;
-  #timer;
+  #idleTimer;
+  #keepAliveTimer;
   #handshakeTimer;
   #settleReady;
   #settleClosed;
@@ -378,7 +367,7 @@ export class QMuxSession {
     if (this.#closedError) {
       return;
     }
-    this.#heard();
+    this.#lastActivity = Date.now();
     try {
       if (typeof data === "string") {
         throw new QMuxProtocolError(TransportError.ProtocolViolation, "text message", 0);
@@ -534,73 +523,37 @@ export class QMuxSession {
     this.#peer = decodeTransportParameters(frame.params);
     this.#localMax = [this.#peer.initialMaxStreamsBidi, this.#peer.initialMaxStreamsUni];
     this.#connSendMax = this.#peer.initialMaxData;
-    this.#startTimer();
-    clearTimeout(this.#handshakeTimer);
-    this.#settleReady.resolve();
-  }
-
-  /**
-   * Enforces the idle timeout, the smaller of the two endpoints' (RFC 9000 section 10.1), and
-   * sends keep-alives, at most half of it apart, and liveness probes.
-   */
-  #startTimer() {
+    // The idle timeout is the smaller of the two endpoints' (RFC 9000 section 10.1).
     const idleMs = Math.min(
       this.#params.maxIdleTimeoutMs || Infinity,
       this.#peer.maxIdleTimeoutMs || Infinity,
     );
-    const keepAliveMs =
-      this.#keepAlivePeriodMs > 0 ? Math.min(this.#keepAlivePeriodMs, idleMs / 2) : Infinity;
-    if (idleMs === Infinity && keepAliveMs === Infinity) {
-      return;
+    if (idleMs !== Infinity) {
+      this.#idleTimer = setInterval(
+        () => {
+          if (Date.now() - this.#lastActivity >= idleMs) {
+            this.#finish(sessionError("QMux session idle timeout"), false);
+          }
+        },
+        Math.max(10, idleMs / 4),
+      );
     }
-    this.#timer = setInterval(
-      () => {
-        const now = Date.now();
-        if (now - this.#idleSince >= idleMs) {
-          this.#finish(sessionError("QMux session idle timeout"), false);
-          return;
-        }
-        let ping = now - this.#lastSent >= keepAliveMs;
-        // QMux has no acks, so a session that only sends may hear nothing back for longer than
-        // the idle timeout. The peer must answer a QX_PING, so one sent halfway through the
-        // timeout, while stream data or datagrams this endpoint sent wait for the peer to be
-        // heard from, gets an answer from a live peer and none from a vanished one. Replies
-        // such as flow control updates or ping responses don't count, so a session idle both
-        // ways sends no probe.
-        if (this.#dataSinceReceived && !this.#probed && now - this.#lastReceived >= idleMs / 2) {
-          this.#probed = true;
-          ping = true;
-        }
-        if (ping) {
-          writePing(this.#pending, FrameType.Ping, this.#pingNext);
-          this.#pingNext += 1;
-          this.#flush();
-        }
-      },
-      Math.max(10, Math.min(idleMs / 4, keepAliveMs / 2)),
-    );
-  }
-
-  /** The peer was heard from: the idle timeout starts over, and the next send may restart it. */
-  #heard() {
-    this.#lastReceived = Date.now();
-    this.#idleSince = this.#lastReceived;
-    this.#sentSinceReceived = false;
-    this.#dataSinceReceived = false;
-    this.#probed = false;
-  }
-
-  /**
-   * A record went out. Only the first one since the peer was last heard from restarts the idle
-   * timeout: counting every send would let keep-alives restart the deadline they exist to test,
-   * so a peer that vanished while its WebSocket still took writes would never time out.
-   */
-  #spoke() {
-    this.#lastSent = Date.now();
-    if (!this.#sentSinceReceived) {
-      this.#sentSinceReceived = true;
-      this.#idleSince = this.#lastSent;
+    // Keep-alives come at least twice per idle timeout, as in the Go and Erlang packages.
+    const keepAliveMs = Math.min(this.#keepAlivePeriodMs, idleMs / 2);
+    if (keepAliveMs > 0) {
+      this.#keepAliveTimer = setInterval(
+        () => {
+          if (Date.now() - this.#lastSent >= keepAliveMs) {
+            writePing(this.#pending, FrameType.Ping, this.#pingNext);
+            this.#pingNext += 1;
+            this.#flush();
+          }
+        },
+        Math.max(10, keepAliveMs / 4),
+      );
     }
+    clearTimeout(this.#handshakeTimer);
+    this.#settleReady.resolve();
   }
 
   /**
@@ -697,7 +650,6 @@ export class QMuxSession {
       this.#flush();
     }
     writeStreamFrame(this.#pending, stream.id, stream.sendOffset, data, fin);
-    this.#dataSinceReceived = true;
     stream.sendOffset += data.length;
     this.#connSent += data.length;
     this.#scheduleFlush();
@@ -745,7 +697,6 @@ export class QMuxSession {
       this.#flush();
     }
     writeDatagram(this.#pending, data);
-    this.#dataSinceReceived = true;
     this.#scheduleFlush();
   }
 
@@ -787,7 +738,8 @@ export class QMuxSession {
     const record = this.#pending.take();
     if (this.#ws.readyState === 1) {
       this.#ws.send(record);
-      this.#spoke();
+      this.#lastActivity = Date.now();
+      this.#lastSent = this.#lastActivity;
     }
   }
 
@@ -796,7 +748,8 @@ export class QMuxSession {
       return;
     }
     this.#closedError = error;
-    clearInterval(this.#timer);
+    clearInterval(this.#idleTimer);
+    clearInterval(this.#keepAliveTimer);
     clearTimeout(this.#handshakeTimer);
     for (const stream of this.#streams.values()) {
       stream.onSessionClosed(error);

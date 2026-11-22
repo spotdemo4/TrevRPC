@@ -53,11 +53,9 @@ export declare const DefaultMaxRecordSize: 16382;
  */
 export interface Parameters {
   /**
-   * Closes the session after this long without activity; 0 disables it. Every record received
-   * counts, and so does the first record sent after each (RFC 9000 §10.1), so keep-alives alone
-   * can't keep a session to a vanished peer open. While stream data or datagrams the session sent
-   * wait for the peer to be heard from, it sends a QX_PING halfway through the timeout, which a
-   * live peer answers.
+   * Closes the session after this long without a record either way; 0 disables it. As
+   * draft-ietf-quic-qmux-02 §7.1 defines it, every record received or sent restarts it,
+   * keep-alives included.
    */
   maxIdleTimeoutMs: number;
   /** The connection-level receive window, in bytes. */

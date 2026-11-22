@@ -82,12 +82,7 @@
 %%   <li>`parameters': the transport parameters to advertise.</li>
 %%   <li>`keep_alive': milliseconds without sending after which a QX_PING
 %%       goes out, at most half the idle timeout, or `infinity' (the
-%%       default). The idle timeout (`max_idle_timeout') restarts on every
-%%       record received and on the first record sent after each, so
-%%       keep-alives alone can't keep a session to a vanished peer open; while
-%%       stream data or datagrams the session sent wait for the peer to be
-%%       heard from, it sends a QX_PING halfway through the timeout, which a
-%%       live peer answers.</li>
+%%       default).</li>
 %%   <li>`send_queue_limit': the buffered bytes past which send_data/5 is
 %%       refused with `send_queue_full' (default 1 MiB).</li>
 %%   <li>`handshake_timeout': milliseconds for the peer's
@@ -226,14 +221,6 @@
     send_timeout :: pos_integer(),
     last_received :: integer(),
     last_sent :: integer(),
-    %% When the idle timeout counts from: the last record received, or the
-    %% first record sent after it (RFC 9000 section 10.1).
-    idle_since :: integer(),
-    %% Whether a record went out since one last came in, whether one carrying
-    %% stream data or datagrams did, and whether a QX_PING probe did.
-    sent_since_received = false :: boolean(),
-    data_since_received = false :: boolean(),
-    probed = false :: boolean(),
     %% A `flush' message is on its way to this process.
     flush_pending = false :: boolean(),
     closing = false :: boolean()
@@ -449,7 +436,6 @@ init({Transport, Role, Owner, Queue, Opts}) ->
         send_timeout = maps:get(send_timeout, Opts, 30000),
         last_received = Now,
         last_sent = Now,
-        idle_since = Now,
         control = [qmux_frame:transport_parameters(Local)]
     }}.
 
@@ -565,7 +551,7 @@ handle_info(
     %% Draining after CONNECTION_CLOSE.
     {noreply, State};
 handle_info({Tag, Socket, Data}, #state{socket = Socket, messages = {Tag, _, _}} = State) ->
-    received(Data, heard(State));
+    received(Data, State#state{last_received = now_ms()});
 handle_info({Tag, Socket}, #state{socket = Socket, messages = {_, Tag, _}, closing = true} = State) ->
     {stop, normal, State};
 handle_info({Tag, Socket}, #state{socket = Socket, messages = {_, Tag, _}} = State) ->
@@ -1312,29 +1298,7 @@ hand(_Records, _Size, #state{writer = undefined} = State) ->
     State;
 hand(Records, Size, #state{writer = Writer, unwritten = Unwritten} = State) ->
     Writer ! {write, Records, Size},
-    maybe_send_ready(spoke(State#state{unwritten = Unwritten + Size})).
-
-%% Records that the peer was heard from: the idle timeout starts over, and the
-%% next record sent may restart it once more.
-heard(State) ->
-    Now = now_ms(),
-    State#state{
-        last_received = Now,
-        idle_since = Now,
-        sent_since_received = false,
-        data_since_received = false,
-        probed = false
-    }.
-
-%% Records that a record went out. Only the first one since the peer was last
-%% heard from restarts the idle timeout: counting every send would let
-%% keep-alives restart the deadline they exist to test, so a peer that vanished
-%% while its connection still took writes would never time out.
-spoke(#state{sent_since_received = false} = State) ->
-    Now = now_ms(),
-    State#state{last_sent = Now, idle_since = Now, sent_since_received = true};
-spoke(State) ->
-    State#state{last_sent = now_ms()}.
+    maybe_send_ready(State#state{unwritten = Unwritten + Size, last_sent = now_ms()}).
 
 %% The size of the records to send, once the peer's parameters arrived.
 limit(#state{peer = Peer}) ->
@@ -1375,8 +1339,7 @@ build(State) ->
                 {Datagrams ++ Streams, S1}
         end,
     {Control ++ Flow ++ Data, State3#state{
-        streams_first = State3#state.streams_first xor BothWait,
-        data_since_received = State3#state.data_since_received orelse Data =/= []
+        streams_first = State3#state.streams_first xor BothWait
     }}.
 
 take_control([Frame | Rest], Limit, Acc, Size, State) ->
@@ -1558,25 +1521,11 @@ half(infinity) -> infinity;
 half(KeepAlive) -> KeepAlive div 2.
 
 tick(
-    #state{
-        idle_timeout = Idle,
-        keep_alive = KeepAlive,
-        last_received = Received,
-        last_sent = Sent,
-        idle_since = IdleSince
-    } = State
+    #state{idle_timeout = Idle, keep_alive = KeepAlive, last_received = Received, last_sent = Sent} =
+        State
 ) ->
     Now = now_ms(),
-    %% QMux has no acks, so a session that only sends may hear nothing back for
-    %% longer than the idle timeout. The peer must answer a QX_PING, so one sent
-    %% halfway through the timeout, while stream data or datagrams this
-    %% endpoint sent wait for the peer to be heard from, gets an answer from a
-    %% live peer and none from a vanished one. Replies such as flow control
-    %% updates or ping responses don't count, so a session idle both ways sends
-    %% no probe.
-    Probe =
-        Idle =/= infinity andalso State#state.data_since_received andalso
-            not State#state.probed andalso Now - Received >= Idle div 2,
+    Active = max(Received, Sent),
     %% Keep-alives come at least twice per idle timeout.
     Interval =
         case {KeepAlive, Idle} of
@@ -1586,11 +1535,8 @@ tick(
             _ -> min(KeepAlive, Idle div 2)
         end,
     if
-        Idle =/= infinity, Now - IdleSince >= Idle ->
+        Idle =/= infinity, Now - Active >= Idle ->
             quiet_close(idle_timeout, State);
-        Probe ->
-            schedule_tick(State),
-            noreply(State#state{send_ping = true, probed = true});
         Interval =/= infinity, Now - Sent >= Interval ->
             schedule_tick(State),
             noreply(State#state{send_ping = true});

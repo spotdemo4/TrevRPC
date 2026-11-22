@@ -65,8 +65,8 @@ func protocolError(code TransportErrorCode, frameType uint64, format string, arg
 }
 
 var (
-	// ErrIdleTimeout reports that the peer was not heard from for the
-	// negotiated idle timeout (see Parameters.MaxIdleTimeout).
+	// ErrIdleTimeout reports that no record was sent or received for the
+	// negotiated idle timeout.
 	ErrIdleTimeout = errors.New("QMux session idle timeout")
 	// ErrConnectionLost reports that the underlying transport failed or ended
 	// without a CONNECTION_CLOSE.

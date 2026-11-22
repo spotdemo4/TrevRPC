@@ -8,12 +8,8 @@ import (
 // QX_TRANSPORT_PARAMETERS frame. A zero field is left out of the frame, so it
 // takes the protocol default: no credit, no streams and no datagrams.
 type Parameters struct {
-	// MaxIdleTimeout closes a session after this long without activity. Every
-	// record received counts, and so does one record sent after each receipt
-	// (RFC 9000 section 10.1), so keep-alives alone can't keep a session to a
-	// vanished peer open. While stream data or datagrams the session sent wait
-	// for the peer to be heard from, it sends a QX_PING halfway through the
-	// timeout, which a live peer answers. Zero disables the local timeout.
+	// MaxIdleTimeout closes a session after this long without a record in
+	// either direction. Zero disables the local timeout.
 	MaxIdleTimeout time.Duration
 	// InitialMaxData is the connection-level receive window.
 	InitialMaxData uint64
