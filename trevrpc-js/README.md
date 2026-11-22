@@ -2,10 +2,10 @@
 
 The browser client for [TrevRPC](https://trev.zip/llc/TrevRPC), an RPC framework like gRPC built on QUIC instead of HTTP/2: a WebTransport runtime with a QMux over WebSocket fallback for where WebTransport is missing or UDP is blocked, for the messages and service descriptors that [protobuf-es](https://github.com/bufbuild/protobuf-es) generates. It has no Node.js runtime, and it talks to TrevRPC servers written in Go, Rust or Erlang.
 
-> **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, `trevrpc-kotlin`
-> 1.12.0, and the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a
-> milestone for 2.0.
+> **Compatibility:** the TrevRPC runtimes and code generators share one version, and runtimes of the same version
+> are compatible with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0,
+> `trevrpc-kotlin` 1.12.0, and the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed
+> yet; that's a milestone for 2.0. The QMux packages and the integrations have versions of their own.
 
 ## Packages
 

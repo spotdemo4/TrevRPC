@@ -2,9 +2,10 @@
 
 [protovalidate](https://github.com/bufbuild/protovalidate) request validation for [TrevRPC](https://trev.zip/llc/TrevRPC) servers: requests that break their [`buf.validate`](https://buf.build/bufbuild/protovalidate) rules fail before the handler runs. It is a separate crate so that `trevrpc` itself does not depend on protovalidate or CEL.
 
-> **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, and `trevrpc-kotlin`
-> 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> **Versioning:** this package has a version of its own. Each release depends on the `trevrpc` release it was built
+> with, and every `trevrpc` release is followed by one of this package. The TrevRPC runtimes share one version, and
+> runtimes of the same version are compatible with each other; compatibility across different versions isn't
+> guaranteed yet, a milestone for 2.0.
 
 Generate the services with `protoc-gen-trevrpc-rust`'s `validate=true` option, with `buf/validate/validate.proto` on the include path, and depend on this crate:
 

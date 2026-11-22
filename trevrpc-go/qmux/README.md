@@ -8,8 +8,8 @@ It has no dependencies outside the standard library. [TrevRPC](https://trev.zip/
 go get trev.zip/llc/trevrpc/trevrpc-go/qmux
 ```
 
-> **Versioning:** the module shares the TrevRPC version and is released with it. QMux is still an Internet-Draft, so
-> a new draft revision may change the API and the wire format.
+> **Versioning:** the module has a version of its own, and is released only when it changes. QMux is still an Internet-Draft, so a new draft
+> revision may change the API and the wire format.
 
 ## Use
 

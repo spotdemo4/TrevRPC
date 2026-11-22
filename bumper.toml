@@ -1,0 +1,33 @@
+#:schema https://trev.zip/llc/bumper/raw/branch/main/bumper.schema.json
+
+# Breaking changes (`feat!:`, a `BREAKING CHANGE:` footer) bump the minor version like any other
+# `feat`, so no package moves to a new major version, nor a Go module to a /vN path, on its own.
+# Cross-version compatibility is a milestone for 2.0; until then a minor release may break.
+breaking-changes = false
+
+# The runtimes, their code generators, and the packages only used to test them release together at
+# one version. The root is a member so that the unscoped tag, which triggers the release workflow
+# and labels the Buf module, always carries that version.
+#
+# Every other package, the QMux implementations and the OpenTelemetry, protovalidate and Effect
+# integrations, keeps its own version. Those inside a runtime's directory still release that
+# runtime, and with it the group, with a patch; those that depend on a runtime release with a patch
+# when it does. flake-release releases them all from the unscoped tag, each to its own tag.
+[groups.trevrpc]
+packages = [
+  ".",
+  "bench/baseline",
+  "trevrpc-erlang",
+  "trevrpc-erlang/interop",
+  "trevrpc-erlang/protoc-gen-*",
+  "trevrpc-go",
+  "trevrpc-go/cmd/trevrpc-interop",
+  "trevrpc-js",
+  "trevrpc-js/protoc-gen-trevrpc-js",
+  "trevrpc-kotlin",
+  "trevrpc-py",
+  "trevrpc-py/protoc-gen-trevrpc-py",
+  "trevrpc-rust",
+  "trevrpc-rust/crates/protoc-gen-trevrpc-rust",
+  "trevrpc-rust/crates/trevrpc-interop",
+]

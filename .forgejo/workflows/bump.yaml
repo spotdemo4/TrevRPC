@@ -37,7 +37,8 @@ jobs:
 
       - name: Bump
         run: bumper
+        # bumper.toml groups the runtimes and leaves their libraries independent. Forcing the root
+        # releases the whole group; FORCE would release every library too.
         env:
-          FIXED_VERSION: true
           GITHUB_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
-          FORCE: ${{ inputs.force }}
+          FORCE_PACKAGES: ${{ inputs.force == 'true' && '.' || '' }}

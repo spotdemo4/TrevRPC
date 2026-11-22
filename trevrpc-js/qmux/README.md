@@ -8,8 +8,8 @@ It has no dependencies and runs in browsers and in server runtimes with a WebSoc
 npm install @trevrpc/qmux
 ```
 
-> **Versioning:** the package shares the TrevRPC version and is released with it. QMux is still an Internet-Draft, so
-> a new draft revision may change the API and the wire format.
+> **Versioning:** the package has a version of its own, and is released only when it changes. QMux is still an Internet-Draft, so a new draft
+> revision may change the API and the wire format.
 
 ## Use
 

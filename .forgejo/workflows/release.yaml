@@ -6,8 +6,10 @@ on:
   push:
     tags: ["v*"]
 
-# Bumper tags every package with the same version, so one base tag releases them all; flake-release
-# picks each package's tag by its source directory. A shared group would cancel queued versions.
+# Every bump releases the root, which is in bumper.toml's version group, so each one has a base tag.
+# flake-release releases each package tagged on its commit to its own tag, picked by source
+# directory, including the libraries whose versions differ from the base tag. A shared group would
+# cancel queued versions.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -34,8 +36,9 @@ jobs:
 
       # Both sources have rebar.config and gleam.toml. trevrpc's Gleam modules make flake-release
       # publish it with gleam publish, which ships the Gleam binding alongside the runtime; qmux,
-      # without any, goes out first with rebar3, and trevrpc's path dependency on it becomes a Hex
-      # requirement.
+      # without any, is published with rebar3. trevrpc's path dependency on qmux becomes a Hex
+      # requirement on the version this run publishes, with qmux going out first, or, when qmux
+      # didn't change, on the version it is already released at.
       - name: Release to Forgejo and hex.pm
         run: flake-release
         env:

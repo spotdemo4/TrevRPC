@@ -2,8 +2,8 @@
 
 A `protoc` plugin that generates a codec for each message, for the TrevRPC browser client, [`@trevrpc/trevrpc-js`](https://www.npmjs.com/package/@trevrpc/trevrpc-js). It runs after [`protoc-gen-es`](https://github.com/bufbuild/protobuf-es) and writes `<file>_trevrpc.js` next to its `<file>_pb.js`. A codec encodes and decodes the same protobuf-es messages as `toBinary` and `fromBinary`, to the same bytes, with code written for its message type instead of protobuf-es's generic per-field dispatch.
 
-> **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: generated codecs need the `@trevrpc/trevrpc-js` of the plugin's version or later. Compatibility
+> **Compatibility:** the plugin shares its version with `@trevrpc/trevrpc-js` and the other TrevRPC runtimes:
+> generated codecs need the `@trevrpc/trevrpc-js` of the plugin's version or later. Compatibility
 > across different versions isn't guaranteed yet; that's a milestone for 2.0.
 
 ```sh

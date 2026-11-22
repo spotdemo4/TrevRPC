@@ -6,8 +6,9 @@ on:
   push:
     tags: ["v*"]
 
-# Bumper tags every package with the same version, so one base tag releases them all; flake-release
-# picks each package's tag by its source directory. A shared group would cancel queued versions.
+# Every bump releases the root, which is in bumper.toml's version group with the runtimes, so each
+# one has a base tag; flake-release releases each runtime to its own tag, picked by its source
+# directory. A shared group would cancel queued versions.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false

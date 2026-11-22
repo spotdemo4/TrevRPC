@@ -2,10 +2,10 @@
 
 The Rust runtime for [TrevRPC](https://trev.zip/llc/TrevRPC), an RPC framework like gRPC built on QUIC instead of HTTP/2: servers that serve native QUIC, HTTP/3 and WebTransport from one Quinn endpoint and every TCP fallback on one TCP port, and native QUIC clients that reconnect automatically and fall back to QMux over TLS when UDP is blocked. It is built on [Quinn](https://github.com/quinn-rs/quinn), with the [`qmux`](https://crates.io/crates/qmux) crate, `h2` and `tokio-rustls` for the TCP fallbacks. Rust has no HTTP/3 or WebTransport client.
 
-> **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, `trevrpc-kotlin`
-> 1.12.0, and the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a
-> milestone for 2.0.
+> **Compatibility:** the TrevRPC runtimes and code generators share one version, and runtimes of the same version
+> are compatible with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0,
+> `trevrpc-kotlin` 1.12.0, and the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed
+> yet; that's a milestone for 2.0. The QMux packages and the integrations have versions of their own.
 
 ## Packages
 

@@ -11,8 +11,8 @@ It needs only OTP (Erlang/OTP 29 or later). [TrevRPC](https://trev.zip/llc/TrevR
 
 `gleam add qmux` and `{:qmux, "~> 1.12"}` in mix.exs work too.
 
-> **Versioning:** the package shares the TrevRPC version and is released with it. QMux is still an Internet-Draft,
-> so a new draft revision may change the API and the wire format.
+> **Versioning:** the package has a version of its own, and is released only when it changes. QMux is still an Internet-Draft, so a new draft
+> revision may change the API and the wire format.
 
 ## Use
 
@@ -63,4 +63,4 @@ rebar3 xref
 rebar3 dialyzer
 ```
 
-`nix build .#trevrpc-erlang-qmux` runs all three, and the `trevrpc-erlang-qmux-lint` check runs erlfmt. `trevrpc` depends on this package through `_checkouts/qmux` (rebar3) and a path dependency (Gleam); flake-release publishes this package to Hex first with rebar3, and replaces the path dependency with its version when it publishes `trevrpc`.
+`nix build .#trevrpc-erlang-qmux` runs all three, and the `trevrpc-erlang-qmux-lint` check runs erlfmt. `trevrpc` depends on this package through `_checkouts/qmux` (rebar3) and a path dependency (Gleam); when this package is released with `trevrpc`, flake-release publishes it to Hex first with rebar3, and otherwise `trevrpc` requires the version it is already released at; either way the path dependency becomes a Hex requirement.
