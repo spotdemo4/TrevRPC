@@ -70,6 +70,18 @@ type ListenOptions struct {
 	// QMux handshake or HTTP request headers that follow it. It defaults to
 	// 10 seconds.
 	TLSHandshakeTimeout time.Duration
+	// TCPUserTimeout bounds how long data sent on a TCP connection may stay
+	// unacknowledged before the kernel drops the connection (TCP_USER_TIMEOUT,
+	// Linux only). QMux restarts its idle timeout on every record sent,
+	// keep-alives included, so without it a client that vanishes while its
+	// connection still takes writes holds the connection until TCP gives up
+	// retransmitting, many minutes later. It defaults to
+	// ServerOptions.ConnectionIdleTimeout, or none when that is disabled;
+	// DisableTCPUserTimeout turns it off. MPTCP sockets refuse the option, so
+	// the listener uses plain TCP while it is set, and Go's default, MPTCP
+	// where the kernel has it, otherwise.
+	TCPUserTimeout        time.Duration
+	DisableTCPUserTimeout bool
 }
 
 // Listener serves a Server on one UDP socket and, unless disabled, one TCP
@@ -164,6 +176,9 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 	}
 	if options.AltSvcPort < 0 || options.AltSvcPort > math.MaxUint16 {
 		return nil, InvalidArgument("AltSvcPort " + strconv.Itoa(options.AltSvcPort) + " is not a port number")
+	}
+	if options.TCPUserTimeout < 0 {
+		return nil, InvalidArgument("ListenOptions.TCPUserTimeout must not be negative")
 	}
 	ctx, cancelCause := context.WithCancelCause(context.Background())
 	cancel := func() { cancelCause(errServerShutdown) }

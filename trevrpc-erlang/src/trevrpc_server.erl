@@ -50,6 +50,10 @@
 
 -behaviour(gen_server).
 
+-ifdef(TEST).
+-export([tcp_listener_options/2]).
+-endif.
+
 -export([start_link/1, start/1, port/1, tcp_port/1, stop/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -116,6 +120,10 @@
     max_stream_body_size => pos_integer() | infinity,
     initial_request_timeout => timeout(),
     connection_idle_timeout => pos_integer() | infinity,
+    %% How long data sent on a TCP connection may stay unacknowledged before
+    %% the kernel drops it (TCP_USER_TIMEOUT, Linux only), so that a client
+    %% that vanishes is let go; connection_idle_timeout by default.
+    tcp_user_timeout => pos_integer() | infinity,
     graceful_shutdown_timeout => non_neg_integer(),
     compression => trevrpc_zstd:settings(),
     stream_compression_memory => non_neg_integer(),
@@ -244,6 +252,7 @@ init(Opts) ->
         {ok, Compression} ?= compression(Opts),
         ok ?= check_routes(maps:get(routes, Opts)),
         ok ?= check_browsers(Opts),
+        ok ?= trevrpc_socket:check_user_timeout(Opts),
         ok = webtransport_routers(Opts),
         listen(Opts, Credentials, Compression)
     else
@@ -518,7 +527,6 @@ listen_tcp(
             end
         end
     end,
-    Handshake = maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
     #{http := Mapping, webtransport := Browsers, fallback := Fallback} = Config,
     %% HTTP/2 carries the HTTP mapping and the fallback, HTTP/1.1 the
     %% WebSocket sessions and the fallback.
@@ -535,12 +543,7 @@ listen_tcp(
             ]
     ),
     {ok, UdpPort} = quic:get_server_port(Name),
-    Listen = #{
-        ip => maps:get(ip, Opts, {0, 0, 0, 0}),
-        port => maps:get(tcp_port, Opts, UdpPort),
-        handshake_timeout => Handshake,
-        max_handshakes => maps:get(max_tls_handshakes, Opts, 256)
-    },
+    Listen = tcp_listener_options(Opts, UdpPort),
     case trevrpc_tcp_listener:start_link(Listen, Credentials, Accept) of
         {error, eaddrinuse} when not is_map_key(tcp_port, Opts) ->
             trevrpc_tcp_listener:start_link(Listen#{port => 0}, Credentials, Accept);
@@ -630,6 +633,20 @@ webtransport_options(#{webtransport := true} = Opts) ->
     };
 webtransport_options(#{}) ->
     undefined.
+
+%% The options of the TCP listener: its address, the TCP_USER_TIMEOUT of its
+%% connections (the connection idle timeout unless `tcp_user_timeout' says
+%% otherwise), and the bounds on TLS handshakes.
+tcp_listener_options(Opts, UdpPort) ->
+    #{
+        ip => maps:get(ip, Opts, {0, 0, 0, 0}),
+        port => maps:get(tcp_port, Opts, UdpPort),
+        user_timeout => maps:get(
+            tcp_user_timeout, Opts, maps:get(connection_idle_timeout, Opts, 30000)
+        ),
+        handshake_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
+        max_handshakes => maps:get(max_tls_handshakes, Opts, 256)
+    }.
 
 %% QMux sessions get the windows and limits of QUIC connections, and
 %% keep-alives at half the idle timeout.

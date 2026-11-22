@@ -45,6 +45,10 @@
 
 -behaviour(gen_server).
 
+-ifdef(TEST).
+-export([tls_opts/2]).
+-endif.
+
 -export([
     start_link/1,
     start/1,
@@ -85,6 +89,11 @@
     max_frame_size => pos_integer(),
     connect_timeout => pos_integer(),
     idle_timeout => pos_integer(),
+    %% How long data sent on the QMux over TLS connection may stay
+    %% unacknowledged before the kernel drops it (TCP_USER_TIMEOUT, Linux
+    %% only), so that a server that vanishes is noticed; idle_timeout by
+    %% default.
+    tcp_user_timeout => pos_integer() | infinity,
     compression => trevrpc_zstd:settings(),
     stream_compression_memory => non_neg_integer(),
     min_quic_connections => pos_integer(),
@@ -307,7 +316,10 @@ connect(Opts, Timeout) ->
                     {error, Status}
             end;
         {error, {compression, Message}} ->
-            {error, trevrpc_status:new(invalid_argument, Message)}
+            {error, trevrpc_status:new(invalid_argument, Message)};
+        {error, {invalid_option, Name}} ->
+            {error,
+                trevrpc_status:new(invalid_argument, <<"invalid ", (atom_to_binary(Name))/binary>>)}
     end.
 
 %% @doc Waits up to `Timeout' milliseconds for the channel to be ready.
@@ -517,9 +529,14 @@ stream_done(Channel, Id, Ref) ->
 %% Invalid settings fail the start without taking a linked caller down.
 -spec init(options()) -> {ok, #state{}} | {error, {compression, binary()}}.
 init(Opts) ->
-    case trevrpc_zstd:config(maps:get(compression, Opts, #{})) of
-        {ok, Compression} -> init(Opts, Compression);
-        {error, Message} -> {error, {compression, Message}}
+    maybe
+        ok ?= trevrpc_socket:check_user_timeout(Opts),
+        {ok, Compression} ?=
+            case trevrpc_zstd:config(maps:get(compression, Opts, #{})) of
+                {error, Message} -> {error, {compression, Message}};
+                Config -> Config
+            end,
+        init(Opts, Compression)
     end.
 
 init(Opts, Compression) ->
@@ -637,7 +654,10 @@ tls_opts(Opts, Host) ->
         {nodelay, true},
         {versions, ['tlsv1.3', 'tlsv1.2']},
         {alpn_advertised_protocols, [trevrpc:qmux_alpn()]}
-        | Trust ++ Identity
+        | Trust ++ Identity ++
+            trevrpc_socket:user_timeout(
+                maps:get(tcp_user_timeout, Opts, maps:get(idle_timeout, Opts, 30000))
+            )
     ].
 
 %% Trust in the certificates `Trusted', which may include a self-signed

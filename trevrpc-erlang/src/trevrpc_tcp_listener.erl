@@ -81,6 +81,7 @@ init(Parent, Opts, #{cert := Cert, key := Key} = Credentials, Accept) ->
                 key => {KeyType, public_key:der_encode(KeyType, Key)}
             }
         ]}
+        | trevrpc_socket:user_timeout(maps:get(user_timeout, Opts, infinity))
     ],
     case ssl:listen(maps:get(port, Opts, 0), Listen) of
         {ok, Socket} ->

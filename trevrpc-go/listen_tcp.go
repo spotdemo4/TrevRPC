@@ -40,7 +40,12 @@ func (l *Listener) listenTCP(addr string, options ListenOptions) (connSource, er
 		host, _, _ := net.SplitHostPort(addr)
 		tcpAddr = net.JoinHostPort(host, strconv.Itoa(l.udp.LocalAddr().(*net.UDPAddr).Port))
 	}
-	var lc net.ListenConfig
+	userTimeout, err := resolveTCPUserTimeout("ListenOptions.TCPUserTimeout", options.TCPUserTimeout,
+		l.runtime.options.ConnectionIdleTimeout, options.DisableTCPUserTimeout)
+	if err != nil {
+		return connSource{}, err
+	}
+	lc := tcpUserTimeoutListenConfig(userTimeout)
 	ln, err := lc.Listen(l.ctx, "tcp", tcpAddr)
 	if err != nil {
 		return connSource{}, err

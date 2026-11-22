@@ -36,6 +36,14 @@ type DialOptions struct {
 	// ReprobeInterval is how long reconnects keep using QMux over TLS after it
 	// won a race, before QUIC is tried again. It defaults to 5 minutes.
 	ReprobeInterval time.Duration
+	// TCPUserTimeout bounds how long data sent on the QMux over TLS
+	// connection may stay unacknowledged before the kernel drops it
+	// (TCP_USER_TIMEOUT, Linux only), so that a server that vanishes while the
+	// connection still takes writes is noticed. It defaults to 30 seconds, the
+	// server's default connection idle timeout; DisableTCPUserTimeout turns it
+	// off.
+	TCPUserTimeout        time.Duration
+	DisableTCPUserTimeout bool
 	// OnEvent receives channel lifecycle events asynchronously from a bounded queue.
 	OnEvent func(ChannelEvent)
 	// Compression lets messages travel compressed with the dictionaries it
@@ -128,6 +136,10 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 	if err != nil {
 		return nil, err
 	}
+	userTimeout, err := resolveTCPUserTimeout("TCPUserTimeout", options.TCPUserTimeout, defaultTCPUserTimeout, options.DisableTCPUserTimeout)
+	if err != nil {
+		return nil, err
+	}
 	quicConnector := &quicConnector{
 		addr:         addr,
 		tls:          clientTLSConfig(options.TLSConfig, host),
@@ -144,6 +156,7 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 		compression:  compression,
 		streams:      streams,
 		metadata:     connectionMetadata,
+		dialer:       tcpUserTimeoutDialer(userTimeout),
 	}
 	var connector channelConnector
 	switch options.Transport {
