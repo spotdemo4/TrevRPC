@@ -92,11 +92,12 @@
               ruff
               basedpyright
 
-              # erlang
+              # erlang / gleam
               beamMinimal29Packages.erlang
               beamMinimal29Packages.rebar3
               erlfmt
               erlang-language-platform
+              gleam
 
               vscode-json-languageserver # json
               yaml-language-server # yaml
