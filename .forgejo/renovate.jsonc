@@ -34,8 +34,10 @@
   "gradle": {
     "ignorePaths": []
   },
+  // the only submodule is wiki/, which is bumped by hand alongside the
+  // changes it documents
   "git-submodules": {
-    "enabled": true
+    "enabled": false
   },
   // fix PRs for vulnerable dependencies, from osv.dev: direct and indirect go
   // modules, and direct dependencies elsewhere. transitive vulnerabilities
