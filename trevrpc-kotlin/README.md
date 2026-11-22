@@ -63,7 +63,7 @@ python3 -I -m unittest discover -s interop-android
 
 ### Interop tests
 
-`interop-android` is an Android app and instrumented test that generates its client from the shared [`interop/proto/interop.proto`](../interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](../interop/README.md) from an emulator against a Go, Rust, or Erlang server on the host. It is not published. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:
+`interop-android` is an Android app and instrumented test that generates its client from the shared [`interop/proto/interop.proto`](https://trev.zip/llc/TrevRPC/src/branch/main/interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](https://trev.zip/llc/TrevRPC/src/branch/main/interop/README.md) from an emulator against a Go, Rust, or Erlang server on the host. It is not published. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:
 
 ```shell
 nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go-interop --command \

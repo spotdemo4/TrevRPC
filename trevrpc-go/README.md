@@ -9,13 +9,13 @@ The Go runtime for [TrevRPC](https://trev.zip/llc/TrevRPC), an RPC framework lik
 
 ## Packages
 
-| Package                                                                                 | Install                                                                       | Purpose                                                                                           |
-| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| [`trev.zip/llc/trevrpc/trevrpc-go`](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go) | `go get trev.zip/llc/trevrpc/trevrpc-go`                                      | Client and server runtime                                                                         |
-| [`…/trevrpc-go/cmd/protoc-gen-trevrpc-go`](cmd/protoc-gen-trevrpc-go)                   | `go install trev.zip/llc/trevrpc/trevrpc-go/cmd/protoc-gen-trevrpc-go@latest` | `protoc` plugin: service interfaces, clients and registration functions                           |
-| [`…/trevrpc-go/ratelimit`](ratelimit)                                                   | part of the runtime module                                                    | [Rate-limit interceptor](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#rate-limiting)                |
-| [`…/trevrpc-go/oteltrevrpc`](oteltrevrpc)                                               | `go get trev.zip/llc/trevrpc/trevrpc-go/oteltrevrpc`                          | [OpenTelemetry](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#opentelemetry) metrics and tracing     |
-| [`…/trevrpc-go/protovalidatetrevrpc`](protovalidatetrevrpc)                             | `go get trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc`                 | [protovalidate](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#request-validation) request validation |
+| Package                                                                                                                  | Install                                                                       | Purpose                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| [`trev.zip/llc/trevrpc/trevrpc-go`](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go)                                  | `go get trev.zip/llc/trevrpc/trevrpc-go`                                      | Client and server runtime                                                                         |
+| [`…/trevrpc-go/cmd/protoc-gen-trevrpc-go`](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go/cmd/protoc-gen-trevrpc-go) | `go install trev.zip/llc/trevrpc/trevrpc-go/cmd/protoc-gen-trevrpc-go@latest` | `protoc` plugin: service interfaces, clients and registration functions                           |
+| [`…/trevrpc-go/ratelimit`](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go/ratelimit)                                 | part of the runtime module                                                    | [Rate-limit interceptor](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#rate-limiting)                |
+| [`…/trevrpc-go/oteltrevrpc`](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go/oteltrevrpc)                             | `go get trev.zip/llc/trevrpc/trevrpc-go/oteltrevrpc`                          | [OpenTelemetry](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#opentelemetry) metrics and tracing     |
+| [`…/trevrpc-go/protovalidatetrevrpc`](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc)           | `go get trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc`                 | [protovalidate](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#request-validation) request validation |
 
 The `trevrpc-go` Nix package provides the plugin: `nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-go`.
 
@@ -66,7 +66,7 @@ client := greeter.NewGreeterClient(channel, trevrpc.WithTimeout(5*time.Second))
 reply, err := client.SayHello(ctx, &greeter.HelloRequest{Name: "TrevRPC"})
 ```
 
-Runnable servers and clients are in [`examples`](examples).
+Runnable servers and clients are in [`examples`](https://trev.zip/llc/TrevRPC/src/branch/main/trevrpc-go/examples).
 
 ## Documentation
 
@@ -81,6 +81,6 @@ go run ./examples/greeter_server
 go run ./examples/greeter_client TrevRPC   # another shell
 ```
 
-`cmd/trevrpc-interop` (installed as `trevrpc-interop-go`) implements the `server` and `client` subcommands of the cross-runtime [interop suite](../interop/README.md), and the `bench` load client of the [benchmarks](../bench/README.md). It is a module of its own, so that this one does not depend on protovalidate, which its server uses. Its Echo, UnreliableEcho, CompressedEcho, RefusingEcho, ValidatedEcho and ValidationBench bindings in `cmd/trevrpc-interop/interoppb` are generated from `interop/proto/*.proto`; `go -C cmd/trevrpc-interop test ./interoppb` fails when they drift, and `-update` rewrites them.
+`cmd/trevrpc-interop` (installed as `trevrpc-interop-go`) implements the `server` and `client` subcommands of the cross-runtime [interop suite](https://trev.zip/llc/TrevRPC/src/branch/main/interop/README.md), and the `bench` load client of the [benchmarks](https://trev.zip/llc/TrevRPC/src/branch/main/bench/README.md). It is a module of its own, so that this one does not depend on protovalidate, which its server uses. Its Echo, UnreliableEcho, CompressedEcho, RefusingEcho, ValidatedEcho and ValidationBench bindings in `cmd/trevrpc-interop/interoppb` are generated from `interop/proto/*.proto`; `go -C cmd/trevrpc-interop test ./interoppb` fails when they drift, and `-update` rewrites them.
 
 See [Local Development](https://trev.zip/llc/TrevRPC/wiki/Local-Development) for the repository-wide checks.

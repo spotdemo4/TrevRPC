@@ -9,12 +9,12 @@ The Rust runtime for [TrevRPC](https://trev.zip/llc/TrevRPC), an RPC framework l
 
 ## Packages
 
-| Package                                                                   | Install                                                                        | Purpose                                                                                             |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| [`trevrpc`](https://crates.io/crates/trevrpc)                             | `cargo add trevrpc`                                                            | Client and server runtime                                                                           |
-| [`protoc-gen-trevrpc-rust`](crates/protoc-gen-trevrpc-rust)               | `cargo install --git https://trev.zip/llc/TrevRPC.git protoc-gen-trevrpc-rust` | `protoc` plugin: service traits, `register_*` functions and typed clients                           |
-| [`trevrpc-opentelemetry`](https://crates.io/crates/trevrpc-opentelemetry) | `cargo add trevrpc-opentelemetry`                                              | [OpenTelemetry](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#observability) metrics and tracing     |
-| [`trevrpc-protovalidate`](https://crates.io/crates/trevrpc-protovalidate) | `cargo add trevrpc-protovalidate`                                              | [protovalidate](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#request-validation) request validation |
+| Package                                                                                                               | Install                                                                        | Purpose                                                                                             |
+| --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| [`trevrpc`](https://crates.io/crates/trevrpc)                                                                         | `cargo add trevrpc`                                                            | Client and server runtime                                                                           |
+| [`protoc-gen-trevrpc-rust`](https://trev.zip/llc/TrevRPC/src/branch/main/trevrpc-rust/crates/protoc-gen-trevrpc-rust) | `cargo install --git https://trev.zip/llc/TrevRPC.git protoc-gen-trevrpc-rust` | `protoc` plugin: service traits, `register_*` functions and typed clients                           |
+| [`trevrpc-opentelemetry`](https://crates.io/crates/trevrpc-opentelemetry)                                             | `cargo add trevrpc-opentelemetry`                                              | [OpenTelemetry](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#observability) metrics and tracing     |
+| [`trevrpc-protovalidate`](https://crates.io/crates/trevrpc-protovalidate)                                             | `cargo add trevrpc-protovalidate`                                              | [protovalidate](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#request-validation) request validation |
 
 The `trevrpc-rust` Nix package provides the plugin: `nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust`.
 
@@ -61,7 +61,7 @@ let reply = client.say_hello(&greeter::HelloRequest { name: "TrevRPC".into() }).
 channel.close();
 ```
 
-Runnable servers and clients are in [`examples`](examples).
+Runnable servers and clients are in [`examples`](https://trev.zip/llc/TrevRPC/src/branch/main/trevrpc-rust/examples).
 
 ## Documentation
 
@@ -76,6 +76,6 @@ cargo run --features dev-certificate --example greeter_server   # then, in anoth
 cargo run --example greeter_client
 ```
 
-`crates/trevrpc-interop` (installed as `trevrpc-interop-rust`, not published) implements the `server` and `client` subcommands of the cross-runtime [interop suite](../interop/README.md), and the `bench` load client of the [benchmarks](../bench/README.md). Its `Echo`, `UnreliableEcho`, `CompressedEcho` and `RefusingEcho` services are generated from `interop/proto/interop.proto`, `interop/proto/unreliable.proto` and `interop/proto/compressed.proto`, the single copy of the contract.
+`crates/trevrpc-interop` (installed as `trevrpc-interop-rust`, not published) implements the `server` and `client` subcommands of the cross-runtime [interop suite](https://trev.zip/llc/TrevRPC/src/branch/main/interop/README.md), and the `bench` load client of the [benchmarks](https://trev.zip/llc/TrevRPC/src/branch/main/bench/README.md). Its `Echo`, `UnreliableEcho`, `CompressedEcho` and `RefusingEcho` services are generated from `interop/proto/interop.proto`, `interop/proto/unreliable.proto` and `interop/proto/compressed.proto`, the single copy of the contract.
 
 See [Local Development](https://trev.zip/llc/TrevRPC/wiki/Local-Development) for the repository-wide checks.
