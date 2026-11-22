@@ -303,13 +303,14 @@
             };
             trevrpc-go-qmux = pkgs.callPackage ./trevrpc-go/qmux { inherit qmuxGolden; };
             trevrpc-go-otel = pkgs.callPackage ./trevrpc-go/oteltrevrpc { };
+            trevrpc-erlang-qmux = pkgs.callPackage ./trevrpc-erlang/qmux { inherit qmuxGolden; };
             trevrpc-erlang = pkgs.callPackage ./trevrpc-erlang {
               inherit
                 wireGolden
-                qmuxGolden
                 zstdGolden
                 trevrpcProto
                 ;
+              qmux = self.packages.${system}.trevrpc-erlang-qmux;
             };
             trevrpc-erlang-interop = pkgs.callPackage ./trevrpc-erlang/interop {
               inherit (self.packages.${system}) trevrpc-erlang;

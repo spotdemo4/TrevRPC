@@ -1,13 +1,14 @@
 %% @doc The QMux wire format (draft-ietf-quic-qmux-02): the QUIC v1 frames
-%% QMux carries, its QX_TRANSPORT_PARAMETERS and QX_PING frames, and the
-%% Size-prefixed records of QMux over TLS.
+%% QMux carries, its QX_TRANSPORT_PARAMETERS and QX_PING frames, RFC 9221
+%% DATAGRAM frames, and the Size-prefixed records of QMux over TLS.
 %%
-%% Only what TrevRPC uses is supported: bidirectional streams with QUIC flow
-%% control and stream limits. Frames QMux forbids (ACK, PING, CRYPTO,
-%% NEW_TOKEN, DATAGRAM, ...) and extensions TrevRPC never negotiates are
-%% FRAME_ENCODING_ERRORs, and transport parameters that only make sense over
+%% Frames QMux forbids (ACK, PING, CRYPTO, NEW_TOKEN, ...) and extensions
+%% that are never negotiated (RESET_STREAM_AT, ...) are
+%% FRAME_ENCODING_ERRORs, a DATAGRAM frame to an endpoint that did not
+%% advertise max_datagram_frame_size, or larger than it, is a
+%% PROTOCOL_VIOLATION, and transport parameters that only make sense over
 %% QUIC packets are TRANSPORT_PARAMETER_ERRORs.
--module(trevrpc_qmux_frame).
+-module(qmux_frame).
 
 -export([
     stream/4,
@@ -15,7 +16,8 @@
     stop_sending/2,
     max_data/1,
     max_stream_data/2,
-    max_streams_bidi/1,
+    max_streams/2,
+    datagram/1,
     application_close/2,
     transport_close/3,
     ping/1,
@@ -23,9 +25,11 @@
     transport_parameters/1,
     record/1,
     decode_frames/1,
+    decode_frames/2,
     decode_parameters/1,
     decode_record/2,
     stream_overhead/3,
+    max_datagram_payload/1,
     error_code/1,
     default_max_record_size/0,
     max_streams_limit/0
@@ -47,7 +51,7 @@
 -define(STREAMS_BLOCKED_UNI, 16#17).
 -define(CONNECTION_CLOSE, 16#1c).
 -define(APPLICATION_CLOSE, 16#1d).
-%% RFC 9221 DATAGRAM, without and with a Length field. Never negotiated.
+%% RFC 9221 DATAGRAM, without and with a Length field.
 -define(DATAGRAM, 16#30).
 -define(DATAGRAM_LEN, 16#31).
 %% draft-ietf-quic-qmux-02 codepoints.
@@ -55,6 +59,8 @@
 -define(PING, 16#348c67529ef8c7bd).
 -define(PING_RESPONSE, 16#348c67529ef8c7be).
 -define(MAX_RECORD_SIZE, 16#0571c59429cd0845).
+%% RFC 9221 max_datagram_frame_size.
+-define(MAX_DATAGRAM_FRAME_SIZE, 16#20).
 
 -define(FIN, 16#01).
 -define(LEN, 16#02).
@@ -77,17 +83,23 @@
     | {connection_close, application, non_neg_integer(), binary()}
     | {transport_parameters, binary()}
     | {ping, non_neg_integer()}
-    | {ping_response, non_neg_integer()}.
+    | {ping_response, non_neg_integer()}
+    | {datagram, binary()}.
 
-%% Transport parameters, all optional: max_idle_timeout (ms),
-%% initial_max_data, initial_max_stream_data_bidi_local and _remote,
-%% initial_max_streams_bidi, and max_record_size.
+%% Transport parameters, all optional and zero by default, as QUIC's are:
+%% max_idle_timeout (ms), the initial flow control limits and stream limits
+%% of RFC 9000 Section 18.2, max_datagram_frame_size (RFC 9221 Section 3),
+%% which is the largest DATAGRAM frame accepted, type and length included,
+%% and zero to refuse them, and max_record_size, which defaults to 16382.
 -type parameters() :: #{
     max_idle_timeout => non_neg_integer(),
     initial_max_data => non_neg_integer(),
     initial_max_stream_data_bidi_local => non_neg_integer(),
     initial_max_stream_data_bidi_remote => non_neg_integer(),
+    initial_max_stream_data_uni => non_neg_integer(),
     initial_max_streams_bidi => non_neg_integer(),
+    initial_max_streams_uni => non_neg_integer(),
+    max_datagram_frame_size => non_neg_integer(),
     max_record_size => non_neg_integer()
 }.
 
@@ -122,10 +134,10 @@ fin_flag(false) -> 0.
 %% @doc The bytes a STREAM frame header takes for Length bytes at Offset.
 -spec stream_overhead(non_neg_integer(), non_neg_integer(), non_neg_integer()) -> pos_integer().
 stream_overhead(Id, Offset, Length) ->
-    1 + trevrpc_varint:size(Id) + trevrpc_varint:size(Length) +
+    1 + qmux_varint:size(Id) + qmux_varint:size(Length) +
         case Offset of
             0 -> 0;
-            _ -> trevrpc_varint:size(Offset)
+            _ -> qmux_varint:size(Offset)
         end.
 
 -spec reset_stream(non_neg_integer(), non_neg_integer(), non_neg_integer()) -> binary().
@@ -149,9 +161,30 @@ max_data(Max) ->
 max_stream_data(Id, Max) ->
     <<(varint(?MAX_STREAM_DATA))/binary, (varint(Id))/binary, (varint(Max))/binary>>.
 
--spec max_streams_bidi(non_neg_integer()) -> binary().
-max_streams_bidi(Max) ->
-    <<(varint(?MAX_STREAMS_BIDI))/binary, (varint(Max))/binary>>.
+-spec max_streams(bidi | uni, non_neg_integer()) -> binary().
+max_streams(bidi, Max) ->
+    <<(varint(?MAX_STREAMS_BIDI))/binary, (varint(Max))/binary>>;
+max_streams(uni, Max) ->
+    <<(varint(?MAX_STREAMS_UNI))/binary, (varint(Max))/binary>>.
+
+%% @doc A DATAGRAM frame. It always carries its length, so more frames may
+%% follow it in the record.
+-spec datagram(iodata()) -> iodata().
+datagram(Data) ->
+    [varint(?DATAGRAM_LEN), varint(iolist_size(Data)) | Data].
+
+%% @doc The largest payload of a DATAGRAM frame of at most `FrameSize'
+%% bytes, or 0 when not even an empty one fits.
+-spec max_datagram_payload(non_neg_integer()) -> non_neg_integer().
+max_datagram_payload(FrameSize) when is_integer(FrameSize), FrameSize >= 0 ->
+    %% The type takes a byte; the length takes 1, 2, 4 or 8, each holding up
+    %% to a limit.
+    lists:max([
+        max(0, min(FrameSize - 1 - LengthSize, Largest))
+     || {LengthSize, Largest} <- [
+            {1, 16#3f}, {2, 16#3fff}, {4, 16#3fffffff}, {8, 16#3fffffffffffffff}
+        ]
+    ]).
 
 %% @doc An application CONNECTION_CLOSE (type 0x1d).
 -spec application_close(non_neg_integer(), binary()) -> binary().
@@ -191,7 +224,10 @@ transport_parameters(Params) ->
         (parameter(16#04, maps:get(initial_max_data, Params, 0)))/binary,
         (parameter(16#05, maps:get(initial_max_stream_data_bidi_local, Params, 0)))/binary,
         (parameter(16#06, maps:get(initial_max_stream_data_bidi_remote, Params, 0)))/binary,
+        (parameter(16#07, maps:get(initial_max_stream_data_uni, Params, 0)))/binary,
         (parameter(16#08, maps:get(initial_max_streams_bidi, Params, 0)))/binary,
+        (parameter(16#09, maps:get(initial_max_streams_uni, Params, 0)))/binary,
+        (parameter(?MAX_DATAGRAM_FRAME_SIZE, maps:get(max_datagram_frame_size, Params, 0)))/binary,
         (parameter(?MAX_RECORD_SIZE, maps:get(max_record_size, Params, ?DEFAULT_MAX_RECORD_SIZE)))/binary
     >>,
     <<(varint(?TRANSPORT_PARAMETERS))/binary, (varint(byte_size(Body)))/binary, Body/binary>>.
@@ -207,7 +243,7 @@ parameter(Id, Value) ->
 record(Frames) ->
     [varint(iolist_size(Frames)) | Frames].
 
-varint(Value) -> trevrpc_varint:encode(Value).
+varint(Value) -> qmux_varint:encode(Value).
 
 %%% Decoding
 
@@ -216,7 +252,7 @@ varint(Value) -> trevrpc_varint:encode(Value).
 -spec decode_record(binary(), non_neg_integer()) ->
     {ok, binary(), binary()} | more | {error, error()}.
 decode_record(Bin, MaxRecordSize) ->
-    case trevrpc_varint:decode(Bin) of
+    case qmux_varint:decode(Bin) of
         more ->
             more;
         {Size, _Rest} when Size > MaxRecordSize ->
@@ -234,24 +270,65 @@ decode_record(Bin, MaxRecordSize) ->
             end
     end.
 
-%% @doc Decodes the frames of one record, in order. PADDING is dropped.
+%% @doc Decodes the frames of one record, in order, for an endpoint that
+%% accepts no DATAGRAM frames. PADDING is dropped.
 -spec decode_frames(binary()) -> {ok, [frame()]} | {error, error()}.
 decode_frames(Record) ->
-    decode_frames(Record, []).
+    decode_frames(Record, 0).
 
-decode_frames(<<>>, Acc) ->
+%% @doc Decodes the frames of one record for an endpoint that advertised
+%% `MaxDatagramFrameSize' (0 to accept no DATAGRAM frames).
+-spec decode_frames(binary(), non_neg_integer()) -> {ok, [frame()]} | {error, error()}.
+decode_frames(Record, MaxDatagramFrameSize) ->
+    decode_frames(Record, MaxDatagramFrameSize, []).
+
+decode_frames(<<>>, _MaxDatagram, Acc) ->
     {ok, lists:reverse(Acc)};
-decode_frames(Bin, Acc) ->
-    case trevrpc_varint:decode(Bin) of
+decode_frames(Bin, MaxDatagram, Acc) ->
+    case qmux_varint:decode(Bin) of
         more ->
             truncated(0);
         {?PADDING, Rest} ->
-            decode_frames(Rest, Acc);
+            decode_frames(Rest, MaxDatagram, Acc);
+        {Type, Rest} when Type =:= ?DATAGRAM; Type =:= ?DATAGRAM_LEN ->
+            case datagram_frame(Type, Rest, byte_size(Bin), MaxDatagram) of
+                {ok, Frame, Next} -> decode_frames(Next, MaxDatagram, [Frame | Acc]);
+                {error, _} = Error -> Error
+            end;
         {Type, Rest} ->
             case frame(Type, Rest) of
-                {ok, Frame, Next} -> decode_frames(Next, [Frame | Acc]);
+                {ok, Frame, Next} -> decode_frames(Next, MaxDatagram, [Frame | Acc]);
                 {error, _} = Error -> Error
             end
+    end.
+
+%% A DATAGRAM frame, which starts `Available' bytes from the end of the
+%% record.
+datagram_frame(Type, _Bin, _Available, 0) ->
+    %% RFC 9221 Section 3.
+    {error, {protocol_violation, Type, <<"DATAGRAM frame without max_datagram_frame_size">>}};
+datagram_frame(Type, Bin, Available, Max) ->
+    maybe
+        {ok, Length, Rest} ?=
+            case Type of
+                ?DATAGRAM -> {ok, byte_size(Bin), Bin};
+                ?DATAGRAM_LEN -> varint_field(Type, Bin)
+            end,
+        true ?= Length =< byte_size(Rest) orelse truncated(Type),
+        Size = Available - byte_size(Rest) + Length,
+        true ?=
+            Size =< Max orelse
+            {error,
+                {protocol_violation, Type,
+                    iolist_to_binary(
+                        io_lib:format(
+                            "DATAGRAM frame of ~b bytes exceeds max_datagram_frame_size ~b", [
+                                Size, Max
+                            ]
+                        )
+                    )}},
+        <<Data:Length/binary, Next/binary>> = Rest,
+        {ok, {datagram, Data}, Next}
     end.
 
 frame(Type, Bin) when Type >= ?STREAM, Type =< ?STREAM bor 7 ->
@@ -307,9 +384,6 @@ frame(?PING, Bin) ->
     fields(?PING, 1, Bin, fun([Sequence]) -> {ping, Sequence} end);
 frame(?PING_RESPONSE, Bin) ->
     fields(?PING_RESPONSE, 1, Bin, fun([Sequence]) -> {ping_response, Sequence} end);
-frame(Type, _Bin) when Type =:= ?DATAGRAM; Type =:= ?DATAGRAM_LEN ->
-    %% RFC 9221 §3: a DATAGRAM frame without max_datagram_frame_size.
-    {error, {protocol_violation, Type, <<"DATAGRAM frame without max_datagram_frame_size">>}};
 frame(Type, _Bin) ->
     {error,
         {frame_encoding, Type,
@@ -330,7 +404,7 @@ stream_frame(Type, Bin) ->
             end,
         true ?= Length =< byte_size(Rest3) orelse truncated(Type),
         true ?=
-            Offset + Length =< trevrpc_varint:max() orelse
+            Offset + Length =< qmux_varint:max() orelse
             {error, {frame_encoding, Type, <<"stream data beyond the maximum offset">>}},
         <<Data:Length/binary, Next/binary>> = Rest3,
         {ok, {stream, Id, Offset, Data, Type band ?FIN =/= 0}, Next}
@@ -354,7 +428,7 @@ varints(Type, Count, Bin, Acc) ->
     end.
 
 varint_field(Type, Bin) ->
-    case trevrpc_varint:decode(Bin) of
+    case qmux_varint:decode(Bin) of
         more -> truncated(Type);
         {Value, Rest} -> {ok, Value, Rest}
     end.
@@ -379,6 +453,8 @@ decode_parameters(Body) ->
             );
         {ok, #{initial_max_streams_bidi := Streams}} when Streams > ?MAX_STREAMS ->
             parameter_error(io_lib:format("initial_max_streams_bidi ~b exceeds 2^60", [Streams]));
+        {ok, #{initial_max_streams_uni := Streams}} when Streams > ?MAX_STREAMS ->
+            parameter_error(io_lib:format("initial_max_streams_uni ~b exceeds 2^60", [Streams]));
         Result ->
             Result
     end.
@@ -400,7 +476,7 @@ decode_parameters(Bin, Seen, Params) ->
     end.
 
 param_varint(Bin, Message) ->
-    case trevrpc_varint:decode(Bin) of
+    case qmux_varint:decode(Bin) of
         more -> parameter_error(Message);
         {Value, Rest} -> {ok, Value, Rest}
     end.
@@ -425,17 +501,15 @@ parameter_value(Id, Value, Params) ->
             16#04 -> initial_max_data;
             16#05 -> initial_max_stream_data_bidi_local;
             16#06 -> initial_max_stream_data_bidi_remote;
-            16#07 -> ignored;
+            16#07 -> initial_max_stream_data_uni;
             16#08 -> initial_max_streams_bidi;
-            16#09 -> ignored;
+            16#09 -> initial_max_streams_uni;
+            ?MAX_DATAGRAM_FRAME_SIZE -> max_datagram_frame_size;
             ?MAX_RECORD_SIZE -> max_record_size;
             _ -> unknown
         end,
-    case {Key, trevrpc_varint:decode(Value)} of
+    case {Key, qmux_varint:decode(Value)} of
         {unknown, _} ->
-            {ok, Params};
-        {_, {Integer, <<>>}} when Key =:= ignored ->
-            _ = Integer,
             {ok, Params};
         {_, {Integer, <<>>}} ->
             {ok, Params#{Key => Integer}};

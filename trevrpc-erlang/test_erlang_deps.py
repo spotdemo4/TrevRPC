@@ -207,6 +207,34 @@ class SyncTest(TestCase):
         with self.assertRaisesRegex(SystemExit, "manifest.toml locks no delta"):
             runtime.synced()
 
+    def test_requires_path_dependencies_by_name_without_locking_them(self) -> None:
+        runtime = self.runtime(
+            [
+                *PACKAGES,
+                {
+                    "name": "local_dep",
+                    "version": "1.0.0",
+                    "build_tools": ["gleam"],
+                    "requirements": [],
+                    "source": "local",
+                    "path": "local_dep",
+                },
+            ]
+        )
+        (self.tmp / "gleam.toml").write_text(GLEAM_TOML + 'local_dep = { path = "local_dep" }\n')
+        config = REBAR_CONFIG.replace("{alpha,", "local_dep,\n    {alpha,")
+        (self.tmp / "rebar.config").write_text(config)
+        files = runtime.synced()
+        self.assertIn("local_dep,\n", files[self.tmp / "rebar.config"])
+        self.assertEqual(files[self.tmp / "rebar.lock"], erlang_deps.render_lock(LOCKED))
+        (self.tmp / "rebar.config").write_text(REBAR_CONFIG)
+        with self.assertRaisesRegex(SystemExit, "takes local_dep from a path, which .* does not"):
+            runtime.synced()
+        (self.tmp / "gleam.toml").write_text(GLEAM_TOML)
+        (self.tmp / "rebar.config").write_text(config)
+        with self.assertRaisesRegex(SystemExit, "requires local_dep by name, which gleam.toml"):
+            runtime.synced()
+
     def test_fails_when_gleam_and_rebar3_require_different_packages(self) -> None:
         runtime = self.runtime()
         (self.tmp / "gleam.toml").write_text(GLEAM_TOML + 'epsilon = ">= 1.0.0 and < 2.0.0"\n')

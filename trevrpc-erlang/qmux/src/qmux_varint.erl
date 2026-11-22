@@ -1,8 +1,7 @@
-%% @doc QUIC variable-length integers (RFC 9000, section 16).
-%%
-%% TrevRPC frame headers and datagram flow IDs use them. Encoding is always
-%% minimal; decoding accepts any valid encoding.
--module(trevrpc_varint).
+%% @doc QUIC variable-length integers (RFC 9000, section 16), which every
+%% QMux frame field and record Size is. Encoding is always minimal; decoding
+%% accepts any valid encoding.
+-module(qmux_varint).
 
 -export([encode/1, decode/1, size/1, max/0]).
 

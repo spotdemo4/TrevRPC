@@ -68,7 +68,7 @@ a_chunk_must_decompress_to_its_size_test() ->
         ?assertMatch(
             {error, {invalid, _}},
             trevrpc_zstd_stream:decode(
-                Decoder, <<(trevrpc_varint:encode(S))/binary, Chunk/binary>>, ?MAX
+                Decoder, <<(qmux_varint:encode(S))/binary, Chunk/binary>>, ?MAX
             )
         )
      || S <- [Size - 1, Size + 1]
@@ -163,7 +163,7 @@ senders_end_frames_before_the_window_wraps_test() ->
             {Out, NextEnc} = trevrpc_zstd_stream:encode(Enc, Message),
             Payload = iolist_to_binary(Out),
             {ok, Message, NextDec} = trevrpc_zstd_stream:decode(Dec, Payload, ?MAX),
-            {_, Chunk} = trevrpc_varint:decode(Payload),
+            {_, Chunk} = qmux_varint:decode(Payload),
             %% A frame header carrying Dictionary_ID 1: descriptor with a
             %% one-byte ID, a window descriptor, then the ID.
             Start =

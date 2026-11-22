@@ -144,7 +144,7 @@
     %% What stream compression contexts may hold on the whole server.
     stream_budget := trevrpc_zstd_stream:budget() | undefined,
     %% The options of QMux sessions.
-    qmux := trevrpc_qmux:options(),
+    qmux := qmux:options(),
     %% The HTTP mapping's options, unless HTTP is off.
     http := trevrpc_http:options() | undefined,
     %% How long an HTTP/2 or HTTP/1.1 connection may go without a request.
@@ -652,7 +652,9 @@ qmux_options(Opts) ->
             case Idle of
                 infinity -> infinity;
                 _ -> max(1, Idle div 2)
-            end
+            end,
+        %% Calls return the credit for what they read.
+        stream_flow_control => manual
     }.
 
 %% Runs for every new connection, in the QUIC listener or in a TLS

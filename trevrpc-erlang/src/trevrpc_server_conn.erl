@@ -113,7 +113,7 @@ start(Conn, Config) ->
 
 %% @doc Starts the owner of a QMux session over the TLS connection `Socket',
 %% whose handshake completed, with the server's session options and `Opts'
-%% (how its records travel: see {@link trevrpc_qmux:options()}).
+%% (how its records travel: see {@link qmux:options()}).
 %% The caller must be the socket's controlling process; the session takes
 %% it over.
 -spec start_qmux(ssl:sslsocket(), map(), trevrpc_server:config()) ->
@@ -275,7 +275,7 @@ handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
 handle_cast({qmux, Socket, Opts}, #state{config = Config} = State) ->
-    case trevrpc_qmux:start(Socket, server, self(), maps:merge(maps:get(qmux, Config), Opts)) of
+    case qmux:start({qmux_ssl, Socket}, server, self(), maps:merge(maps:get(qmux, Config), Opts)) of
         {ok, Session, Queue} ->
             {noreply, State#state{
                 transport = {qmux, Session, Queue}, session_monitor = monitor(process, Session)
@@ -323,7 +323,7 @@ handle_info(
 handle_info({Tag, Pid, Event}, #state{transport = Transport} = State) when
     is_tuple(Transport),
     element(2, Transport) =:= Pid,
-    (Tag =:= quic orelse Tag =:= trevrpc_qmux orelse Tag =:= quic_h3 orelse Tag =:= h2 orelse
+    (Tag =:= quic orelse Tag =:= qmux orelse Tag =:= quic_h3 orelse Tag =:= h2 orelse
         Tag =:= h1 orelse Tag =:= trevrpc_wt)
 ->
     quic_event(Event, State);
@@ -636,8 +636,10 @@ accept_websocket(Id, Accept, Request, #state{transport = {h1, Conn}, config = Co
         end,
     case Upgraded of
         {ok, Socket, Received} ->
-            Opts = maps:merge(maps:get(qmux, Config), #{framing => websocket, received => Received}),
-            case trevrpc_qmux:start(Socket, server, self(), Opts) of
+            Opts = maps:merge(maps:get(qmux, Config), #{
+                framing => trevrpc_qmux_websocket, received => Received
+            }),
+            case qmux:start({qmux_ssl, Socket}, server, self(), Opts) of
                 {ok, Session, Queue} ->
                     logger:info("trevrpc: WebSocket session from ~s", [
                         trevrpc_http1:describe(Request)

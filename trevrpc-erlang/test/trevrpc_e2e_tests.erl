@@ -532,7 +532,7 @@ concurrent_test(#{channel := Channel}) ->
 conn_calls_test(#{channel := Channel, server := Server}) ->
     %% #state{connections = #{Monitor => Pid}} of the server.
     [Conn] = maps:values(element(5, sys:get_state(Server))),
-    Modules = [trevrpc_transport, trevrpc_qmux, quic, quic_connection],
+    Modules = [trevrpc_transport, qmux, quic, quic_connection],
     _ = [erlang:trace_pattern({Module, '_', '_'}, true, [local]) || Module <- Modules],
     1 = erlang:trace(Conn, true, [call]),
     try
@@ -560,7 +560,7 @@ conn_calls_test(#{channel := Channel, server := Server}) ->
 %% through, makes no call into the transport for them.
 channel_calls_test(#{channel := Channel}) ->
     ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"c">>, #{})),
-    Modules = [trevrpc_transport, trevrpc_qmux, quic, quic_connection],
+    Modules = [trevrpc_transport, qmux, quic, quic_connection],
     _ = [erlang:trace_pattern({Module, '_', '_'}, true, [local]) || Module <- Modules],
     1 = erlang:trace(Channel, true, [call]),
     try
@@ -2006,7 +2006,7 @@ flow_reader({qmux, Session, _Queue}) ->
     {
         fun() ->
             #{recv_max := Max, received := Received, consumed := Consumed} =
-                trevrpc_qmux:flow(Session),
+                qmux:flow(Session),
             ?assert(Consumed < 1 bsl 20),
             #{granted => Max, received => Received}
         end,
@@ -3295,7 +3295,7 @@ adopted_session(Credentials) ->
     try
         [First] = await_attempts(Channel, []),
         Gone = spawn(fun() -> ok end),
-        Channel ! {trevrpc_qmux, Gone, {closed, connection_lost}},
+        Channel ! {qmux, Gone, {closed, connection_lost}},
         %% The closed event failed the attempt; its retry, after the first
         %% backoff, goes to the silent listener again.
         [_Retry] = await_attempts(Channel, [First]),
@@ -3306,8 +3306,8 @@ adopted_session(Credentials) ->
             {alpn_advertised_protocols, [trevrpc:qmux_alpn()]}
         ]),
         Parameters = trevrpc_quic:qmux_parameters(trevrpc:default_max_frame_size(), 64, 0, 30000),
-        {ok, Session, _Queue} = trevrpc_qmux:start(Socket, client, Channel, #{
-            parameters => Parameters
+        {ok, Session, _Queue} = qmux:start({qmux_ssl, Socket}, client, Channel, #{
+            parameters => Parameters, stream_flow_control => manual
         }),
         ok = trevrpc_channel:wait_until_ready(Channel, 5000),
         ?assertEqual(Session, session(Channel)),
@@ -3354,7 +3354,7 @@ server_session_dies(Credentials) ->
         [Session] = [
             Pid
          || Pid <- processes(),
-            proc_lib:translate_initial_call(Pid) =:= {trevrpc_qmux, init, 1},
+            proc_lib:translate_initial_call(Pid) =:= {qmux, init, 1},
             {monitors, Monitors} <- [process_info(Pid, monitors)],
             lists:any(fun(Owner) -> lists:member({process, Owner}, Monitors) end, Connections)
         ],
@@ -3486,7 +3486,7 @@ early_close_fails_the_attempt(Credentials) ->
     try
         {ok, Held} = gen_tcp:accept(Listen, 5000),
         Session = spawn(fun() -> ok end),
-        Channel ! {trevrpc_qmux, Session, {closed, connection_lost}},
+        Channel ! {qmux, Session, {closed, connection_lost}},
         receive
             {trace, Channel, call, {trevrpc_channel, retry, _}} -> ok
         after 5000 -> error(attempt_not_failed)

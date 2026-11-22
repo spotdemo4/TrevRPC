@@ -32,7 +32,7 @@
 %% @doc Encodes a datagram payload from frames already encoded.
 -spec encode(non_neg_integer(), [iodata()]) -> iodata().
 encode(Flow, Frames) ->
-    [trevrpc_varint:encode(Flow) | Frames].
+    [qmux_varint:encode(Flow) | Frames].
 
 %% @doc Encodes a datagram payload carrying each message in a MESSAGE frame.
 -spec encode_messages(non_neg_integer(), [iodata()]) -> iodata().
@@ -64,7 +64,7 @@ decode(Payload) ->
 %% flow (`error').
 -spec parse(binary()) -> {ok, pos_integer(), [message()]} | {malformed, pos_integer()} | error.
 parse(Payload) ->
-    case trevrpc_varint:decode(Payload) of
+    case qmux_varint:decode(Payload) of
         {Flow, Frames} when Flow > 0 ->
             case frames(Frames, []) of
                 error -> {malformed, Flow};
@@ -77,11 +77,11 @@ parse(Payload) ->
 frames(<<>>, Acc) ->
     lists:reverse(Acc);
 frames(Bin, Acc) ->
-    case trevrpc_varint:decode(Bin) of
+    case qmux_varint:decode(Bin) of
         more ->
             error;
         {Code, Rest} ->
-            case trevrpc_varint:decode(Rest) of
+            case qmux_varint:decode(Rest) of
                 {Length, Data} when Length =< byte_size(Data) ->
                     <<Payload:Length/binary, Next/binary>> = Data,
                     case trevrpc_frame:type_name(Code) of

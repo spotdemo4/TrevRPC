@@ -191,7 +191,7 @@
     fallback_until :: integer() | undefined,
     quic_opts :: map(),
     tls_opts :: [ssl:tls_client_option()],
-    qmux_opts :: trevrpc_qmux:options(),
+    qmux_opts :: qmux:options(),
     max_frame_size :: pos_integer(),
     connect_timeout :: pos_integer(),
     compression :: trevrpc_zstd:config(),
@@ -564,7 +564,9 @@ init(Opts, Compression) ->
             parameters => trevrpc_quic:qmux_parameters(MaxFrame, 64, 0, Idle),
             keep_alive => max(1, Idle div 2),
             handshake_timeout => maps:get(connect_timeout, Opts, 10000),
-            send_timeout => Idle
+            send_timeout => Idle,
+            %% Calls return the credit for what they read.
+            stream_flow_control => manual
         },
         max_frame_size = MaxFrame,
         connect_timeout = maps:get(connect_timeout, Opts, 10000),
@@ -785,7 +787,7 @@ handle_cast(sample, State) ->
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info({Tag, Pid, Event}, #state{status = ready, transport = Transport} = State) when
-    (Tag =:= quic orelse Tag =:= trevrpc_qmux), element(2, Transport) =:= Pid
+    (Tag =:= quic orelse Tag =:= qmux), element(2, Transport) =:= Pid
 ->
     connection_event(Pid, Event, State);
 handle_info({quic, Pid, Event}, #state{extras = Extras, draining = Draining} = State) when
@@ -793,13 +795,13 @@ handle_info({quic, Pid, Event}, #state{extras = Extras, draining = Draining} = S
 ->
     connection_event(Pid, Event, State);
 handle_info({Tag, Pid, _Event}, #state{retired = Retired} = State) when
-    (Tag =:= quic orelse Tag =:= trevrpc_qmux) andalso is_map_key(Pid, Retired)
+    (Tag =:= quic orelse Tag =:= qmux) andalso is_map_key(Pid, Retired)
 ->
     {noreply, State};
 handle_info({quic, Pid, Event}, #state{status = ready} = State) ->
     %% Only an extra's attempt dials while the generation is ready.
     {noreply, extra_attempt_event(Pid, Event, State)};
-handle_info({Tag, Pid, Event}, State) when Tag =:= quic; Tag =:= trevrpc_qmux ->
+handle_info({Tag, Pid, Event}, State) when Tag =:= quic; Tag =:= qmux ->
     case find_attempt(Pid, State) of
         {ok, Ref} ->
             attempt_event(Ref, Event, State);
@@ -1069,7 +1071,7 @@ tcp_attempt(
                     Qmux = trevrpc:qmux_alpn(),
                     case ssl:negotiated_protocol(Socket) of
                         {ok, Qmux} ->
-                            case trevrpc_qmux:start(Socket, client, Self, QmuxOpts) of
+                            case qmux:start({qmux_ssl, Socket}, client, Self, QmuxOpts) of
                                 {ok, Session, Queue} ->
                                     {ok, {qmux, Session, Queue}};
                                 Error ->

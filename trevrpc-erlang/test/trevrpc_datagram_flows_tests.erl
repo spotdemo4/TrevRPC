@@ -11,7 +11,7 @@ datagram(Flow, Messages) ->
 
 %% A datagram of `Flow' whose frame runs past its end.
 malformed(Flow) ->
-    iolist_to_binary([trevrpc_varint:encode(Flow), 0, 5, "ab"]).
+    iolist_to_binary([qmux_varint:encode(Flow), 0, 5, "ab"]).
 
 reg(Flow, Flows) ->
     reg(Flow, true, Flows).

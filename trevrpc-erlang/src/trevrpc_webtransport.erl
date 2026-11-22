@@ -228,7 +228,7 @@ init(Session, _Request, #{conn := Conn, window := Window} = Opts) ->
 %% The bytes of the quarter stream ID that prefixes each datagram of the
 %% session.
 quarter_size(SessionId) ->
-    byte_size(trevrpc_varint:encode(SessionId div 4)).
+    byte_size(qmux_varint:encode(SessionId div 4)).
 
 %% The server's admission decided on the request before erlang-webtransport
 %% saw it; without this callback, erlang-webtransport would refuse every

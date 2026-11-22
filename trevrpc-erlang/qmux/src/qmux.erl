@@ -1,22 +1,29 @@
-%% @doc A QMux session (draft-ietf-quic-qmux-02) over a TLS connection: QUIC's
-%% bidirectional streams, flow control and stream limits, carried in
-%% Size-prefixed records over a reliable byte stream, or in WebSocket
-%% messages (draft-lcurley-qmux-websocket-00) over a TLS connection that
-%% upgraded to a WebSocket (see `trevrpc_qmux_record').
+%% @doc A QMux session (draft-ietf-quic-qmux-02): QUIC's streams, flow
+%% control, stream limits and datagrams, carried in records over a reliable
+%% byte stream, such as TLS over TCP. Applications built on QUIC streams can
+%% use it as a fallback for networks that block UDP.
 %%
-%% Its API and the events it sends its owner mirror erlang_quic's, so the
-%% rest of the runtime drives native QUIC and QMux the same way (see
-%% `trevrpc_transport'). Events go to the owner as
-%% `{trevrpc_qmux, Session, Event}':
+%% A session runs over a `qmux_transport' (`qmux_ssl', `qmux_tcp', or one
+%% of the application's own) and frames its records with a `qmux_framing':
+%% Size-prefixed by default, or one record per message, as QMux over
+%% WebSocket does (draft-lcurley-qmux-websocket-00).
+%%
+%% Its API and the events it sends its owner mirror erlang_quic's, so an
+%% application drives native QUIC and QMux the same way. Events go to the
+%% owner as `{qmux, Session, Event}':
 %%
 %% <ul>
 %%   <li>`{connected, #{send_queue => Queue}}': the peer's transport
 %%       parameters arrived; `Queue' is the session's send queue, as
 %%       {@link start/4} returns it.</li>
-%%   <li>`{stream_opened, Id}', `{stream_data, Id, Bin, Fin}',
-%%       `{stream_reset, Id, Code}', `{stop_sending, Id, Code}'.</li>
-%%   <li>`{streams_available, bidi}': an {@link open_stream/1} refused for
-%%       lack of stream credit would now succeed.</li>
+%%   <li>`{stream_opened, Id}': the peer opened a stream, bidirectional or
+%%       unidirectional (`Id band 2 =/= 0').</li>
+%%   <li>`{stream_data, Id, Bin, Fin}', `{stream_reset, Id, Code}',
+%%       `{stop_sending, Id, Code}'.</li>
+%%   <li>`{streams_available, bidi | uni}': an {@link open_stream/1} or
+%%       {@link open_unidirectional_stream/1} refused for lack of stream
+%%       credit would now succeed.</li>
+%%   <li>`{datagram, Bin}': a DATAGRAM frame arrived (RFC 9221).</li>
 %%   <li>`send_ready': the send queue drained, after
 %%       {@link notify_send_ready/1}.</li>
 %%   <li>`{closed, Reason}': the session ended.</li>
@@ -29,11 +36,22 @@
 %% would otherwise deadlock. At most ?WRITE_WINDOW bytes wait in the
 %% writer; the rest stays in the streams until it wrote them.
 %%
-%% Streams are always in manual flow control: the peer may send one window
-%% past the bytes returned with {@link consume/3}. Data, and a FIN, go out in
-%% order: a FIN travels with a stream's last data, so a reset's final size,
-%% the bytes actually sent, always agrees with what the peer saw.
--module(trevrpc_qmux).
+%% A stream earns the peer receive credit as erlang_quic's do: in `auto'
+%% flow control (the default) as its data is delivered to the owner, while
+%% the owner's mailbox holds no more than `max_owner_queue' messages; in
+%% `manual' flow control only for the bytes returned with {@link consume/3},
+%% so an owner that stops reading stops the peer after one window. Data,
+%% and a FIN, go out in order: a FIN travels with a stream's last data, so
+%% a reset's final size, the bytes actually sent, always agrees with what
+%% the peer saw.
+%%
+%% Datagrams go each way only to an end that advertised
+%% max_datagram_frame_size (RFC 9221 Section 3): a session sends them once
+%% the peer did, and accepts them if it did itself. As over QUIC, one may be
+%% dropped: when too many wait to be sent, or when the
+%% owner's mailbox holds more than `max_owner_queue' messages as it
+%% arrives. Unlike over QUIC, one that is sent arrives, in order.
+-module(qmux).
 
 -behaviour(gen_server).
 
@@ -42,10 +60,14 @@
     send_data/5,
     send_data_async/5,
     queued/1,
+    set_stream_flow_control/3,
     consume/3,
     reset_stream/3,
     stop_sending/3,
     open_stream/1,
+    open_unidirectional_stream/1,
+    send_datagram/2,
+    datagram_max_size/1,
     notify_send_ready/1,
     close/2,
     peername/1,
@@ -53,7 +75,7 @@
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--export_type([options/0, send_queue/0]).
+-export_type([options/0, send_queue/0, flow_control/0]).
 
 %% Session options:
 %% <ul>
@@ -66,20 +88,30 @@
 %%       QX_TRANSPORT_PARAMETERS to arrive (default 10 s).</li>
 %%   <li>`send_timeout': milliseconds a write to a peer that stopped reading
 %%       may block before the connection is lost (default 30 s).</li>
-%%   <li>`framing': how records travel, `tls' (the default) or
-%%       `websocket'.</li>
+%%   <li>`framing': the `qmux_framing' module that carries records
+%%       (default `qmux_stream_framing', Size-prefixed records).</li>
 %%   <li>`received': bytes already read from the socket, which come before
 %%       what it delivers (default none).</li>
+%%   <li>`stream_flow_control': how new streams earn the peer credit,
+%%       `auto' (the default) or `manual'; see
+%%       {@link set_stream_flow_control/3}.</li>
+%%   <li>`max_owner_queue': the owner's mailbox length past which `auto'
+%%       streams hold their credit back and datagrams are dropped, or
+%%       `infinity' (default 1000).</li>
 %% </ul>
 -type options() :: #{
-    parameters := trevrpc_qmux_frame:parameters(),
+    parameters := qmux_frame:parameters(),
     keep_alive => pos_integer() | infinity,
     send_queue_limit => pos_integer(),
     handshake_timeout => pos_integer(),
     send_timeout => pos_integer(),
-    framing => trevrpc_qmux_record:framing(),
-    received => binary()
+    framing => module(),
+    received => binary(),
+    stream_flow_control => flow_control(),
+    max_owner_queue => pos_integer() | infinity
 }.
+
+-type flow_control() :: auto | manual.
 
 %% The session's send queue, as its writers see it: the bytes written and
 %% not sent yet (?QUEUED), whether the session ended (?CLOSED), and the
@@ -102,45 +134,63 @@
     fin_requested = false :: boolean(),
     fin_sent = false :: boolean(),
     reset_sent = false :: boolean(),
-    %% Receiving: the offset received, our limit and window, the offset the
-    %% owner consumed, and the final size once known.
+    %% Receiving: the offset received, our limit and window, the offset
+    %% consumed, and the final size once known.
     received = 0 :: non_neg_integer(),
     recv_max :: non_neg_integer(),
     recv_window :: non_neg_integer(),
     read = 0 :: non_neg_integer(),
     final_size :: non_neg_integer() | undefined,
+    %% Credit comes back as data is delivered, not with consume/3.
+    auto :: boolean(),
     %% The owner was given the stream's end: FIN or reset.
     recv_ended = false :: boolean(),
     %% The owner stopped reading: later data is consumed at once.
     read_stopped = false :: boolean()
 }).
 
+%% The streams of one direction: those we opened and may open, and whether
+%% the owner waits for more; those the peer opened and may open, and
+%% whether a MAX_STREAMS raising that limit is due.
+-record(limits, {
+    opened_local = 0 :: non_neg_integer(),
+    max_local = 0 :: non_neg_integer(),
+    want = false :: boolean(),
+    opened_remote = 0 :: non_neg_integer(),
+    max_remote = 0 :: non_neg_integer(),
+    send_max = false :: boolean()
+}).
+
 -record(state, {
-    socket :: ssl:sslsocket() | undefined,
+    transport :: module(),
+    socket :: qmux_transport:socket() | undefined,
+    %% The tags of the socket's data, closed and error messages.
+    messages :: {atom(), atom(), atom()},
     %% The process that writes to the socket, its monitor, and the bytes
     %% handed to it and not written yet.
     writer :: pid() | undefined,
     writer_monitor :: reference() | undefined,
     unwritten = 0 :: non_neg_integer(),
-    %% The WebSocket Pong owed to the peer's latest Ping, waiting for room
-    %% in the writer.
+    %% What the framing owes the peer for its latest message, such as a
+    %% WebSocket Pong, waiting for room in the writer.
     pong = [] :: iodata(),
     role :: client | server,
     owner :: pid(),
-    local :: trevrpc_qmux_frame:parameters(),
-    peer :: trevrpc_qmux_frame:parameters() | undefined,
+    max_owner_queue :: pos_integer() | infinity,
+    local :: qmux_frame:parameters(),
+    peer :: qmux_frame:parameters() | undefined,
     max_record_size :: pos_integer(),
-    framing :: trevrpc_qmux_record:t(),
+    framing :: qmux_framing:t(),
     %% Bytes read before the session took the socket over.
     received = <<>> :: binary(),
     streams = #{} :: #{non_neg_integer() => #stream{}},
-    %% Streams we opened and may open; streams the peer opened and may open.
-    opened_local = 0 :: non_neg_integer(),
-    max_local = 0 :: non_neg_integer(),
-    want_streams = false :: boolean(),
-    opened_remote = 0 :: non_neg_integer(),
-    max_remote :: non_neg_integer(),
-    send_max_streams = false :: boolean(),
+    bidi :: #limits{},
+    uni :: #limits{},
+    auto :: boolean(),
+    %% Auto streams whose credit waits for the owner to catch up, and the
+    %% timer that checks again.
+    withheld = #{} :: #{non_neg_integer() => true},
+    credit_timer = false :: boolean(),
     %% Connection flow control.
     conn_send_max = 0 :: non_neg_integer(),
     conn_sent = 0 :: non_neg_integer(),
@@ -153,6 +203,11 @@
     %% data or a FIN to send, in turn.
     control = [] :: [iodata()],
     ready = queue:new() :: queue:queue(non_neg_integer()),
+    %% DATAGRAM frames to send, and how many; and whether stream data goes
+    %% before them in the next record, as the two take turns.
+    datagrams = queue:new() :: queue:queue(iodata()),
+    datagrams_queued = 0 :: non_neg_integer(),
+    streams_first = false :: boolean(),
     send_queue :: send_queue(),
     notify_ready = false :: boolean(),
     ping_sent = 0 :: non_neg_integer(),
@@ -175,22 +230,29 @@
 -define(QUANTUM, 16384).
 -define(CLOSE_TIMEOUT, 1000).
 -define(DEFAULT_QUEUE_LIMIT, 1048576).
+-define(DEFAULT_MAX_OWNER_QUEUE, 1000).
+%% The DATAGRAM frames waiting to be sent, past which new ones are dropped,
+%% as RFC 9221 Section 5 lets a sender do.
+-define(DATAGRAM_QUEUE, 128).
+%% Milliseconds before withheld credit is looked at again.
+-define(CREDIT_RETRY, 10).
 
 %%% API
 
-%% @doc Starts a session over `Socket', a TLS connection whose handshake
-%% completed, owned by `Owner', and returns it with the send queue its
-%% writers pass to {@link send_data/5}. The caller must be the socket's
-%% controlling process; the session takes it over.
--spec start(ssl:sslsocket(), client | server, pid(), options()) ->
+%% @doc Starts a session over `Socket', a connection of `Transport' (see
+%% `qmux_transport') that is not in active mode, owned by `Owner', and
+%% returns it with the send queue its writers pass to {@link send_data/5}.
+%% The caller must be the socket's controlling process; the session takes
+%% it over.
+-spec start(qmux_transport:t(), client | server, pid(), options()) ->
     {ok, pid(), send_queue()} | {error, term()}.
-start(Socket, Role, Owner, Opts) ->
+start({Transport, Socket}, Role, Owner, Opts) ->
     Queue = {
         atomics:new(2, [{signed, true}]), maps:get(send_queue_limit, Opts, ?DEFAULT_QUEUE_LIMIT)
     },
-    case gen_server:start(?MODULE, {Role, Owner, Queue, Opts}, []) of
+    case gen_server:start(?MODULE, {Transport, Role, Owner, Queue, Opts}, []) of
         {ok, Pid} ->
-            case ssl:controlling_process(Socket, Pid) of
+            case Transport:controlling_process(Socket, Pid) of
                 ok ->
                     gen_server:cast(Pid, {socket, Socket}),
                     {ok, Pid, Queue};
@@ -205,8 +267,8 @@ start(Socket, Role, Owner, Opts) ->
 %% @doc Writes data to a stream, finishing it with `Fin', without waiting
 %% for the session. Refused with `send_queue_full' while the session's send
 %% queue is over its limit, and with `closed' once the session ended. Data
-%% written to a stream that is already reset or finished is dropped, as
-%% the peer would never read it.
+%% written to a stream that is already reset or finished, or that only the
+%% peer sends on, is dropped, as the peer would never read it.
 -spec send_data(pid(), send_queue(), non_neg_integer(), iodata(), boolean()) ->
     ok | {error, send_queue_full | closed}.
 send_data(Session, {Ref, Limit}, Id, Data, Fin) ->
@@ -251,7 +313,18 @@ send_data_async(Session, {Ref, _}, Id, Data, Fin) ->
     atomics:add(Ref, ?QUEUED, byte_size(Bin)),
     gen_server:cast(Session, {send, Id, Bin, Fin}).
 
-%% @doc Returns receive credit for `Bytes' of a stream the owner processed.
+%% @doc Chooses how a stream earns the peer receive credit. `auto' grants
+%% it as data is delivered to the owner, while the owner's mailbox holds no
+%% more than `max_owner_queue' messages; `manual' only for the bytes the
+%% owner returns with {@link consume/3}. Bytes delivered before a switch to
+%% `auto' are consumed at once.
+-spec set_stream_flow_control(pid(), non_neg_integer(), flow_control()) ->
+    ok | {error, unknown_stream | closed}.
+set_stream_flow_control(Session, Id, Mode) when Mode =:= auto; Mode =:= manual ->
+    call(Session, {flow_control, Id, Mode =:= auto}).
+
+%% @doc Returns receive credit for `Bytes' of a `manual' stream the owner
+%% processed; a no-op on an `auto' stream.
 -spec consume(pid(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
 consume(Session, Id, Bytes) ->
     call(Session, {consume, Id, Bytes}).
@@ -271,7 +344,30 @@ stop_sending(Session, Id, Code) ->
 %% stream credit; `{streams_available, bidi}' follows once there is some.
 -spec open_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
 open_stream(Session) ->
-    call(Session, open_stream).
+    call(Session, {open_stream, bidi}).
+
+%% @doc Opens a unidirectional stream, which only this end sends on.
+%% Refused with `stream_limit' without stream credit;
+%% `{streams_available, uni}' follows once there is some.
+-spec open_unidirectional_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
+open_unidirectional_stream(Session) ->
+    call(Session, {open_stream, uni}).
+
+%% @doc Sends `Data' in a DATAGRAM frame (RFC 9221). Refused with
+%% `datagrams_not_supported' unless the peer advertised
+%% max_datagram_frame_size, and with `datagram_too_large' when it does not
+%% fit in one (see {@link datagram_max_size/1}). Like a datagram over
+%% QUIC, it may be dropped when too many wait to be sent.
+-spec send_datagram(pid(), iodata()) ->
+    ok | {error, datagrams_not_supported | datagram_too_large | not_connected | closed}.
+send_datagram(Session, Data) ->
+    call(Session, {send_datagram, iolist_to_binary(Data)}).
+
+%% @doc The largest payload {@link send_datagram/2} accepts, or 0 when the
+%% peer accepts no datagrams.
+-spec datagram_max_size(pid()) -> non_neg_integer() | {error, closed}.
+datagram_max_size(Session) ->
+    call(Session, datagram_max_size).
 
 %% @doc Asks for `send_ready' once the send queue is under half its limit
 %% (at once if it already is).
@@ -305,8 +401,8 @@ call(Session, Request) ->
 
 %%% gen_server
 
--spec init({client | server, pid(), send_queue(), options()}) -> {ok, #state{}}.
-init({Role, Owner, Queue, Opts}) ->
+-spec init({module(), client | server, pid(), send_queue(), options()}) -> {ok, #state{}}.
+init({Transport, Role, Owner, Queue, Opts}) ->
     %% Every write of every stream queues here; under load the queue runs
     %% thousands deep, and kept off the heap it is not copied by each
     %% garbage collection.
@@ -315,15 +411,22 @@ init({Role, Owner, Queue, Opts}) ->
     Local = maps:get(parameters, Opts),
     Now = now_ms(),
     InitialData = maps:get(initial_max_data, Local, 0),
-    MaxRecordSize = maps:get(max_record_size, Local, trevrpc_qmux_frame:default_max_record_size()),
+    MaxRecordSize = maps:get(max_record_size, Local, qmux_frame:default_max_record_size()),
     {ok, #state{
+        transport = Transport,
+        messages = Transport:messages(),
         role = Role,
         owner = Owner,
+        max_owner_queue = maps:get(max_owner_queue, Opts, ?DEFAULT_MAX_OWNER_QUEUE),
         local = Local,
         max_record_size = MaxRecordSize,
-        framing = trevrpc_qmux_record:new(maps:get(framing, Opts, tls), Role, MaxRecordSize),
+        framing = qmux_framing:new(
+            maps:get(framing, Opts, qmux_stream_framing), Role, MaxRecordSize
+        ),
         received = maps:get(received, Opts, <<>>),
-        max_remote = maps:get(initial_max_streams_bidi, Local, 0),
+        bidi = #limits{max_remote = maps:get(initial_max_streams_bidi, Local, 0)},
+        uni = #limits{max_remote = maps:get(initial_max_streams_uni, Local, 0)},
+        auto = maps:get(stream_flow_control, Opts, auto) =:= auto,
         conn_recv_max = InitialData,
         conn_recv_window = InitialData,
         send_queue = Queue,
@@ -332,7 +435,7 @@ init({Role, Owner, Queue, Opts}) ->
         send_timeout = maps:get(send_timeout, Opts, 30000),
         last_received = Now,
         last_sent = Now,
-        control = [trevrpc_qmux_frame:transport_parameters(Local)]
+        control = [qmux_frame:transport_parameters(Local)]
     }}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) ->
@@ -341,8 +444,18 @@ handle_call(_Request, _From, #state{closing = true} = State) ->
     {reply, {error, closed}, State};
 handle_call({consume, Id, Bytes}, _From, State) ->
     case State#state.streams of
+        #{Id := #stream{auto = true}} -> {reply, ok, State};
         #{Id := Stream} -> reply(ok, consumed(Bytes, Stream, State));
         #{} -> {reply, {error, unknown_stream}, State}
+    end;
+handle_call({flow_control, Id, Auto}, _From, State) ->
+    case State#state.streams of
+        #{Id := #stream{received = Received, read = Read} = Stream} when Auto ->
+            reply(ok, consumed(Received - Read, Stream#stream{auto = true}, State));
+        #{Id := Stream} ->
+            {reply, ok, store(Stream#stream{auto = Auto}, State)};
+        #{} ->
+            {reply, {error, unknown_stream}, State}
     end;
 handle_call({reset_stream, Id, Code}, _From, State) ->
     case State#state.streams of
@@ -354,22 +467,33 @@ handle_call({stop_sending, Id, Code}, _From, State) ->
         #{Id := Stream} -> reply(ok, stop_reading(Code, Stream, State));
         #{} -> {reply, {error, unknown_stream}, State}
     end;
-handle_call(open_stream, _From, #state{peer = undefined} = State) ->
+handle_call({open_stream, _Direction}, _From, #state{peer = undefined} = State) ->
     {reply, {error, not_connected}, State};
-handle_call(open_stream, _From, #state{opened_local = Opened, max_local = Max} = State) when
-    Opened < Max
-->
-    Id = (Opened bsl 2) bor role_bit(State#state.role),
-    Stream = new_stream(
-        Id,
-        maps:get(initial_max_stream_data_bidi_remote, State#state.peer, 0),
-        maps:get(initial_max_stream_data_bidi_local, State#state.local, 0)
-    ),
-    {reply, {ok, Id}, State#state{
-        opened_local = Opened + 1, streams = (State#state.streams)#{Id => Stream}
-    }};
-handle_call(open_stream, _From, State) ->
-    {reply, {error, stream_limit}, State#state{want_streams = true}};
+handle_call({open_stream, Direction}, _From, State) ->
+    case open_local(Direction, State) of
+        {ok, Id, Next} -> {reply, {ok, Id}, Next};
+        {error, stream_limit, Next} -> {reply, {error, stream_limit}, Next}
+    end;
+handle_call({send_datagram, _Data}, _From, #state{peer = undefined} = State) ->
+    {reply, {error, not_connected}, State};
+handle_call({send_datagram, Data}, _From, State) ->
+    case datagram_limit(State) of
+        0 ->
+            {reply, {error, datagrams_not_supported}, State};
+        Max when byte_size(Data) > Max ->
+            {reply, {error, datagram_too_large}, State};
+        _ when State#state.datagrams_queued >= ?DATAGRAM_QUEUE ->
+            {reply, ok, State};
+        _ ->
+            reply(ok, State#state{
+                datagrams = queue:in(qmux_frame:datagram(Data), State#state.datagrams),
+                datagrams_queued = State#state.datagrams_queued + 1
+            })
+    end;
+handle_call(datagram_max_size, _From, #state{peer = undefined} = State) ->
+    {reply, 0, State};
+handle_call(datagram_max_size, _From, State) ->
+    {reply, datagram_limit(State), State};
 handle_call(flow, _From, State) ->
     {reply,
         #{
@@ -378,22 +502,31 @@ handle_call(flow, _From, State) ->
             consumed => State#state.conn_consumed
         },
         State};
-handle_call(peername, _From, #state{socket = Socket} = State) ->
-    {reply, ssl:peername(Socket), State}.
+handle_call(peername, _From, #state{transport = Transport, socket = Socket} = State) ->
+    {reply, Transport:peername(Socket), State}.
 
 reply(Reply, State) ->
     {reply, Reply, schedule_flush(State)}.
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
-handle_cast({socket, Socket}, #state{handshake_timeout = Handshake, send_timeout = Send} = State) ->
+handle_cast(
+    {socket, Socket},
+    #state{transport = Transport, handshake_timeout = Handshake, send_timeout = Send} = State
+) ->
     %% A write that blocks longer than the send timeout closes the socket, so
     %% a peer that stops reading cannot hold this process, its timers and its
     %% callers.
-    case ssl:setopts(Socket, [{send_timeout, Send}, {send_timeout_close, true}]) of
+    case
+        Transport:setopts(Socket, [
+            {mode, binary}, {send_timeout, Send}, {send_timeout_close, true}
+        ])
+    of
         ok ->
             erlang:send_after(Handshake, self(), handshake_timeout),
             Session = self(),
-            {Writer, Monitor} = spawn_opt(fun() -> writer(Session, Socket) end, [monitor]),
+            {Writer, Monitor} = spawn_opt(
+                fun() -> writer(Session, Transport, Socket) end, [monitor]
+            ),
             received(State#state.received, State#state{
                 socket = Socket, received = <<>>, writer = Writer, writer_monitor = Monitor
             });
@@ -407,19 +540,22 @@ handle_cast({send, Id, Bin, Fin}, State) ->
 handle_cast(notify_send_ready, State) ->
     noreply(maybe_send_ready(State#state{notify_ready = true}));
 handle_cast({close, Code}, State) ->
-    close_with(trevrpc_qmux_frame:application_close(Code, <<>>), normal, State).
+    close_with(qmux_frame:application_close(Code, <<>>), normal, State).
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
-handle_info({ssl, Socket, _Data}, #state{socket = Socket, closing = true} = State) ->
+handle_info(
+    {Tag, Socket, _Data},
+    #state{socket = Socket, messages = {Tag, _, _}, closing = true} = State
+) ->
     %% Draining after CONNECTION_CLOSE.
     {noreply, State};
-handle_info({ssl, Socket, Data}, #state{socket = Socket} = State) ->
+handle_info({Tag, Socket, Data}, #state{socket = Socket, messages = {Tag, _, _}} = State) ->
     received(Data, State#state{last_received = now_ms()});
-handle_info({ssl_closed, Socket}, #state{socket = Socket, closing = true} = State) ->
+handle_info({Tag, Socket}, #state{socket = Socket, messages = {_, Tag, _}, closing = true} = State) ->
     {stop, normal, State};
-handle_info({ssl_closed, Socket}, #state{socket = Socket} = State) ->
+handle_info({Tag, Socket}, #state{socket = Socket, messages = {_, Tag, _}} = State) ->
     {stop, normal, lost(connection_lost, State)};
-handle_info({ssl_error, Socket, Reason}, #state{socket = Socket} = State) ->
+handle_info({Tag, Socket, Reason}, #state{socket = Socket, messages = {_, _, Tag}} = State) ->
     {stop, normal, lost({connection_lost, Reason}, State)};
 handle_info(flush, State) ->
     {noreply, flush(State#state{flush_pending = false})};
@@ -438,6 +574,8 @@ handle_info({'DOWN', Monitor, process, _Writer, Reason}, #state{writer_monitor =
             _ -> {connection_lost, Reason}
         end,
     {stop, normal, lost(Lost, State#state{writer = undefined, writer_monitor = undefined})};
+handle_info(credit_retry, #state{closing = false} = State) ->
+    noreply(release_credit(State#state{credit_timer = false}));
 handle_info(tick, #state{closing = false} = State) ->
     tick(State);
 handle_info(close_timeout, State) ->
@@ -449,20 +587,20 @@ handle_info(handshake_timeout, #state{peer = undefined, closing = false} = State
 handle_info(
     {'DOWN', _Monitor, process, Owner, _Reason}, #state{owner = Owner, closing = false} = State
 ) ->
-    close_with(trevrpc_qmux_frame:application_close(0, <<>>), normal, State);
+    close_with(qmux_frame:application_close(0, <<>>), normal, State);
 handle_info(_Message, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{socket = undefined} = State) ->
     mark_closed(State);
-terminate(_Reason, #state{socket = Socket} = State) ->
+terminate(_Reason, #state{transport = Transport, socket = Socket} = State) ->
     mark_closed(State),
     %% What the writer holds, such as a WebSocket close, goes out first,
     %% for a moment at most. A write that still blocks then holds the
     %% close, as ssl closes behind its sender, until the send timeout.
     stop_writer(State),
-    _ = ssl:close(Socket),
+    _ = Transport:close(Socket),
     ok.
 
 stop_writer(#state{writer = undefined}) ->
@@ -479,35 +617,35 @@ stop_writer(#state{writer = Writer, writer_monitor = Monitor}) ->
 %% that fails, or blocks past the send timeout, which closes the socket,
 %% ends it, and the session learns of it from its exit. `shutdown' ends the
 %% sending direction and `stop' the writer, after what was handed before.
-writer(Session, Socket) ->
-    writer_loop(Session, Socket, monitor(process, Session)).
+writer(Session, Transport, Socket) ->
+    writer_loop(Session, {Transport, Socket}, monitor(process, Session)).
 
-writer_loop(Session, Socket, Monitor) ->
+writer_loop(Session, {Transport, Socket} = Out, Monitor) ->
     receive
         {write, Data, Size} ->
-            write_batch(Session, Socket, Monitor, [Data], Size);
+            write_batch(Session, Out, Monitor, [Data], Size);
         shutdown ->
-            _ = ssl:shutdown(Socket, write),
-            writer_loop(Session, Socket, Monitor);
+            _ = Transport:shutdown(Socket, write),
+            writer_loop(Session, Out, Monitor);
         stop ->
             ok;
         {'DOWN', Monitor, process, Session, _} ->
             ok
     end.
 
-write_batch(Session, Socket, Monitor, Batch, Size) when Size < ?WRITE_WINDOW ->
+write_batch(Session, Out, Monitor, Batch, Size) when Size < ?WRITE_WINDOW ->
     receive
-        {write, Data, More} -> write_batch(Session, Socket, Monitor, [Data | Batch], Size + More)
-    after 0 -> write_out(Session, Socket, Monitor, Batch, Size)
+        {write, Data, More} -> write_batch(Session, Out, Monitor, [Data | Batch], Size + More)
+    after 0 -> write_out(Session, Out, Monitor, Batch, Size)
     end;
-write_batch(Session, Socket, Monitor, Batch, Size) ->
-    write_out(Session, Socket, Monitor, Batch, Size).
+write_batch(Session, Out, Monitor, Batch, Size) ->
+    write_out(Session, Out, Monitor, Batch, Size).
 
-write_out(Session, Socket, Monitor, Batch, Size) ->
-    case ssl:send(Socket, lists:reverse(Batch)) of
+write_out(Session, {Transport, Socket} = Out, Monitor, Batch, Size) ->
+    case Transport:send(Socket, lists:reverse(Batch)) of
         ok ->
             Session ! {written, self(), Size},
-            writer_loop(Session, Socket, Monitor);
+            writer_loop(Session, Out, Monitor);
         {error, Reason} ->
             exit({write_failed, Reason})
     end.
@@ -529,9 +667,9 @@ schedule_flush(State) ->
 %%% Receiving
 
 %% Handles bytes from the socket, then reads on.
-received(Data, State) ->
+received(Data, #state{transport = Transport} = State) ->
     {Records, Replies, Then, Framing} =
-        case trevrpc_qmux_record:decode(Data, State#state.framing) of
+        case qmux_framing:decode(Data, State#state.framing) of
             {ok, R, P, F} -> {R, P, read_on, F};
             {closed, Why, R, P, F} -> {R, P, {closed, Why}, F};
             {error, Error, R, P, F} -> {R, P, {error, Error}, F}
@@ -557,7 +695,7 @@ received(Data, State) ->
         {{ok, _}, {closed, Reason}} ->
             quiet_close(Reason, Next);
         {{ok, _}, read_on} ->
-            case ssl:setopts(Next#state.socket, [{active, once}]) of
+            case Transport:setopts(Next#state.socket, [{active, once}]) of
                 ok -> noreply(Next);
                 {error, Reason} -> {stop, normal, lost({connection_lost, Reason}, Next)}
             end
@@ -570,11 +708,12 @@ send_now([], State) ->
 send_now(Bytes, State) ->
     hand(Bytes, iolist_size(Bytes), State).
 
-%% The Pongs that answer the peer's Pings go with the next flush that finds
-%% room in the writer. Only the latest is owed (RFC 6455 Section 5.5.3), so
-%% a peer that sends Pings and reads nothing, once the writer holds its
-%% ?WRITE_WINDOW, adds one owed Pong, not a queue of them, while the
-%% session reads on.
+%% What the framing answers the peer's messages with, such as the Pongs that
+%% answer WebSocket Pings, goes with the next flush that finds room in the
+%% writer. Only the latest is owed, as the qmux_framing contract says (RFC
+%% 6455 Section 5.5.3 for Pongs), so a peer that sends Pings and reads
+%% nothing, once the writer holds its ?WRITE_WINDOW, adds one owed Pong, not
+%% a queue of them, while the session reads on.
 owe_pong([], State) ->
     State;
 owe_pong(Pongs, State) ->
@@ -583,7 +722,9 @@ owe_pong(Pongs, State) ->
 records([], State) ->
     {ok, State};
 records([Record | Rest], State) ->
-    case trevrpc_qmux_frame:decode_frames(Record) of
+    case
+        qmux_frame:decode_frames(Record, maps:get(max_datagram_frame_size, State#state.local, 0))
+    of
         {ok, Frames} ->
             case frames(Frames, State) of
                 {ok, Next} -> records(Rest, Next);
@@ -596,7 +737,7 @@ records([Record | Rest], State) ->
 frames([], State) ->
     {ok, State};
 frames([{transport_parameters, Body} | Rest], #state{peer = undefined} = State) ->
-    case trevrpc_qmux_frame:decode_parameters(Body) of
+    case qmux_frame:decode_parameters(Body) of
         {ok, Peer} -> frames(Rest, connected(Peer, State));
         {error, Error} -> {error, Error, State}
     end;
@@ -610,7 +751,7 @@ frames([Frame | Rest], State) ->
         Other -> Other
     end.
 
-connected(Peer, #state{local = Local, owner = Owner} = State) ->
+connected(Peer, #state{local = Local, owner = Owner, bidi = Bidi, uni = Uni} = State) ->
     Idle =
         case {maps:get(max_idle_timeout, Local, 0), maps:get(max_idle_timeout, Peer, 0)} of
             {0, 0} -> infinity;
@@ -618,10 +759,11 @@ connected(Peer, #state{local = Local, owner = Owner} = State) ->
             {Ours, 0} -> Ours;
             {Ours, Theirs} -> min(Ours, Theirs)
         end,
-    Owner ! {trevrpc_qmux, self(), {connected, #{send_queue => State#state.send_queue}}},
+    Owner ! {qmux, self(), {connected, #{send_queue => State#state.send_queue}}},
     Next = State#state{
         peer = Peer,
-        max_local = maps:get(initial_max_streams_bidi, Peer, 0),
+        bidi = Bidi#limits{max_local = maps:get(initial_max_streams_bidi, Peer, 0)},
+        uni = Uni#limits{max_local = maps:get(initial_max_streams_uni, Peer, 0)},
         conn_send_max = maps:get(initial_max_data, Peer, 0),
         idle_timeout = Idle
     },
@@ -632,18 +774,18 @@ frame({transport_parameters, _}, State) ->
     {error, {protocol_violation, 16#3f5153300d0a0d0a, <<"repeated QX_TRANSPORT_PARAMETERS">>},
         State};
 frame({stream, Id, Offset, Data, Fin}, State) ->
-    with_stream(Id, 16#08, State, fun
+    with_stream(Id, 16#08, recv, State, fun
         (undefined, S) when Data =:= <<>> -> {ok, S};
         (undefined, S) -> {error, {final_size, 16#08, <<"data beyond a stream's final size">>}, S};
         (Stream, S) -> stream_data(Stream, Offset, Data, Fin, S)
     end);
 frame({reset_stream, Id, Code, Final}, State) ->
-    with_stream(Id, 16#04, State, fun
+    with_stream(Id, 16#04, recv, State, fun
         (undefined, S) -> {ok, S};
         (Stream, S) -> reset_received(Stream, Code, Final, S)
     end);
 frame({stop_sending, Id, Code}, State) ->
-    with_stream(Id, 16#05, State, fun
+    with_stream(Id, 16#05, send, State, fun
         (undefined, S) ->
             {ok, S};
         (#stream{fin_sent = true}, S) ->
@@ -651,7 +793,7 @@ frame({stop_sending, Id, Code}, State) ->
         (#stream{reset_sent = true}, S) ->
             {ok, S};
         (Stream, S) ->
-            S#state.owner ! {trevrpc_qmux, self(), {stop_sending, Id, Code}},
+            S#state.owner ! {qmux, self(), {stop_sending, Id, Code}},
             {ok, reset_send(Code, Stream, S)}
     end);
 frame({max_data, Max}, #state{conn_send_max = Current} = State) when Max > Current ->
@@ -665,7 +807,7 @@ frame({max_data, Max}, #state{conn_send_max = Current} = State) when Max > Curre
 frame({max_data, _Max}, State) ->
     {ok, State};
 frame({max_stream_data, Id, Max}, State) ->
-    with_stream(Id, 16#11, State, fun
+    with_stream(Id, 16#11, send, State, fun
         (undefined, S) ->
             {ok, S};
         (#stream{send_max = Current} = Stream, S) when Max > Current ->
@@ -674,23 +816,35 @@ frame({max_stream_data, Id, Max}, State) ->
             {ok, S}
     end);
 frame({max_streams, Direction, Max}, State) ->
-    case Max > trevrpc_qmux_frame:max_streams_limit() of
+    #limits{max_local = Current} = Limits = limits(Direction, State),
+    case Max > qmux_frame:max_streams_limit() of
         true ->
-            {error, {frame_encoding, 16#12, <<"MAX_STREAMS exceeds 2^60">>}, State};
-        false when Direction =:= bidi, Max > State#state.max_local ->
-            {ok, streams_available(State#state{max_local = Max})};
+            {error, {frame_encoding, max_streams_type(Direction), <<"MAX_STREAMS exceeds 2^60">>},
+                State};
+        false when Max > Current ->
+            {ok, streams_available(Direction, Limits#limits{max_local = Max}, State)};
         false ->
             {ok, State}
     end;
 frame({streams_blocked, _Direction, Max}, State) ->
-    case Max > trevrpc_qmux_frame:max_streams_limit() of
+    case Max > qmux_frame:max_streams_limit() of
         true -> {error, {frame_encoding, 16#16, <<"STREAMS_BLOCKED exceeds 2^60">>}, State};
         false -> {ok, State}
     end;
 frame({data_blocked, _}, State) ->
     {ok, State};
 frame({stream_data_blocked, Id, _}, State) ->
-    with_stream(Id, 16#15, State, fun(_, S) -> {ok, S} end);
+    with_stream(Id, 16#15, recv, State, fun(_, S) -> {ok, S} end);
+frame({datagram, Data}, State) ->
+    %% Datagrams are unreliable (RFC 9221 Section 5): one the owner has no
+    %% room for is dropped, as nothing else stops a peer from filling its
+    %% mailbox.
+    _ =
+        case owner_behind(State) of
+            true -> dropped;
+            false -> State#state.owner ! {qmux, self(), {datagram, Data}}
+        end,
+    {ok, State};
 frame({connection_close, transport, Code, FrameType, Reason}, State) ->
     {closed, {peer_closed, transport, Code, FrameType, Reason}, State};
 frame({connection_close, application, Code, Reason}, State) ->
@@ -712,43 +866,100 @@ frame({ping_response, _}, State) ->
 frame_type({stream, _, _, _, _}) -> 16#08;
 frame_type(_) -> 0.
 
-%% Looks a stream up for a frame, opening peer streams up to it. Calls Fun
-%% with the stream, or undefined for one that already completed, and the
-%% state that opened it.
-with_stream(Id, FrameType, State, Fun) ->
+max_streams_type(bidi) -> 16#12;
+max_streams_type(uni) -> 16#13.
+
+%% Looks a stream up for a frame about its `recv' or `send' side, opening
+%% peer streams up to it. Calls Fun with the stream, or undefined for one
+%% that already completed, and the state that opened it. A frame about a
+%% side a unidirectional stream does not have is a STREAM_STATE_ERROR
+%% (RFC 9000 Section 19).
+with_stream(Id, FrameType, Side, State, Fun) ->
     Local = Id band 1 =:= role_bit(State#state.role),
+    Direction = direction(Id),
     Number = Id bsr 2,
+    #limits{opened_local = OpenedLocal, opened_remote = OpenedRemote, max_remote = MaxRemote} =
+        limits(Direction, State),
     if
-        Id band 2 =/= 0, Local ->
-            {error, {stream_state, FrameType, <<"unidirectional stream was never opened">>}, State};
-        Id band 2 =/= 0 ->
-            {error, {stream_limit, FrameType, <<"unidirectional streams are not allowed">>}, State};
-        Local, Number >= State#state.opened_local ->
+        Direction =:= uni, Local, Side =:= recv ->
+            {error, {stream_state, FrameType, <<"frame for a send-only stream">>}, State};
+        Direction =:= uni, not Local, Side =:= send ->
+            {error, {stream_state, FrameType, <<"frame for a receive-only stream">>}, State};
+        Local, Number >= OpenedLocal ->
             {error, {stream_state, FrameType, <<"stream was never opened">>}, State};
         Local ->
             Fun(maps:get(Id, State#state.streams, undefined), State);
-        Number < State#state.opened_remote ->
+        Number < OpenedRemote ->
             Fun(maps:get(Id, State#state.streams, undefined), State);
-        Number >= State#state.max_remote ->
+        Number >= MaxRemote ->
             {error, {stream_limit, FrameType, <<"stream exceeds the stream limit">>}, State};
         true ->
-            Opened = open_remote(Number, State),
-            with_stream(Id, FrameType, Opened, Fun)
+            Opened = open_remote(Number, Direction, State),
+            with_stream(Id, FrameType, Side, Opened, Fun)
     end.
 
-open_remote(Number, #state{opened_remote = Opened} = State) when Opened > Number ->
-    State;
-open_remote(Number, #state{opened_remote = Opened, owner = Owner} = State) ->
-    Id = (Opened bsl 2) bor role_bit(peer_role(State#state.role)),
-    Stream = new_stream(
-        Id,
-        maps:get(initial_max_stream_data_bidi_local, State#state.peer, 0),
-        maps:get(initial_max_stream_data_bidi_remote, State#state.local, 0)
-    ),
-    Owner ! {trevrpc_qmux, self(), {stream_opened, Id}},
-    open_remote(Number, State#state{
-        opened_remote = Opened + 1, streams = (State#state.streams)#{Id => Stream}
-    }).
+%% Opens the peer's streams of Direction up to Number.
+open_remote(Number, Direction, #state{owner = Owner} = State) ->
+    case limits(Direction, State) of
+        #limits{opened_remote = Opened} when Opened > Number ->
+            State;
+        #limits{opened_remote = Opened} = Limits ->
+            Id = stream_id(Opened, Direction, peer_role(State#state.role)),
+            Stream =
+                case Direction of
+                    bidi ->
+                        new_stream(
+                            Id,
+                            bidi,
+                            maps:get(initial_max_stream_data_bidi_local, State#state.peer, 0),
+                            maps:get(initial_max_stream_data_bidi_remote, State#state.local, 0),
+                            State
+                        );
+                    uni ->
+                        new_stream(
+                            Id,
+                            recv_only,
+                            0,
+                            maps:get(initial_max_stream_data_uni, State#state.local, 0),
+                            State
+                        )
+                end,
+            Owner ! {qmux, self(), {stream_opened, Id}},
+            Next = set_limits(Direction, Limits#limits{opened_remote = Opened + 1}, State),
+            open_remote(Number, Direction, Next#state{
+                streams = (Next#state.streams)#{Id => Stream}
+            })
+    end.
+
+%% Opens a stream of ours, if the peer allows another.
+open_local(Direction, State) ->
+    case limits(Direction, State) of
+        #limits{opened_local = Opened, max_local = Max} = Limits when Opened < Max ->
+            Id = stream_id(Opened, Direction, State#state.role),
+            Stream =
+                case Direction of
+                    bidi ->
+                        new_stream(
+                            Id,
+                            bidi,
+                            maps:get(initial_max_stream_data_bidi_remote, State#state.peer, 0),
+                            maps:get(initial_max_stream_data_bidi_local, State#state.local, 0),
+                            State
+                        );
+                    uni ->
+                        new_stream(
+                            Id,
+                            send_only,
+                            maps:get(initial_max_stream_data_uni, State#state.peer, 0),
+                            0,
+                            State
+                        )
+                end,
+            Next = set_limits(Direction, Limits#limits{opened_local = Opened + 1}, State),
+            {ok, Id, Next#state{streams = (Next#state.streams)#{Id => Stream}}};
+        Limits ->
+            {error, stream_limit, set_limits(Direction, Limits#limits{want = true}, State)}
+    end.
 
 stream_data(
     #stream{id = Id, final_size = Final, received = Received} = Stream, Offset, Data, Fin, State
@@ -777,8 +988,8 @@ stream_data(
                 true ->
                     {ok, consumed(byte_size(Data), Updated, Counted)};
                 false ->
-                    State#state.owner ! {trevrpc_qmux, self(), {stream_data, Id, Data, Fin}},
-                    {ok, store(Updated#stream{recv_ended = Fin}, Counted)}
+                    State#state.owner ! {qmux, self(), {stream_data, Id, Data, Fin}},
+                    {ok, delivered(Updated#stream{recv_ended = Fin}, Counted)}
             end
     end.
 
@@ -800,7 +1011,7 @@ reset_received(
                 true ->
                     ok;
                 false ->
-                    State#state.owner ! {trevrpc_qmux, self(), {stream_reset, Id, Code}},
+                    State#state.owner ! {qmux, self(), {stream_reset, Id, Code}},
                     ok
             end,
             Counted = State#state{conn_received = State#state.conn_received + (Size - Received)},
@@ -810,6 +1021,62 @@ reset_received(
     end.
 
 %%% Flow control and stream state
+
+%% Stores a stream after delivering data to the owner: an auto stream's
+%% credit comes back at once, unless the owner is behind, when it waits.
+delivered(#stream{auto = false} = Stream, State) ->
+    store(Stream, State);
+delivered(#stream{id = Id, received = Received, read = Read} = Stream, State) ->
+    case owner_behind(State) of
+        false ->
+            consumed(Received - Read, Stream, State);
+        true ->
+            withhold(Id, store(Stream, State))
+    end.
+
+withhold(Id, #state{withheld = Withheld} = State) ->
+    schedule_credit_retry(State#state{withheld = Withheld#{Id => true}}).
+
+schedule_credit_retry(#state{credit_timer = true} = State) ->
+    State;
+schedule_credit_retry(State) ->
+    erlang:send_after(?CREDIT_RETRY, self(), credit_retry),
+    State#state{credit_timer = true}.
+
+%% Grants what was withheld, or waits another round if the owner is still
+%% behind.
+release_credit(#state{withheld = Withheld} = State) when map_size(Withheld) =:= 0 ->
+    State;
+release_credit(#state{withheld = Withheld} = State) ->
+    case owner_behind(State) of
+        true ->
+            schedule_credit_retry(State);
+        false ->
+            maps:fold(
+                fun(Id, true, S) ->
+                    case S#state.streams of
+                        #{Id := #stream{auto = true, received = Received, read = Read} = Stream} ->
+                            consumed(Received - Read, Stream, S);
+                        #{} ->
+                            S
+                    end
+                end,
+                State#state{withheld = #{}},
+                Withheld
+            )
+    end.
+
+%% The owner is behind when its mailbox holds more than max_owner_queue
+%% messages.
+owner_behind(#state{max_owner_queue = infinity}) ->
+    false;
+owner_behind(#state{owner = Owner, max_owner_queue = Max}) when node(Owner) =:= node() ->
+    case erlang:process_info(Owner, message_queue_len) of
+        {message_queue_len, Length} -> Length > Max;
+        undefined -> false
+    end;
+owner_behind(_State) ->
+    false.
 
 %% Returns credit for Bytes the owner (or the session itself) processed.
 consumed(Bytes, #stream{read = Read, received = Received} = Stream, State) ->
@@ -824,7 +1091,7 @@ consumed(Bytes, #stream{read = Read, received = Received} = Stream, State) ->
             true ->
                 Max = NewRead + Window,
                 {Stream#stream{read = NewRead, recv_max = Max}, [
-                    trevrpc_qmux_frame:max_stream_data(Stream#stream.id, Max)
+                    qmux_frame:max_stream_data(Stream#stream.id, Max)
                 ]};
             false ->
                 {Stream#stream{read = NewRead}, []}
@@ -847,19 +1114,21 @@ connection_consumed(
     end.
 
 %% Resets our sending side: the data not sent yet is dropped, and the final
-%% size is what was sent.
+%% size is what was sent. A stream without a sending side has nothing to
+%% reset.
 reset_send(_Code, #stream{fin_sent = true}, State) ->
     State;
 reset_send(_Code, #stream{reset_sent = true}, State) ->
     State;
 reset_send(Code, #stream{id = Id, sent = Sent, send_size = Size} = Stream, State) ->
     Reset = Stream#stream{reset_sent = true, send_buf = queue:new(), send_size = 0},
-    Next = queue_control([trevrpc_qmux_frame:reset_stream(Id, Code, Sent)], store(Reset, State)),
+    Next = queue_control([qmux_frame:reset_stream(Id, Code, Sent)], store(Reset, State)),
     unqueue(Size, Next),
     maybe_send_ready(Next).
 
 %% Stops reading: what was received and not consumed comes back as credit,
-%% and so will whatever still arrives.
+%% and so will whatever still arrives. A stream without a receiving side has
+%% nothing to stop.
 stop_reading(_Code, #stream{read_stopped = true}, State) ->
     State;
 stop_reading(
@@ -869,10 +1138,10 @@ stop_reading(
 stop_reading(Code, #stream{id = Id, received = Received, read = Read} = Stream, State) ->
     Stopped = Stream#stream{read_stopped = true},
     consumed(
-        Received - Read, Stopped, queue_control([trevrpc_qmux_frame:stop_sending(Id, Code)], State)
+        Received - Read, Stopped, queue_control([qmux_frame:stop_sending(Id, Code)], State)
     ).
 
-%% Stores a stream, or removes it once both its sides ended: a completed
+%% Stores a stream, or removes it once all its sides ended: a completed
 %% peer stream gives its stream credit back to the peer, and data received
 %% and never consumed counts as consumed, so it does not hold back the
 %% connection's window.
@@ -882,14 +1151,18 @@ store(#stream{id = Id} = Stream, #state{streams = Streams} = State) ->
             State#state{streams = Streams#{Id => Stream}};
         true ->
             Unread = Stream#stream.received - Stream#stream.read,
-            Removed = connection_consumed(Unread, State#state{streams = maps:remove(Id, Streams)}),
+            Removed = connection_consumed(Unread, State#state{
+                streams = maps:remove(Id, Streams), withheld = maps:remove(Id, State#state.withheld)
+            }),
             case Id band 1 =:= role_bit(State#state.role) of
                 true ->
                     Removed;
                 false ->
-                    Removed#state{
-                        max_remote = Removed#state.max_remote + 1, send_max_streams = true
-                    }
+                    Direction = direction(Id),
+                    #limits{max_remote = Max} = Limits = limits(Direction, Removed),
+                    set_limits(
+                        Direction, Limits#limits{max_remote = Max + 1, send_max = true}, Removed
+                    )
             end
     end.
 
@@ -905,19 +1178,50 @@ done(#stream{
     RecvDone = (Ended orelse Stopped) andalso Final =/= undefined andalso Received =:= Final,
     SendDone andalso RecvDone.
 
-new_stream(Id, SendMax, RecvWindow) ->
-    #stream{id = Id, send_max = SendMax, recv_max = RecvWindow, recv_window = RecvWindow}.
+%% A stream with the peer's limit SendMax and our window RecvWindow. The
+%% side a unidirectional stream lacks starts out ended.
+new_stream(Id, Kind, SendMax, RecvWindow, #state{auto = Auto}) ->
+    Stream = #stream{
+        id = Id,
+        send_max = SendMax,
+        recv_max = RecvWindow,
+        recv_window = RecvWindow,
+        auto = Auto
+    },
+    case Kind of
+        bidi -> Stream;
+        send_only -> Stream#stream{recv_ended = true, final_size = 0};
+        recv_only -> Stream#stream{fin_requested = true, fin_sent = true}
+    end.
 
-streams_available(#state{want_streams = true, owner = Owner} = State) ->
-    Owner ! {trevrpc_qmux, self(), {streams_available, bidi}},
-    State#state{want_streams = false};
-streams_available(State) ->
-    State.
+streams_available(Direction, #limits{want = true} = Limits, #state{owner = Owner} = State) ->
+    Owner ! {qmux, self(), {streams_available, Direction}},
+    set_limits(Direction, Limits#limits{want = false}, State);
+streams_available(Direction, Limits, State) ->
+    set_limits(Direction, Limits, State).
+
+limits(bidi, #state{bidi = Limits}) -> Limits;
+limits(uni, #state{uni = Limits}) -> Limits.
+
+set_limits(bidi, Limits, State) -> State#state{bidi = Limits};
+set_limits(uni, Limits, State) -> State#state{uni = Limits}.
+
+direction(Id) when Id band 2 =:= 0 -> bidi;
+direction(_Id) -> uni.
+
+%% The ID of the Number-th stream of Direction that Role opens.
+stream_id(Number, Direction, Role) ->
+    DirectionBit =
+        case Direction of
+            bidi -> 0;
+            uni -> 2
+        end,
+    (Number bsl 2) bor DirectionBit bor role_bit(Role).
 
 %%% Sending
 
 %% Queues a write, which its writer counted in the send queue already;
-%% one to a stream that is gone, reset or finished is dropped.
+%% one to a stream that is gone, reset, finished or receive-only is dropped.
 write(Id, Bin, Fin, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #stream{reset_sent = false, fin_requested = false} = Stream} ->
@@ -959,9 +1263,9 @@ queue_control(Frames, #state{control = Control} = State) ->
     State#state{control = Control ++ Frames}.
 
 %% Hands the writer everything that can go: control frames, flow control
-%% updates and stream data as credit allows, in records the peer accepts,
-%% until the writer holds ?WRITE_WINDOW bytes. The rest goes once it wrote
-%% some.
+%% updates, datagrams and stream data as credit allows, in records the peer
+%% accepts, until the writer holds ?WRITE_WINDOW bytes. The rest goes once
+%% it wrote some.
 flush(#state{writer = undefined} = State) ->
     State;
 flush(#state{closing = true} = State) ->
@@ -982,7 +1286,7 @@ flush(State, Records, Size) ->
         {[], Next} ->
             hand(lists:reverse(Records), Size, Next);
         {Frames, Next} ->
-            Record = trevrpc_qmux_record:encode(Frames, Next#state.framing),
+            Record = qmux_framing:encode(Frames, Next#state.framing),
             flush(Next, [Record | Records], Size + iolist_size(Record))
     end.
 
@@ -998,9 +1302,17 @@ hand(Records, Size, #state{writer = Writer, unwritten = Unwritten} = State) ->
 %% The size of the records to send, once the peer's parameters arrived.
 limit(#state{peer = Peer}) ->
     min(
-        maps:get(max_record_size, Peer, trevrpc_qmux_frame:default_max_record_size()),
+        maps:get(max_record_size, Peer, qmux_frame:default_max_record_size()),
         ?MAX_SEND_RECORD
     ).
+
+%% The largest datagram payload that fits in a DATAGRAM frame the peer
+%% accepts and in one record, or 0 when the peer accepts none.
+datagram_limit(#state{peer = Peer} = State) ->
+    case maps:get(max_datagram_frame_size, Peer, 0) of
+        0 -> 0;
+        FrameSize -> qmux_frame:max_datagram_payload(min(FrameSize, limit(State)))
+    end.
 
 %% One record's frames, and the state after sending them.
 build(#state{peer = undefined, control = Control} = State) ->
@@ -1010,8 +1322,24 @@ build(State) ->
     Limit = limit(State),
     {Control, Size1, State1} = take_control(State#state.control, Limit, [], 0, State),
     {Flow, Size2, State2} = flow_control(Size1, Limit, State1),
-    {Data, _Size3, State3} = stream_data(Size2, Limit, State2),
-    {Control ++ Flow ++ Data, State3}.
+    %% While both wait, datagrams and stream data take turns at the front of
+    %% a record, so neither starves the other.
+    BothWait =
+        State2#state.datagrams_queued > 0 andalso not queue:is_empty(State2#state.ready),
+    {Data, State3} =
+        case State2#state.streams_first of
+            true ->
+                {Streams, Size3, S} = stream_data(Size2, Limit, State2),
+                {Datagrams, _, S1} = datagram_frames(Size3, Limit, S),
+                {Streams ++ Datagrams, S1};
+            false ->
+                {Datagrams, Size3, S} = datagram_frames(Size2, Limit, State2),
+                {Streams, _, S1} = stream_data(Size3, Limit, S),
+                {Datagrams ++ Streams, S1}
+        end,
+    {Control ++ Flow ++ Data, State3#state{
+        streams_first = State3#state.streams_first xor BothWait
+    }}.
 
 take_control([Frame | Rest], Limit, Acc, Size, State) ->
     FrameSize = iolist_size(Frame),
@@ -1022,48 +1350,74 @@ take_control([Frame | Rest], Limit, Acc, Size, State) ->
 take_control([], _Limit, Acc, Size, State) ->
     {lists:reverse(Acc), Size, State#state{control = []}}.
 
-flow_control(Size, Limit, State) when Size + 40 > Limit ->
+flow_control(Size, Limit, State) when Size + 60 > Limit ->
     {[], Size, State};
 flow_control(Size, _Limit, State) ->
     {MaxData, S1} =
         case State#state.send_max_data of
             true ->
-                {[trevrpc_qmux_frame:max_data(State#state.conn_recv_max)], State#state{
+                {[qmux_frame:max_data(State#state.conn_recv_max)], State#state{
                     send_max_data = false
                 }};
             false ->
                 {[], State}
         end,
-    {MaxStreams, S2} =
-        case S1#state.send_max_streams of
+    {MaxBidi, S2} = max_streams(bidi, S1),
+    {MaxUni, S3} = max_streams(uni, S2),
+    {Reply, S4} =
+        case S3#state.send_ping_reply of
             true ->
-                {[trevrpc_qmux_frame:max_streams_bidi(S1#state.max_remote)], S1#state{
-                    send_max_streams = false
-                }};
-            false ->
-                {[], S1}
-        end,
-    {Reply, S3} =
-        case S2#state.send_ping_reply of
-            true ->
-                {[trevrpc_qmux_frame:ping_response(S2#state.ping_received)], S2#state{
+                {[qmux_frame:ping_response(S3#state.ping_received)], S3#state{
                     send_ping_reply = false
-                }};
-            false ->
-                {[], S2}
-        end,
-    {Ping, S4} =
-        case S3#state.send_ping of
-            true ->
-                Sequence = S3#state.ping_sent + 1,
-                {[trevrpc_qmux_frame:ping(Sequence)], S3#state{
-                    send_ping = false, ping_sent = Sequence
                 }};
             false ->
                 {[], S3}
         end,
-    Frames = MaxData ++ MaxStreams ++ Reply ++ Ping,
-    {Frames, Size + iolist_size(Frames), S4}.
+    {Ping, S5} =
+        case S4#state.send_ping of
+            true ->
+                Sequence = S4#state.ping_sent + 1,
+                {[qmux_frame:ping(Sequence)], S4#state{
+                    send_ping = false, ping_sent = Sequence
+                }};
+            false ->
+                {[], S4}
+        end,
+    Frames = MaxData ++ MaxBidi ++ MaxUni ++ Reply ++ Ping,
+    {Frames, Size + iolist_size(Frames), S5}.
+
+%% The MAX_STREAMS frame of Direction that is due, if any.
+max_streams(Direction, State) ->
+    case limits(Direction, State) of
+        #limits{send_max = true, max_remote = Max} = Limits ->
+            {
+                [qmux_frame:max_streams(Direction, Max)],
+                set_limits(Direction, Limits#limits{send_max = false}, State)
+            };
+        #limits{} ->
+            {[], State}
+    end.
+
+%% The queued DATAGRAM frames that fit in the rest of the record, in order.
+datagram_frames(Size, Limit, State) ->
+    datagram_frames(Size, Limit, [], State).
+
+datagram_frames(Size, Limit, Acc, #state{datagrams = Datagrams} = State) ->
+    case queue:peek(Datagrams) of
+        {value, Frame} ->
+            FrameSize = iolist_size(Frame),
+            case Size + FrameSize =< Limit of
+                true ->
+                    datagram_frames(Size + FrameSize, Limit, [Frame | Acc], State#state{
+                        datagrams = queue:drop(Datagrams),
+                        datagrams_queued = State#state.datagrams_queued - 1
+                    });
+                false ->
+                    {lists:reverse(Acc), Size, State}
+            end;
+        empty ->
+            {lists:reverse(Acc), Size, State}
+    end.
 
 %% Stream data in turn: each ready stream sends up to a quantum, as its own
 %% and the connection's credit allow.
@@ -1085,7 +1439,7 @@ stream_data([Id | Rest], Size, Limit, Acc, Again, #state{streams = Streams} = St
             Room = max(
                 0,
                 Limit - Size -
-                    trevrpc_qmux_frame:stream_overhead(
+                    qmux_frame:stream_overhead(
                         Id, Stream#stream.sent, min(Pending, ?QUANTUM)
                     )
             ),
@@ -1098,7 +1452,7 @@ stream_data([Id | Rest], Size, Limit, Acc, Again, #state{streams = Streams} = St
                     stream_data(Rest, Size, Limit, Acc, Again, State);
                 true ->
                     {Data, Buf} = take(N, Stream#stream.send_buf),
-                    Frame = trevrpc_qmux_frame:stream(Id, Stream#stream.sent, Data, Fin),
+                    Frame = qmux_frame:stream(Id, Stream#stream.sent, Data, Fin),
                     Sent = Stream#stream{
                         send_buf = Buf,
                         send_size = Pending - N,
@@ -1142,7 +1496,7 @@ maybe_send_ready(
 ) ->
     case atomics:get(Ref, ?QUEUED) < Limit div 2 of
         true ->
-            Owner ! {trevrpc_qmux, self(), send_ready},
+            Owner ! {qmux, self(), send_ready},
             State#state{notify_ready = false};
         false ->
             State
@@ -1193,14 +1547,14 @@ tick(
 %% Ends the session for a protocol error the peer made.
 fail(Code, FrameType, Reason, State) ->
     Cut = binary:part(Reason, 0, min(256, byte_size(Reason))),
-    Frame = trevrpc_qmux_frame:transport_close(trevrpc_qmux_frame:error_code(Code), FrameType, Cut),
+    Frame = qmux_frame:transport_close(qmux_frame:error_code(Code), FrameType, Cut),
     close_with(Frame, {transport_error, Code, Reason}, State).
 
 %% Sends CONNECTION_CLOSE after everything already queued that fits, ends
 %% our sending direction, and waits briefly for the peer to close.
-close_with(Frame, Reason, #state{socket = Socket, owner = Owner} = State0) ->
+close_with(Frame, Reason, #state{transport = Transport, socket = Socket, owner = Owner} = State0) ->
     mark_closed(State0),
-    Owner ! {trevrpc_qmux, self(), {closed, Reason}},
+    Owner ! {qmux, self(), {closed, Reason}},
     case State0#state.writer of
         undefined ->
             {stop, normal, State0};
@@ -1208,10 +1562,10 @@ close_with(Frame, Reason, #state{socket = Socket, owner = Owner} = State0) ->
             %% What was written before the close, and not flushed yet, goes
             %% first, whatever the writer holds.
             State = flush_all(State0),
-            Closed = send_now(trevrpc_qmux_record:close(Frame, State#state.framing), State),
+            Closed = send_now(qmux_framing:close(Frame, State#state.framing), State),
             Writer ! shutdown,
             erlang:send_after(?CLOSE_TIMEOUT, self(), close_timeout),
-            _ = ssl:setopts(Socket, [{active, true}]),
+            _ = Transport:setopts(Socket, [{active, true}]),
             {noreply, Closed#state{closing = true}}
     end.
 
@@ -1221,16 +1575,17 @@ flush_all(State) ->
         {[], Next} ->
             Next;
         {Frames, Next} ->
-            Record = trevrpc_qmux_record:encode(Frames, Next#state.framing),
+            Record = qmux_framing:encode(Frames, Next#state.framing),
             flush_all(hand(Record, iolist_size(Record), Next))
     end.
 
 %% The peer closed, or the idle timeout expired: end without frames, but
-%% with the closing handshake of a WebSocket.
+%% with whatever the framing ends a connection with, such as a WebSocket
+%% Close.
 quiet_close(Reason, #state{owner = Owner} = State) ->
     mark_closed(State),
-    Owner ! {trevrpc_qmux, self(), {closed, Reason}},
-    Closed = send_now(trevrpc_qmux_record:close(none, State#state.framing), State),
+    Owner ! {qmux, self(), {closed, Reason}},
+    Closed = send_now(qmux_framing:close(none, State#state.framing), State),
     _ =
         case Closed#state.writer of
             %% It failed during a close the peer now answers.
@@ -1241,7 +1596,7 @@ quiet_close(Reason, #state{owner = Owner} = State) ->
 
 lost(Reason, #state{owner = Owner} = State) ->
     mark_closed(State),
-    Owner ! {trevrpc_qmux, self(), {closed, Reason}},
+    Owner ! {qmux, self(), {closed, Reason}},
     State#state{closing = true}.
 
 role_bit(client) -> 0;

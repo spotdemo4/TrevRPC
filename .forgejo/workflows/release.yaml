@@ -32,8 +32,10 @@ jobs:
           fetch_depth: 0
           shell: release
 
-      # The source has both rebar.config and gleam.toml; its Gleam modules make flake-release
-      # publish it with gleam publish, which ships the Gleam binding alongside the runtime.
+      # Both sources have rebar.config and gleam.toml. trevrpc's Gleam modules make flake-release
+      # publish it with gleam publish, which ships the Gleam binding alongside the runtime; qmux,
+      # without any, goes out first with rebar3, and trevrpc's path dependency on it becomes a Hex
+      # requirement.
       - name: Release to Forgejo and hex.pm
         run: flake-release
         env:
@@ -42,7 +44,9 @@ jobs:
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
           HEXPM_TOKEN: ${{ secrets.HEXPM_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-erlang
+          PACKAGES: |
+            packages.x86_64-linux.trevrpc-erlang-qmux
+            packages.x86_64-linux.trevrpc-erlang
 
   go:
     # zizmor: ignore[excessive-permissions]

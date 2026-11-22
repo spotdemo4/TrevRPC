@@ -142,7 +142,7 @@ socket_backend() ->
 -spec qmux_parameters(
     pos_integer(), pos_integer(), non_neg_integer(), non_neg_integer() | infinity
 ) ->
-    trevrpc_qmux_frame:parameters().
+    qmux_frame:parameters().
 qmux_parameters(MaxFrameSize, ReceiveStreams, PeerStreams, IdleTimeout) ->
     StreamWindow = stream_window(MaxFrameSize),
     #{

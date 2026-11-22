@@ -1,24 +1,17 @@
-%% @private How a QMux session's records travel: Size-prefixed over a TLS
-%% byte stream (draft-ietf-quic-qmux-02), or one record per binary message
-%% over a WebSocket (draft-lcurley-qmux-websocket-00), where message
-%% boundaries replace the Size field and text messages are forbidden.
+%% @private QMux over WebSocket (draft-lcurley-qmux-websocket-00): the
+%% `qmux_framing' of a session over a TLS connection that upgraded to a
+%% WebSocket, one record per binary message, where message boundaries
+%% replace the Size field and text messages are forbidden.
 %%
-%% Over a WebSocket, pings are answered here, and the closing handshake
-%% replaces QMux's draining: a session that ends sends a Close frame after
-%% its last record.
--module(trevrpc_qmux_record).
+%% Pings are answered here, and the closing handshake replaces QMux's
+%% draining: a session that ends sends a Close frame after its last record.
+-module(trevrpc_qmux_websocket).
 
--export([new/3, decode/2, encode/2, close/2]).
+-behaviour(qmux_framing).
 
--export_type([t/0, framing/0, decoded/0]).
+-export([init/2, decode/2, encode/2, close/2]).
 
-%% `tls' for QMux over TLS, `websocket' for QMux over WebSocket.
--type framing() :: tls | websocket.
-
--record(tls, {
-    max_record_size :: pos_integer(),
-    buffer = <<>> :: binary()
-}).
+-export_type([state/0]).
 
 -record(websocket, {
     role :: client | server,
@@ -28,16 +21,7 @@
     close = 1000 :: 1000..4999 | sent
 }).
 
--opaque t() :: #tls{} | #websocket{}.
-
-%% What a decode found: the records that arrived, in order, and what must go
-%% back to the peer at once (pongs, and the Close that answers the peer's).
-%% `{closed, ...}' means the peer ended the connection after those records,
-%% `{error, ...}' that it broke the framing.
--type decoded() ::
-    {ok, [binary()], iodata(), t()}
-    | {closed, term(), [binary()], iodata(), t()}
-    | {error, trevrpc_qmux_frame:error(), [binary()], iodata(), t()}.
+-opaque state() :: #websocket{}.
 
 %% WebSocket close codes (RFC 6455 section 7.4.1).
 -define(WS_NORMAL, 1000).
@@ -45,12 +29,8 @@
 -define(WS_UNSUPPORTED_DATA, 1003).
 -define(WS_TOO_BIG, 1009).
 
-%% @doc The framing of one end of a session, whose records may hold up to
-%% `MaxRecordSize' bytes.
--spec new(framing(), client | server, pos_integer()) -> t().
-new(tls, _Role, MaxRecordSize) ->
-    #tls{max_record_size = MaxRecordSize};
-new(websocket, Role, MaxRecordSize) ->
+-spec init(client | server, pos_integer()) -> state().
+init(Role, MaxRecordSize) ->
     #websocket{
         role = Role,
         parser = ws_frame:init_parser(#{
@@ -58,10 +38,9 @@ new(websocket, Role, MaxRecordSize) ->
         })
     }.
 
-%% @doc Takes the records out of bytes that arrived.
--spec decode(binary(), t()) -> decoded().
-decode(Bin, #tls{buffer = Buffer} = Framing) ->
-    tls_records(<<Buffer/binary, Bin/binary>>, Framing, []);
+%% @doc Takes the records out of bytes that arrived, with the Pongs and the
+%% Close that answer the peer's Pings and Close.
+-spec decode(binary(), state()) -> qmux_framing:decoded(state()).
 decode(Bin, #websocket{parser = Parser} = Framing) ->
     case ws_frame:parse(Parser, Bin) of
         {ok, Messages, Next} ->
@@ -73,16 +52,6 @@ decode(Bin, #websocket{parser = Parser} = Framing) ->
             {error, {protocol_violation, 0, atom_to_binary(Reason)}, [], [], Framing#websocket{
                 parser = Next, close = ?WS_PROTOCOL_ERROR
             }}
-    end.
-
-tls_records(Bin, #tls{max_record_size = Max} = Framing, Acc) ->
-    case trevrpc_qmux_frame:decode_record(Bin, Max) of
-        more ->
-            {ok, lists:reverse(Acc), [], Framing#tls{buffer = Bin}};
-        {ok, Record, Rest} ->
-            tls_records(Rest, Framing, [Record | Acc]);
-        {error, Error} ->
-            {error, Error, lists:reverse(Acc), [], Framing#tls{buffer = <<>>}}
     end.
 
 messages([], Framing, Records, Replies) ->
@@ -105,21 +74,14 @@ messages([Close | _], Framing, Records, Replies) when
     {closed, websocket_closed, lists:reverse(Records),
         lists:reverse([ws_close(?WS_NORMAL, Framing) | Replies]), Framing#websocket{close = sent}}.
 
-%% @doc The bytes of a record carrying `Frames'.
--spec encode(iodata(), t()) -> iodata().
-encode(Frames, #tls{}) ->
-    trevrpc_qmux_frame:record(Frames);
+%% @doc A binary message carrying `Frames'.
+-spec encode(iodata(), state()) -> iodata().
 encode(Frames, #websocket{role = Role}) ->
     ws_frame:encode({binary, Frames}, Role).
 
-%% @doc The bytes that end a session: the last record, carrying `Frame'
-%% unless it is `none', then over a WebSocket a Close frame, unless one
-%% already answered the peer's.
--spec close(iodata() | none, t()) -> iodata().
-close(none, #tls{}) ->
-    [];
-close(Frame, #tls{} = Framing) ->
-    encode(Frame, Framing);
+%% @doc The last record, carrying `Frame' unless it is `none', then a Close
+%% frame, unless one already answered the peer's.
+-spec close(iodata() | none, state()) -> iodata().
 close(Frame, #websocket{close = Code} = Framing) ->
     Record =
         case Frame of

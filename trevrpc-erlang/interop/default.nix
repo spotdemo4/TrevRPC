@@ -29,7 +29,7 @@ let
     checkPhase = ''
       runHook preCheck
       export HOME=$(mktemp -d)
-      ${trevrpc-erlang.lock.checkouts}
+      ${trevrpc-erlang.checkouts}
       cp -R ${trevrpc-erlang.src}/trevrpc-erlang _checkouts/trevrpc
       chmod -R u+w _checkouts
       rebar3 xref

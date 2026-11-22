@@ -32,6 +32,10 @@ mkGleamPackage (finalAttrs: {
           (lib.fileset.maybeMissing ./_build)
           (lib.fileset.maybeMissing ./build)
           (lib.fileset.maybeMissing ./test/greet)
+          # Links for rebar3; Gleam takes qmux from its path.
+          ./_checkouts
+          ./qmux/default.nix
+          (lib.fileset.maybeMissing ./qmux/_build)
           # Packages of their own.
           ./interop
           ./protoc-gen-trevrpc-erlang

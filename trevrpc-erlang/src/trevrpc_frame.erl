@@ -79,26 +79,26 @@
 -spec encode(type(), iodata()) -> iodata().
 encode(Type, Payload) ->
     Length = iolist_size(Payload),
-    [<<(type_code(Type)), (trevrpc_varint:encode(Length))/binary>> | Payload].
+    [<<(type_code(Type)), (qmux_varint:encode(Length))/binary>> | Payload].
 
 %% @doc Encodes a frame of any type code, such as an extension or a grease
 %% type.
 -spec encode_raw(non_neg_integer(), iodata()) -> iodata().
 encode_raw(Code, Payload) ->
     Length = iolist_size(Payload),
-    [<<(trevrpc_varint:encode(Code))/binary, (trevrpc_varint:encode(Length))/binary>> | Payload].
+    [<<(qmux_varint:encode(Code))/binary, (qmux_varint:encode(Length))/binary>> | Payload].
 
 %% @doc Encodes a DATAGRAM_COUNT frame: the number of datagrams a direction
 %% sent, as a minimal varint.
 -spec encode_datagram_count(non_neg_integer()) -> iodata().
 encode_datagram_count(Count) ->
-    encode(datagram_count, trevrpc_varint:encode(Count)).
+    encode(datagram_count, qmux_varint:encode(Count)).
 
 %% @doc The count a DATAGRAM_COUNT payload holds: exactly one varint, in
 %% any valid encoding.
 -spec decode_datagram_count(binary()) -> {ok, non_neg_integer()} | error.
 decode_datagram_count(Payload) ->
-    case trevrpc_varint:decode(Payload) of
+    case qmux_varint:decode(Payload) of
         {Count, <<>>} -> {ok, Count};
         _ -> error
     end.
@@ -269,11 +269,11 @@ take(Type, Length, Rest, Reader, Acc) ->
     end.
 
 header(Bin) ->
-    case trevrpc_varint:decode(Bin) of
+    case qmux_varint:decode(Bin) of
         more ->
             more;
         {Code, Rest} ->
-            case trevrpc_varint:decode(Rest) of
+            case qmux_varint:decode(Rest) of
                 more -> more;
                 {Length, Payload} -> {Code, Length, Payload}
             end

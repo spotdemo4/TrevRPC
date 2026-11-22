@@ -108,7 +108,7 @@ new(Stream, Flow) ->
         stream = Stream,
         size_age = application:get_env(trevrpc, datagram_size_age, ?MAX_SIZE_AGE),
         transport = trevrpc_stream:transport(Stream),
-        prefix = iolist_to_binary(trevrpc_varint:encode(Flow)),
+        prefix = iolist_to_binary(qmux_varint:encode(Flow)),
         atomics = Atomics
     }.
 

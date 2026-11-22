@@ -1,0 +1,16 @@
+# Lets Gleam build qmux as trevrpc's path dependency. Without Gleam modules, it
+# is published to Hex with rebar3, from rebar.config and src/qmux.app.src.
+name = "qmux"
+version = "1.12.0"
+description = "QMux: QUIC streams and datagrams over TLS or WebSocket"
+licences = ["MIT"]
+target = "erlang"
+
+[repository]
+type = "forgejo"
+host = "https://trev.zip"
+user = "llc"
+repo = "TrevRPC"
+
+[erlang]
+extra_applications = ["ssl"]

@@ -24,6 +24,14 @@ in
     '';
   };
 
+  qmux-lint = {
+    src = packages.trevrpc-erlang-qmux;
+    packages = [ erlfmt ];
+    script = ''
+      erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
+    '';
+  };
+
   # The generated bindings in src/generated are left as generated.
   interop-lint = {
     root = ./interop;

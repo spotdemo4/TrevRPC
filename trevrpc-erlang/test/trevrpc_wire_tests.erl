@@ -15,31 +15,31 @@ varint_boundaries_test() ->
         {16384, 4},
         {1073741823, 4},
         {1073741824, 8},
-        {trevrpc_varint:max(), 8}
+        {qmux_varint:max(), 8}
     ],
     [
         begin
-            Bin = trevrpc_varint:encode(Value),
+            Bin = qmux_varint:encode(Value),
             ?assertEqual(Size, byte_size(Bin)),
-            ?assertEqual(Size, trevrpc_varint:size(Value)),
-            ?assertEqual({Value, <<"x">>}, trevrpc_varint:decode(<<Bin/binary, "x">>))
+            ?assertEqual(Size, qmux_varint:size(Value)),
+            ?assertEqual({Value, <<"x">>}, qmux_varint:decode(<<Bin/binary, "x">>))
         end
      || {Value, Size} <- Cases
     ].
 
 varint_rejects_out_of_range_test() ->
-    ?assertError(function_clause, trevrpc_varint:encode(trevrpc_varint:max() + 1)),
-    ?assertError(function_clause, trevrpc_varint:encode(-1)).
+    ?assertError(function_clause, qmux_varint:encode(qmux_varint:max() + 1)),
+    ?assertError(function_clause, qmux_varint:encode(-1)).
 
 varint_non_minimal_test() ->
-    ?assertEqual({5, <<>>}, trevrpc_varint:decode(<<16#40, 5>>)),
-    ?assertEqual({5, <<>>}, trevrpc_varint:decode(<<16#C0, 0, 0, 0, 0, 0, 0, 5>>)).
+    ?assertEqual({5, <<>>}, qmux_varint:decode(<<16#40, 5>>)),
+    ?assertEqual({5, <<>>}, qmux_varint:decode(<<16#C0, 0, 0, 0, 0, 0, 0, 5>>)).
 
 varint_truncated_test() ->
-    ?assertEqual(more, trevrpc_varint:decode(<<>>)),
-    ?assertEqual(more, trevrpc_varint:decode(<<16#40>>)),
-    ?assertEqual(more, trevrpc_varint:decode(<<16#80, 0, 0>>)),
-    ?assertEqual(more, trevrpc_varint:decode(<<16#C0, 0, 0, 0, 0, 0, 0>>)).
+    ?assertEqual(more, qmux_varint:decode(<<>>)),
+    ?assertEqual(more, qmux_varint:decode(<<16#40>>)),
+    ?assertEqual(more, qmux_varint:decode(<<16#80, 0, 0>>)),
+    ?assertEqual(more, qmux_varint:decode(<<16#C0, 0, 0, 0, 0, 0, 0>>)).
 
 %%% Frames
 
@@ -83,7 +83,7 @@ frame_too_large_test() ->
     %% from the header alone, before any payload arrives.
     ?assertEqual({error, {frame_too_large, 5}}, trevrpc_frame:feed(<<16#21, 5>>, Reader)),
     ?assertEqual(
-        {error, {frame_too_large, trevrpc_varint:max()}},
+        {error, {frame_too_large, qmux_varint:max()}},
         trevrpc_frame:feed(<<0, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF, 16#FF>>, Reader)
     ).
 

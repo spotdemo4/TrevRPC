@@ -227,7 +227,7 @@ frame_cases(Name, Payload, Frame) ->
                 {<<Name/binary, " read">>, ?_assertEqual([{Type, Payload}], read_all(Frame))}
             ];
         grease ->
-            {Code, _} = trevrpc_varint:decode(Frame),
+            {Code, _} = qmux_varint:decode(Frame),
             [
                 {
                     <<Name/binary, " encode">>,

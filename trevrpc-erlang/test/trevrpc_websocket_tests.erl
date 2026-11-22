@@ -79,37 +79,37 @@ session_test(#{port := Port}) ->
     {101, Headers, Received, Socket} = upgrade(Port, <<"/trevrpc">>, []),
     ?assertEqual(<<"qmux-02.trevrpc-1">>, header(<<"sec-websocket-protocol">>, Headers)),
     Parameters = trevrpc_quic:qmux_parameters(1 bsl 22, 4, 0, infinity),
-    {ok, Session, Queue} = trevrpc_qmux:start(Socket, client, self(), #{
-        parameters => Parameters, framing => websocket, received => Received
+    {ok, Session, Queue} = qmux:start({qmux_ssl, Socket}, client, self(), #{
+        parameters => Parameters, framing => trevrpc_qmux_websocket, received => Received
     }),
     receive
-        {trevrpc_qmux, Session, {connected, _}} -> ok
+        {qmux, Session, {connected, _}} -> ok
     after 5000 -> error(not_connected)
     end,
-    {ok, Id} = trevrpc_qmux:open_stream(Session),
+    {ok, Id} = qmux:open_stream(Session),
     Request = [
         trevrpc_frame:encode(request, trevrpc_wire:encode_request(#{method => ?UNARY})),
         trevrpc_frame:encode(message, <<"hello">>)
     ],
-    ok = trevrpc_qmux:send_data(Session, Queue, Id, Request, true),
+    ok = qmux:send_data(Session, Queue, Id, Request, true),
     Frames = response(Session, Id, trevrpc_frame:reader(1 bsl 22), []),
     ?assert(lists:member({message, <<"hello">>}, Frames)),
     [Status] = [Payload || {status, Payload} <- Frames],
     ?assertMatch({ok, #{code := ok}}, trevrpc_wire:decode_status(Status)),
-    trevrpc_qmux:close(Session, 0).
+    qmux:close(Session, 0).
 
 %% The frames of a stream's response, up to its FIN.
 response(Session, Id, Reader, Acc) ->
     receive
-        {trevrpc_qmux, Session, {stream_data, Id, Bin, Fin}} ->
+        {qmux, Session, {stream_data, Id, Bin, Fin}} ->
             %% A stream that ended is gone, and needs no credit.
-            _ = trevrpc_qmux:consume(Session, Id, byte_size(Bin)),
+            _ = qmux:consume(Session, Id, byte_size(Bin)),
             {ok, Frames, Next} = trevrpc_frame:feed(Bin, Reader),
             case Fin of
                 true -> Acc ++ Frames;
                 false -> response(Session, Id, Next, Acc ++ Frames)
             end;
-        {trevrpc_qmux, Session, {closed, Reason}} ->
+        {qmux, Session, {closed, Reason}} ->
             error({closed, Reason})
     after 5000 -> error(no_response)
     end.
@@ -168,7 +168,7 @@ text_test(#{port := Port}) ->
     %% A CONNECTION_CLOSE comes before it.
     ?assertMatch(
         {ok, [{connection_close, transport, _, _, _}]},
-        trevrpc_qmux_frame:decode_frames(last_record(Messages))
+        qmux_frame:decode_frames(last_record(Messages))
     ).
 
 too_big_test(#{port := Port}) ->

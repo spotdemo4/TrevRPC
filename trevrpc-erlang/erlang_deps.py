@@ -6,7 +6,9 @@ which the runtime's development build, its Nix package and the interop
 executable use, so they take their Hex dependencies from the Gleam files:
 
 - rebar.config requires each package with gleam.toml's range, verbatim, as
-  rebar3 reads Hex's requirement syntax;
+  rebar3 reads Hex's requirement syntax, and each of gleam.toml's path
+  dependencies, such as qmux, by its bare name, as rebar3 takes those from
+  _checkouts, which links them, and never locks them;
 - rebar.lock locks what manifest.toml locks for those packages and the ones
   they depend on, at their depth below the runtime, with the outer checksum
   manifest.toml has and the inner one from the package's tarball;
@@ -45,6 +47,9 @@ PLUGINS_ON_ERLANG = ("protoc-gen-trevrpc-gleam", "protoc-gen-trevrpc-elixir")
 
 # {app, "requirement"} or {app, "requirement", {pkg, package}}
 DEPENDENCY = re.compile(r'\{(\w+), "([^"]*)"(?:, \{pkg, (\w+)\})?\}')
+# A dependency by its bare name, once the others and the comments are gone.
+BARE = re.compile(r"\b([a-z]\w*)\b")
+COMMENT = re.compile(r"%.*$", re.MULTILINE)
 GPB = re.compile(r'\{gpb, "([^"]*)"\}')
 LOCKED = re.compile(r'\{<<"(\w+)">>,\{pkg,<<"(\w+)">>,<<"([^"]+)">>\},(\d+)\}')
 HASH = re.compile(r'\{<<"(\w+)">>, <<"([0-9A-F]+)">>\}')
@@ -72,13 +77,21 @@ def fail(message: str) -> NoReturn:
     sys.exit(f"erlang_deps: {message}")
 
 
-def synced_config(path: Path, ranges: dict[str, str]) -> tuple[str, list[str]]:
-    """rebar.config with gleam.toml's ranges, and the packages it requires."""
+def synced_config(path: Path, ranges: dict[str, str], local: set[str]) -> tuple[str, list[str]]:
+    """rebar.config with gleam.toml's ranges, and the Hex packages it
+    requires. The `local` path dependencies must be required by name."""
     text = path.read_text()
     start = text.find("{deps, [")
     end = text.find("]}.", start)
     if start < 0 or end < 0:
         fail(f"{path} has no {{deps, [...]}}.")
+    bare = set(
+        BARE.findall(DEPENDENCY.sub("", COMMENT.sub("", text[start + len("{deps, [") : end])))
+    )
+    for name in sorted(bare - local):
+        fail(f"{path} requires {name} by name, which gleam.toml does not take from a path")
+    for name in sorted(local - bare):
+        fail(f"gleam.toml takes {name} from a path, which {path} does not require by name")
     required: list[str] = []
 
     def with_range(match: re.Match[str]) -> str:
@@ -198,15 +211,19 @@ def synced(root: Path, offline: bool) -> dict[Path, str]:
     gleam = tomllib.loads((root / "gleam.toml").read_text())
     manifest = tomllib.loads((root / "manifest.toml").read_text())
     ranges: dict[str, str] = {}
+    local: set[str] = set()
     for name, requirement in gleam.get("dependencies", {}).items():
         if name in GLEAM_ONLY:
             continue
-        if not isinstance(requirement, str):
-            fail(f"gleam.toml requires {name} from somewhere other than Hex")
-        ranges[name] = requirement
+        if isinstance(requirement, dict) and requirement.keys() == {"path"}:
+            local.add(name)
+        elif isinstance(requirement, str):
+            ranges[name] = requirement
+        else:
+            fail(f"gleam.toml requires {name} from somewhere other than Hex or a path")
 
     files: dict[Path, str] = {}
-    files[root / "rebar.config"], required = synced_config(root / "rebar.config", ranges)
+    files[root / "rebar.config"], required = synced_config(root / "rebar.config", ranges, local)
     locked = lock(manifest, required, read_lock(root / "rebar.lock"), offline)
     files[root / "rebar.lock"] = render_lock(locked)
     files[root / "interop" / "rebar.lock"] = render_lock(

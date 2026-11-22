@@ -188,7 +188,7 @@ encode(Encoder, Message) ->
                             false ->
                                 Encoder#encoder{in_frame = InFrame + Size, at_frame_start = false}
                         end,
-                    {[trevrpc_varint:encode(Size), Body], Next}
+                    {[qmux_varint:encode(Size), Body], Next}
             catch
                 error:_ -> error
             end
@@ -270,7 +270,7 @@ decoder(Config, Accept) ->
     {ok, binary(), decoder()}
     | {error, {too_large, non_neg_integer()} | {invalid, binary()}}.
 decode(Decoder, Payload, Max) ->
-    case trevrpc_varint:decode(Payload) of
+    case qmux_varint:decode(Payload) of
         more ->
             invalid();
         {Size, _Chunk} when Size > Max ->
