@@ -231,12 +231,26 @@ max_datagram_payload_test() ->
     ?assertEqual(63, qmux_frame:max_datagram_payload(66)),
     ?assertEqual(64, qmux_frame:max_datagram_payload(67)),
     ?assertEqual(1197, qmux_frame:max_datagram_payload(1200)),
+    %% 16#3fffffff bytes take a 4-byte length, and one more an 8-byte one.
+    ?assertEqual(16#3ffffffe, qmux_frame:max_datagram_payload(16#3fffffff + 4)),
+    ?assertEqual(16#3fffffff, qmux_frame:max_datagram_payload(16#3fffffff + 5)),
+    ?assertEqual(16#3fffffff, qmux_frame:max_datagram_payload(16#3fffffff + 9)),
+    ?assertEqual(16#40000000, qmux_frame:max_datagram_payload(16#3fffffff + 10)),
+    %% Against the encoder: every size around the 1- to 2-byte length
+    %% boundary (63/64 bytes) and the 2- to 4-byte one (16383/16384), and a
+    %% sample in between.
+    Buffer = binary:copy(<<0>>, 16400),
     _ = [
         begin
             Payload = qmux_frame:max_datagram_payload(Size),
-            ?assert(iolist_size(qmux_frame:datagram(binary:copy(<<0>>, Payload))) =< Size),
-            ?assert(iolist_size(qmux_frame:datagram(binary:copy(<<0>>, Payload + 1))) > Size)
+            ?assert(datagram_size(Buffer, Payload) =< Size),
+            ?assert(datagram_size(Buffer, Payload + 1) > Size)
         end
-     || Size <- lists:seq(2, 20000)
+     || Size <- lists:seq(2, 200) ++ lists:seq(201, 16300, 97) ++ lists:seq(16301, 16400)
     ],
     ok.
+
+%% The size of a DATAGRAM frame carrying `Size' bytes, sliced from `Buffer'
+%% so that no payload is built.
+datagram_size(Buffer, Size) ->
+    iolist_size(qmux_frame:datagram(binary:part(Buffer, 0, Size))).
