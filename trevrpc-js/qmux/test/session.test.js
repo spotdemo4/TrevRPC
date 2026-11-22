@@ -47,6 +47,16 @@ const isStop = (code) => (frame) => frame.type === FrameType.StopSending && fram
 /** The timers the session uses, mocked so that a test moves the clock itself. */
 const MockedTimers = { apis: ["setInterval", "setTimeout", "Date"] };
 
+/**
+ * Moves the mocked clock on by `ms`, a millisecond at a time: one long tick runs every timer due
+ * in it with the clock already at its end.
+ */
+function advance(t, ms) {
+  for (let elapsed = 0; elapsed < ms; elapsed += 1) {
+    t.mock.timers.tick(1);
+  }
+}
+
 test("a session sends its transport parameters first and echoes streams", async () => {
   const peer = scriptedPeer();
   const session = await openScripted(peer, {
@@ -370,6 +380,66 @@ test("keep-alive pings go out while the session is idle", async (t) => {
   }
   assert.equal(session.stage, "ready");
   session.close();
+});
+
+test("keep-alives don't keep a session to a vanished peer open", async (t) => {
+  t.mock.timers.enable(MockedTimers);
+  // The peer reads everything and answers nothing, not even its pings.
+  const peer = scriptedPeer({
+    onFrame: (_socket, frame) => frame.type === FrameType.Ping || frame.data !== undefined,
+  });
+  const session = await openScripted(peer, {
+    parameters: { maxIdleTimeoutMs: 100 },
+    keepAlivePeriodMs: 20,
+  });
+  // The first keep-alive, at 20 ms, restarts the timeout once; the ones after it don't.
+  advance(t, 119);
+  assert.equal(session.stage, "ready");
+  assert.ok(peer.sockets[0].received.filter((frame) => frame.type === FrameType.Ping).length > 3);
+  advance(t, 1);
+  await assert.rejects(session.closed, /idle timeout/);
+});
+
+test("a session that only sends stays open while the peer answers its probes", async (t) => {
+  t.mock.timers.enable(MockedTimers);
+  // The peer reads the stream data without sending anything back, and answers pings.
+  const peer = scriptedPeer({
+    onFrame(socket, frame) {
+      if (frame.type === FrameType.Ping) {
+        socket.deliver(frames((w) => writePing(w, FrameType.PingResponse, frame.sequence)));
+        return true;
+      }
+      return frame.data !== undefined;
+    },
+  });
+  const session = await openScripted(peer, { parameters: { maxIdleTimeoutMs: 100 } });
+  const writer = (await session.createBidirectionalStream()).writable.getWriter();
+  // A byte every 10 ms for five idle timeouts, well within the stream window, so the peer owes
+  // no MAX_STREAM_DATA: only its answers to the probes reach the session.
+  for (let i = 0; i < 50; i += 1) {
+    await writer.write(Uint8Array.of(i));
+    t.mock.timers.tick(10);
+    await flushMicrotasks();
+  }
+  assert.equal(session.stage, "ready");
+  assert.ok(peer.sockets[0].received.some((frame) => frame.type === FrameType.Ping));
+  session.close();
+});
+
+test("a session idle both ways times out without probing", async (t) => {
+  t.mock.timers.enable(MockedTimers);
+  const peer = scriptedPeer();
+  const session = await openScripted(peer, { parameters: { maxIdleTimeoutMs: 100 } });
+  const [socket] = peer.sockets;
+  // The session's last record only answers the peer's ping, which is no data waiting for it.
+  socket.deliver(frames((w) => writePing(w, FrameType.Ping, 1)));
+  await socket.waitFor((frame) => frame.type === FrameType.PingResponse && frame.sequence === 1);
+  advance(t, 100);
+  await assert.rejects(session.closed, /idle timeout/);
+  assert.deepEqual(
+    socket.received.filter((frame) => frame.type === FrameType.Ping),
+    [],
+  );
 });
 
 test("the session closes after the smaller idle timeout", async (t) => {

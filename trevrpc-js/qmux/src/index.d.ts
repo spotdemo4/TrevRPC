@@ -52,7 +52,13 @@ export declare const DefaultMaxRecordSize: 16382;
  * leaves the parameter out, so it takes the protocol default: no credit, no streams, no datagrams.
  */
 export interface Parameters {
-  /** Closes the session after this long without a record either way; 0 disables it. */
+  /**
+   * Closes the session after this long without activity; 0 disables it. Every record received
+   * counts, and so does the first record sent after each (RFC 9000 §10.1), so keep-alives alone
+   * can't keep a session to a vanished peer open. While stream data or datagrams the session sent
+   * wait for the peer to be heard from, it sends a QX_PING halfway through the timeout, which a
+   * live peer answers.
+   */
   maxIdleTimeoutMs: number;
   /** The connection-level receive window, in bytes. */
   initialMaxData: number;
@@ -113,7 +119,10 @@ export interface QMuxSessionOptions {
   WebSocket?: new (url: string, protocols?: string | string[]) => QMuxWebSocket;
   /** Bounds opening the WebSocket and receiving the peer's transport parameters; 10 s by default. */
   handshakeTimeoutMs?: number;
-  /** Sends a QX_PING after this long without sending a record; 0 (the default) disables it. */
+  /**
+   * Sends a QX_PING after this long without sending a record, at most half the idle timeout;
+   * 0 (the default) disables it.
+   */
   keepAlivePeriodMs?: number;
   /** Writes wait, and datagrams are dropped, while the WebSocket buffers more; 1 MiB by default. */
   sendBufferLimit?: number;

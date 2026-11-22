@@ -53,6 +53,10 @@ tests() ->
         {"the peer's close ends the session", fun peer_close/1},
         {"a peer that stops reading is lost", fun stalled_peer/1},
         {"a peer that sends no parameters is closed", fun silent_peer/1},
+        {"keep-alives don't keep a vanished peer's session open", fun vanished_peer/1},
+        {"a session that only sends stays open while the peer answers its probes",
+            fun one_way_sender/1},
+        {"a session idle both ways times out without probing", fun idle_session/1},
         {"a writer blocked at the close holds it until the send timeout", fun blocked_close/1},
         {"auto streams return credit as data is delivered", fun auto_credit/1},
         {"auto streams hold credit back while the owner is behind", fun owner_behind/1},
@@ -609,6 +613,72 @@ blocked_close(Credentials) ->
 silent_peer(Credentials) ->
     {Session, _Socket} = pair(Credentials, ?PARAMETERS, #{handshake_timeout => 200}),
     ?assertEqual({closed, handshake_timeout}, event(Session)).
+
+%% Keep-alives to a peer that reads nothing and answers nothing don't keep the
+%% session open: the idle timeout still fires.
+vanished_peer(Credentials) ->
+    {Session, _Socket} = connected(
+        Credentials, maps:merge(?PARAMETERS, #{max_idle_timeout => 300}), #{}, #{keep_alive => 50}
+    ),
+    ?assertEqual({closed, idle_timeout}, event(Session)).
+
+%% A session that only sends stays open while its peer is alive but has
+%% nothing to send back: the peer answers its QX_PING probes, and nothing else
+%% reaches the session.
+one_way_sender(Credentials) ->
+    {Session, Socket} = connected(
+        Credentials, maps:merge(?PARAMETERS, #{max_idle_timeout => 1000}), #{}
+    ),
+    {ok, Id} = qmux:open_stream(Session),
+    Queue = get({send_queue, Session}),
+    %% A byte every 100 ms for four idle timeouts, well within the stream
+    %% window, so the peer owes no MAX_STREAM_DATA.
+    spawn_link(fun() ->
+        lists:foreach(
+            fun(_) ->
+                ok = qmux:send_data(Session, Queue, Id, <<1>>, false),
+                timer:sleep(100)
+            end,
+            lists:seq(1, 40)
+        )
+    end),
+    ?assert(answer_pings(Socket, 40, 0) > 0),
+    receive
+        {qmux, Session, {closed, Reason}} -> error({closed, Reason})
+    after 0 -> ok
+    end.
+
+%% A session idle in both directions times out without probing the peer, even
+%% when its last record only answered the peer's: a QX_PING response is no data
+%% waiting for the peer.
+idle_session(Credentials) ->
+    {Session, Socket} = connected(
+        Credentials, maps:merge(?PARAMETERS, #{max_idle_timeout => 300}), #{}
+    ),
+    send(Socket, [qmux_frame:ping(1)]),
+    ?assertEqual({closed, idle_timeout}, event(Session)),
+    Frames = drain(Socket),
+    ?assert(lists:member({ping_response, 1}, Frames)),
+    ?assertEqual([], [Frame || {ping, _} = Frame <- Frames]).
+
+%% Every frame the session sends until the connection closes.
+drain(Socket) ->
+    case next(Socket) of
+        {error, _} -> [];
+        Frames -> Frames ++ drain(Socket)
+    end.
+
+%% Answers the session's QX_PINGs until Bytes more bytes of stream data have
+%% arrived, and returns how many it answered.
+answer_pings(_Socket, 0, Answered) ->
+    Answered;
+answer_pings(Socket, Bytes, Answered) ->
+    Frames = next(Socket),
+    ?assert(is_list(Frames)),
+    Pings = [Sequence || {ping, Sequence} <- Frames],
+    [send(Socket, [qmux_frame:ping_response(Sequence)]) || Sequence <- Pings],
+    Received = lists:sum([byte_size(Data) || {stream, _, _, Data, _} <- Frames]),
+    answer_pings(Socket, Bytes - Received, Answered + length(Pings)).
 
 %% Waits Ms milliseconds for a frame from the session, and fails if one
 %% arrives.

@@ -41,7 +41,7 @@ type Config struct {
 	// Parameters are the transport parameters advertised to the peer.
 	Parameters Parameters
 	// KeepAlivePeriod sends a QX_PING after this long without sending a
-	// record. Zero disables keep-alives.
+	// record, at most half the idle timeout. Zero disables keep-alives.
 	KeepAlivePeriod time.Duration
 	// StreamSendBuffer bounds the bytes Write buffers per stream before it
 	// blocks. It defaults to 64 KiB.
@@ -119,6 +119,8 @@ type Session struct {
 
 	lastReceived atomic.Int64
 	lastSent     atomic.Int64
+	// lastDataSent is when a record carrying stream data or datagrams last went out.
+	lastDataSent atomic.Int64
 
 	mu sync.Mutex
 	// peer is valid once handshakeDone is closed.
@@ -882,14 +884,18 @@ func (s *Session) writeLoop() {
 		}
 		for {
 			s.mu.Lock()
-			frames, full, mode := s.buildRecordLocked(record[:0])
+			frames, data, full, mode := s.buildRecordLocked(record[:0])
 			s.mu.Unlock()
 			if len(frames) > 0 {
 				if err := s.conn.WriteRecord(frames); err != nil {
 					s.closeWith(fmt.Errorf("%w: %w", ErrConnectionLost, err), nil, modeAbort)
 					return
 				}
-				s.lastSent.Store(time.Now().UnixNano())
+				now := time.Now().UnixNano()
+				s.lastSent.Store(now)
+				if data {
+					s.lastDataSent.Store(now)
+				}
 			}
 			if mode != modeOpen {
 				s.finish(mode)
@@ -926,13 +932,13 @@ func (s *Session) finish(mode closeMode) {
 // buildRecordLocked appends the next record's frames to b. full reports that
 // the record ran out of space with more to send. A mode other than modeOpen
 // means the session is done sending once these frames are written.
-func (s *Session) buildRecordLocked(b []byte) (frames []byte, full bool, mode closeMode) {
+func (s *Session) buildRecordLocked(b []byte) (frames []byte, data, full bool, mode closeMode) {
 	limit := min(s.sendRecordLimitLocked(), cap(b))
 	if s.mode == modeAbort {
-		return nil, false, modeAbort
+		return nil, false, false, modeAbort
 	}
 	if s.mode == modeQuiet {
-		return nil, false, modeQuiet
+		return nil, false, false, modeQuiet
 	}
 
 	sent := 0
@@ -946,9 +952,10 @@ func (s *Session) buildRecordLocked(b []byte) (frames []byte, full bool, mode cl
 	clear(s.control[:sent])
 	s.control = s.control[sent:]
 	if len(s.control) > 0 {
-		return b, true, modeOpen
+		return b, false, true, modeOpen
 	}
 	b = s.appendFlowControlLocked(b, limit)
+	control := len(b)
 	// While both wait, datagrams and stream data take turns at the front of
 	// the record, so that neither can crowd the other out.
 	var moreDatagrams, moreStreams bool
@@ -964,14 +971,15 @@ func (s *Session) buildRecordLocked(b []byte) (frames []byte, full bool, mode cl
 		b, moreStreams = s.appendStreamDataLocked(b, limit)
 	}
 	full = moreDatagrams || moreStreams
+	data = len(b) > control
 	if full || s.mode == modeOpen {
-		return b, full, modeOpen
+		return b, data, full, modeOpen
 	}
 	// Closing: everything sendable has been sent, so CONNECTION_CLOSE goes last.
 	if len(b)+len(s.closeFrame) > limit {
-		return b, true, modeOpen
+		return b, data, true, modeOpen
 	}
-	return append(b, s.closeFrame...), false, modeClose
+	return append(b, s.closeFrame...), data, false, modeClose
 }
 
 func (s *Session) appendFlowControlLocked(b []byte, limit int) []byte {
@@ -1081,7 +1089,7 @@ func (s *Session) appendStreamDataLocked(b []byte, limit int) ([]byte, bool) {
 	return b, full || len(again) > 0
 }
 
-// timerLoop enforces the idle timeout and sends keep-alives.
+// timerLoop enforces the idle timeout and sends keep-alives and liveness probes.
 func (s *Session) timerLoop() {
 	s.mu.Lock()
 	idle := s.idleTimeout
@@ -1101,18 +1109,31 @@ func (s *Session) timerLoop() {
 	tick = max(tick, 10*time.Millisecond)
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
+	clock := newIdleClock(s.lastReceived.Load())
+	// The receipt after which the last probe went out, so that one goes out per receipt.
+	probed := int64(-1)
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case now := <-ticker.C:
-			lastSent := time.Unix(0, s.lastSent.Load())
-			lastActivity := time.Unix(0, max(s.lastReceived.Load(), s.lastSent.Load()))
-			if idle > 0 && now.Sub(lastActivity) >= idle {
+			received, sent, dataSent := s.lastReceived.Load(), s.lastSent.Load(), s.lastDataSent.Load()
+			if idle > 0 && now.Sub(time.Unix(0, clock.observe(received, sent))) >= idle {
 				s.closeWith(ErrIdleTimeout, nil, modeQuiet)
 				return
 			}
-			if keepAlive > 0 && now.Sub(lastSent) >= keepAlive {
+			ping := keepAlive > 0 && now.Sub(time.Unix(0, sent)) >= keepAlive
+			// QMux has no acks, so a session that only sends may hear nothing back for longer
+			// than the idle timeout. The peer must answer a QX_PING, so one sent halfway
+			// through the timeout, while stream data or datagrams this endpoint sent wait for
+			// the peer to be heard from, gets an answer from a live peer and none from a
+			// vanished one. Replies such as flow control updates or ping responses don't
+			// count, so a session idle both ways sends no probe.
+			if idle > 0 && dataSent > received && received != probed && now.Sub(time.Unix(0, received)) >= idle/2 {
+				probed = received
+				ping = true
+			}
+			if ping {
 				s.mu.Lock()
 				s.sendPing = true
 				s.mu.Unlock()
@@ -1120,6 +1141,33 @@ func (s *Session) timerLoop() {
 			}
 		}
 	}
+}
+
+// idleClock picks the activity that restarts the idle timeout, as RFC 9000 section 10.1 does:
+// every record received, and one record sent after each receipt (the newest the timer sees).
+// Counting every send would let keep-alives restart the deadline they exist to test, so a peer
+// that vanished while its connection still took writes would never time out.
+type idleClock struct {
+	received, sent int64
+	// credit says whether a send may restart the deadline: a record arrived since the last one
+	// that did.
+	credit bool
+}
+
+func newIdleClock(received int64) idleClock {
+	return idleClock{received: received, sent: received, credit: true}
+}
+
+// observe folds in the times of the last record received and sent, and returns the time the
+// idle timeout counts from.
+func (c *idleClock) observe(received, sent int64) int64 {
+	if received > c.received {
+		c.received, c.credit = received, true
+	}
+	if c.credit && sent > c.received {
+		c.sent, c.credit = sent, false
+	}
+	return max(c.received, c.sent)
 }
 
 // notifier wakes every goroutine waiting for a change. It is used with the
