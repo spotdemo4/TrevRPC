@@ -30,6 +30,8 @@ direnv allow
 | `trevrpc-erlang/protoc-gen-trevrpc-erlang/` | `protoc-gen-trevrpc-erlang`, gpb message modules and service stubs                                                                                      |
 | `trevrpc-erlang/protoc-gen-trevrpc-gleam/`  | `protoc-gen-trevrpc-gleam`, Gleam messages and service modules, on `protoc-gen-trevrpc-erlang`                                                          |
 | `trevrpc-erlang/protoc-gen-trevrpc-elixir/` | `protoc-gen-trevrpc-elixir`, Elixir service modules over gpb's messages, on `protoc-gen-trevrpc-erlang`                                                 |
+| `trevrpc-py/`                               | Python client (in progress: native QUIC), the Python interop client                                                                                     |
+| `trevrpc-py/protoc-gen-trevrpc-py/`         | `protoc-gen-trevrpc-py`, clients for protobuf-py's messages                                                                                             |
 | `interop/`                                  | cross-runtime test suite                                                                                                                                |
 | `bench/`                                    | load benchmarks and the grpc-go and connect-go baselines                                                                                                |
 | `testdata/`                                 | wire, QMux, and zstd golden vectors shared by the runtimes                                                                                              |
@@ -125,6 +127,23 @@ which Renovate updates. Renovate then runs `nix run .#sync-erlang-deps`, which c
 `protoc-gen-trevrpc-elixir`'s `gpb`, which follows `protoc-gen-trevrpc-erlang`'s. Run it after changing those by hand; the `trevrpc-erlang-deps` check fails
 when they drift
 
+with [uv](https://docs.astral.sh/uv/) and [pyright](https://github.com/microsoft/pyright), in `trevrpc-py/`, where
+pyright is strict over the runtime, its tests, the interop client and `protoc-gen-trevrpc-py`:
+
+```sh
+uv sync
+uv run pytest
+pyright --pythonpath .venv/bin/python
+```
+
+the Python interop client runs on bindings generated from `interop/proto` with `protoc-gen-py` and
+`protoc-gen-trevrpc-py`, kept in `trevrpc-py/interop/gen`; after changing the plugin or those protos, run `uv sync` in
+`trevrpc-py/protoc-gen-trevrpc-py/` and regenerate them with `protoc` on the PATH:
+
+```sh
+trevrpc-py/interop/generate.sh
+```
+
 with the cross-runtime [interop](interop) suite:
 
 ```sh
@@ -143,6 +162,9 @@ nix build .#trevrpc-kotlin
 nix build .#trevrpc-erlang
 nix build .#trevrpc-erlang-interop
 nix build .#trevrpc-erlang.gleam
+nix build .#trevrpc-py
+nix build .#trevrpc-py-protoc-gen
+nix build .#trevrpc-py-interop
 ```
 
 ### release

@@ -64,6 +64,7 @@ python:
       - any-glob-to-any-file:
           - "**/*.py"
           - "**/pyproject.toml"
+          - "**/uv.lock"
 
 rust:
   - changed-files:

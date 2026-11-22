@@ -5,6 +5,7 @@
   trevrpc-erlang-interop,
   trevrpc-go-interop,
   trevrpc-js,
+  trevrpc-py-interop,
   trevrpc-rust,
 }:
 callPackage ./runner.nix {
@@ -24,9 +25,14 @@ callPackage ./runner.nix {
       "go=${lib.getExe' trevrpc-go-interop "trevrpc-interop-go"}"
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
       "erlang=${lib.getExe trevrpc-erlang-interop}"
+      "python=${lib.getExe trevrpc-py-interop}"
     ];
-    # The Erlang runtime does not implement every transport and scenario yet; its cells skip the rest.
-    may-skip = [ "erlang" ];
+    # The Erlang and Python runtimes do not implement every transport and scenario yet; their
+    # cells skip the rest.
+    may-skip = [
+      "erlang"
+      "python"
+    ];
     browser = lib.optionals stdenv.hostPlatform.isLinux [
       "chromium"
       "firefox"

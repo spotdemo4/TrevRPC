@@ -1,0 +1,28 @@
+[project]
+name = "protoc-gen-trevrpc-py"
+version = "1.12.0"
+description = "Generates TrevRPC clients for protobuf-py messages"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = [
+  # Pre-1.0: the plugin framework and the code it generates follow protobuf-py's minor version.
+  "protobuf-py>=0.7,<0.8",
+]
+classifiers = ["Programming Language :: Python :: 3", "Programming Language :: Python :: 3.14"]
+
+[project.urls]
+Homepage = "https://trev.zip/llc/TrevRPC"
+Documentation = "https://trev.zip/llc/TrevRPC/wiki"
+
+[project.scripts]
+protoc-gen-trevrpc-py = "protoc_gen_trevrpc_py:main"
+
+[dependency-groups]
+# protoc-gen-py generates the messages next to the clients, and src/protoc_gen_trevrpc_py/_options_pb.py.
+dev = ["protoc-gen-py>=0.7,<0.8"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.14"]
+build-backend = "uv_build"

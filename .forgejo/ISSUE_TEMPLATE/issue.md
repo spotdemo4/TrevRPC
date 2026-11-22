@@ -22,6 +22,7 @@ An issue that spans several gets all of them (e.g. go + rust).
   trevrpc-erlang/  Gleam binding, Gleam codegen (*.gleam,      gleam
                    protoc-gen-trevrpc-gleam/)
   proto/, *.proto  protocol definitions, generated-code shape  proto
+  trevrpc-py/      Python client, protoc-gen-trevrpc-py        python
   interop/, bench/ Python harnesses                            python
   *.nix            flake, packaging, checks                    nix
   .forgejo/workflows/, .github/workflows/  CI                  actions

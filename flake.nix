@@ -91,6 +91,7 @@
               python3
               ruff
               basedpyright
+              uv
 
               # erlang / gleam
               beamMinimal29Packages.erlang
@@ -352,6 +353,11 @@
                 licenseFile
                 ;
             };
+            trevrpc-py = pkgs.callPackage ./trevrpc-py { inherit wireGolden; };
+            trevrpc-py-protoc-gen = pkgs.callPackage ./trevrpc-py/protoc-gen-trevrpc-py { };
+            trevrpc-py-interop = pkgs.callPackage ./trevrpc-py/interop {
+              inherit (self.packages.${system}) trevrpc-py;
+            };
             trevrpc-rust-otel = pkgs.callPackage ./trevrpc-rust/crates/trevrpc-opentelemetry {
               inherit licenseFile;
             };
@@ -373,6 +379,7 @@
                 trevrpc-erlang-interop
                 trevrpc-go-interop
                 trevrpc-js
+                trevrpc-py-interop
                 trevrpc-rust
                 ;
             };
@@ -421,6 +428,7 @@
             trevrpc-go = callChecks ./trevrpc-go;
             trevrpc-js = callChecks ./trevrpc-js;
             trevrpc-kotlin = callChecks ./trevrpc-kotlin;
+            trevrpc-py = callChecks ./trevrpc-py;
             trevrpc-rust = callChecks ./trevrpc-rust;
             trevrpc-bench-baseline = callChecks ./bench/baseline;
 

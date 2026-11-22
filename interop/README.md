@@ -11,6 +11,7 @@ client also has a TCP fallback for networks that block UDP.
 | Erlang                   | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
 | JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
 | JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
+| Python                   | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
 | Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust, Erlang |
 | JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
 
@@ -21,6 +22,10 @@ native QUIC and QMux over TLS, so far. It takes part in what it implements; see
 page coming from its HTTP fallback, and the Android client over HTTP/3 and HTTP/2. Its server does
 not validate requests yet (`validation`, [#641](https://trev.zip/llc/TrevRPC/issues/641)), so
 clients skip that scenario.
+
+The Python client ([#666](https://trev.zip/llc/TrevRPC/issues/666)) calls native QUIC so far, and
+skips the scenarios that need datagrams, compression, connection metadata or decoding
+`buf.validate.Violations`. Its `qmux` and `fallback` cells exit 77 and are skipped.
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
 packaged Go, Rust and Erlang servers and clients and, on Linux, Chromium and Firefox,
@@ -53,8 +58,8 @@ what it does, and what it skips is reported, never counted as passed:
 
 Only the cells of runtimes named with `--may-skip` (a client, browser or server
 name) may skip; a skipped cell or scenario anywhere else fails the run, so a
-regression in a complete runtime cannot pass as a skip. The packaged matrix and
-the `safari` workflow pass `--may-skip erlang`, and the `android` workflow runs
+regression in a complete runtime cannot pass as a skip. The packaged matrix passes
+`--may-skip erlang` and `--may-skip python`, the `safari` workflow `--may-skip erlang`, and the `android` workflow runs
 the Android runner against Erlang with `--may-skip`, which lets it skip only the
 scenarios the server leaves out of its readiness line. Every run that skipped
 anything ends with a summary of the skipped cells and of the passing cells that
@@ -63,19 +68,19 @@ of that every cell passed.
 
 ## Cells
 
-`run.py` runs one cell per client, server, and transport (`X` is a native client,
-`B` a browser, `S` a server):
+`run.py` runs one cell per client, server, and transport (`X` is a native client: Go, Rust,
+Erlang or Python; `B` a browser; `S` a server):
 
-| Cell                      | Client   | Transport                                                                                       |
-| ------------------------- | -------- | ----------------------------------------------------------------------------------------------- |
-| `X-to-S`                  | Go, Rust | QUIC, compressing with the interop dictionary                                                   |
-| `X-qmux-to-S`             | Go, Rust | QMux over TLS on the server's TCP port, compressing with the interop dictionary                 |
-| `X-fallback-to-S`         | Go, Rust | `auto`, with the QUIC address pointing at UDP port 24999, which nothing answers: must fall back |
-| `B-webtransport-to-S`     | Browser  | WebTransport                                                                                    |
-| `B-websocket-to-S`        | Browser  | QMux over WebSocket (`wss://`)                                                                  |
-| `B-fallback-to-S`         | Browser  | `auto`, with the WebTransport URL pointing at UDP port 24999: must fall back to WebSocket       |
-| `B-app-webtransport-to-S` | Browser  | WebTransport, from a page the server serves through its HTTP fallback (over HTTP/3 in Chromium) |
-| `B-app-websocket-to-S`    | Browser  | QMux over WebSocket, from a page the server serves through its HTTP fallback over HTTP/2        |
+| Cell                      | Client  | Transport                                                                                       |
+| ------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `X-to-S`                  | Native  | QUIC, compressing with the interop dictionary                                                   |
+| `X-qmux-to-S`             | Native  | QMux over TLS on the server's TCP port, compressing with the interop dictionary                 |
+| `X-fallback-to-S`         | Native  | `auto`, with the QUIC address pointing at UDP port 24999, which nothing answers: must fall back |
+| `B-webtransport-to-S`     | Browser | WebTransport                                                                                    |
+| `B-websocket-to-S`        | Browser | QMux over WebSocket (`wss://`)                                                                  |
+| `B-fallback-to-S`         | Browser | `auto`, with the WebTransport URL pointing at UDP port 24999: must fall back to WebSocket       |
+| `B-app-webtransport-to-S` | Browser | WebTransport, from a page the server serves through its HTTP fallback (over HTTP/3 in Chromium) |
+| `B-app-websocket-to-S`    | Browser | QMux over WebSocket, from a page the server serves through its HTTP fallback over HTTP/2        |
 
 Every server holds the interop compression dictionary: the `dict.d1` dictionary of
 [`testdata/zstd-golden-vectors.txt`](../testdata/zstd-golden-vectors.txt), which `run.py` writes to a

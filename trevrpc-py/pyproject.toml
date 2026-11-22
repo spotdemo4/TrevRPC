@@ -1,0 +1,52 @@
+[project]
+name = "trevrpc"
+version = "1.12.0"
+description = "A client for TrevRPC, a protobuf RPC framework over QUIC"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = [
+  # The receive backpressure in _quic.py relies on 1.9's flow-control internals.
+  "aioquic>=1.9,<1.10",
+  # Pre-1.0: code protoc-gen-py generates must match the runtime's minor version.
+  "protobuf-py>=0.7,<0.8",
+]
+classifiers = [
+  "Framework :: AsyncIO",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://trev.zip/llc/TrevRPC"
+Documentation = "https://trev.zip/llc/TrevRPC/wiki"
+
+[dependency-groups]
+dev = ["pytest>=9"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.14"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["src", "tests", "interop", "protoc-gen-trevrpc-py/src"]
+# protobuf-py's generated messages are not checked strictly; the clients next to them are.
+exclude = ["**/*_pb.py"]
+executionEnvironments = [
+  { root = "src" },
+  { root = "tests", extraPaths = [
+    "src",
+    ".",
+  ] },
+  { root = "interop", extraPaths = [
+    "src",
+  ] },
+  { root = "protoc-gen-trevrpc-py/src" },
+]
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
