@@ -5,10 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 type unaryTestOpener struct {
@@ -473,6 +477,137 @@ func TestTransportCloseMayRaceBlockedRecv(t *testing.T) {
 				case <-time.After(testTimeout):
 					t.Fatal("Recv did not return after Close")
 				}
+			}
+		})
+	}
+}
+
+// scriptedResponseCall runs a server-streaming call for a StringValue whose
+// stream answers with response and then ends. It returns the messages the call
+// received and the error that ended it, nil after the OK status.
+func scriptedResponseCall(t *testing.T, response []byte, compression *compressionConfig, streams bool) ([]string, error) {
+	t.Helper()
+	stream := newUnaryTransportTestStream(response)
+	close(stream.eof)
+	client := newStreamClient(unaryTestOpener{stream: stream}, DefaultMaxFrameSize)
+	if compression != nil {
+		client.compression = newClientCompression(compression)
+	}
+	var options []CallOption
+	if streams {
+		client.streams = newStreamBudget(0, defaultClientStreamCompressionMemory, compression)
+		options = append(options, WithStreamCompression(StreamCompression{Responses: true}))
+	}
+	call, err := ServerStreaming(t.Context(), client, testPath("Scripted"), wrapperspb.String("request"), newStringValue, options...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = call.Close() }()
+	var received []string
+	for {
+		message, err := call.Recv()
+		if errors.Is(err, io.EOF) {
+			return received, nil
+		}
+		if err != nil {
+			return received, err
+		}
+		received = append(received, message.GetValue())
+	}
+}
+
+// TestClientReportsMalformedResponseFramesAsInternal checks that a response
+// frame the client cannot decode fails the call with Internal, the server's
+// fault, and not with the InvalidArgument a server reports for a malformed
+// request; a message above the frame size limit stays ResourceExhausted.
+func TestClientReportsMalformedResponseFramesAsInternal(t *testing.T) {
+	vectors := loadZstdVectors(t)
+	okStatus, err := appendStatusFrame(nil, OK(), DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	datagramCount := func(payload ...byte) []byte {
+		return append(appendFrameHeader(nil, frameTypeDatagramCount, len(payload)), payload...)
+	}
+	plain := append(appendFrameHeader(nil, frameTypeMessage, 2), 0x0a, 0x00)
+
+	type testCase struct {
+		frames      []byte
+		compression bool
+		streams     bool
+		want        Code
+	}
+	cases := map[string]testCase{
+		"ZSTD_MESSAGE without accepted dictionaries": {frames: vectors["zstd_message.small.frame"], want: CodeInternal},
+		"ZSTD_STREAM_MESSAGE without stream compression": {
+			frames: vectors["zstd_stream_message.first.frame"], compression: true, want: CodeInternal,
+		},
+		"empty DATAGRAM_COUNT":                  {frames: datagramCount(), want: CodeInternal},
+		"DATAGRAM_COUNT of two varints":         {frames: datagramCount(0x01, 0x02), want: CodeInternal},
+		"DATAGRAM_COUNT longer than a varint":   {frames: datagramCount(make([]byte, 9)...), want: CodeInternal},
+		"MESSAGE after DATAGRAM_COUNT":          {frames: append(datagramCount(0x00), plain...), want: CodeInternal},
+		"ZSTD_MESSAGE after DATAGRAM_COUNT":     {frames: append(datagramCount(0x00), vectors["zstd_message.small.frame"]...), compression: true, want: CodeInternal},
+		"ZSTD_STREAM_MESSAGE after a bad chunk": {frames: append(streamFrame(vectors["stream_bad.truncated.payload"]), vectors["zstd_stream_message.first.frame"]...), compression: true, streams: true, want: CodeInternal},
+	}
+	for key, payload := range vectors {
+		name, isPayload := strings.CutSuffix(key, ".payload")
+		if !isPayload {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(name, "bad."):
+			cases[name] = testCase{frames: compressedFrame(payload), compression: true, want: CodeInternal}
+		case strings.HasPrefix(name, "too_large."):
+			cases[name] = testCase{frames: compressedFrame(payload), compression: true, want: CodeResourceExhausted}
+		case strings.HasPrefix(name, "stream_bad."):
+			cases[name] = testCase{frames: streamFrame(payload), compression: true, streams: true, want: CodeInternal}
+		case strings.HasPrefix(name, "stream_too_large."):
+			cases[name] = testCase{frames: streamFrame(payload), compression: true, streams: true, want: CodeResourceExhausted}
+		}
+	}
+
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			var compression *compressionConfig
+			if test.compression {
+				compression = testCompressionConfig(t)
+			}
+			response := append(bytes.Clone(test.frames), okStatus...)
+			_, err := scriptedResponseCall(t, response, compression, test.streams)
+			if got := StatusFromError(err).Code; got != test.want {
+				t.Fatalf("error = %v (code %v), want %v", err, got, test.want)
+			}
+		})
+	}
+
+	// The same calls decode valid frames, so the failures above come from the
+	// frames alone.
+	sample := compressionSample(0)
+	marshalled, err := proto.Marshal(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := compressPayload(marshalled, testCompressionConfig(t).byType[compressedType].Dict).frame
+	streamer := newStreamCompressor(newStreamBudget(0, defaultClientStreamCompressionMemory, nil), nil)
+	defer streamer.close()
+	streamer.start(sample)
+	streamed, err := streamer.encodeStream(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, test := range map[string]struct {
+		frames  []byte
+		streams bool
+	}{
+		"ZSTD_MESSAGE":        {frames: compressed},
+		"ZSTD_STREAM_MESSAGE": {frames: streamed.frame, streams: true},
+		"DATAGRAM_COUNT":      {frames: append(bytes.Clone(plain), datagramCount(0x00)...)},
+	} {
+		t.Run("valid "+name, func(t *testing.T) {
+			response := append(bytes.Clone(test.frames), okStatus...)
+			received, err := scriptedResponseCall(t, response, testCompressionConfig(t), test.streams)
+			if err != nil || len(received) != 1 {
+				t.Fatalf("received %q, %v; want one message", received, err)
 			}
 		})
 	}

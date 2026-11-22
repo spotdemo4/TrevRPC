@@ -342,6 +342,12 @@ func callStatus(ctx context.Context, err error) error {
 	if deadline, ok := ctx.Deadline(); ok && isTimeoutError(err) && !time.Now().Before(deadline) {
 		return statusFromContextError(context.DeadlineExceeded)
 	}
+	// A client decodes only responses, so a frame it cannot decode is the
+	// server's fault, not the caller's: Internal, where transportStatus gives
+	// a server InvalidArgument for a malformed request.
+	if frameDecode, ok := errors.AsType[*frameDecodeError](err); ok {
+		return Internal(frameDecode.Error())
+	}
 	return transportStatus(err)
 }
 
