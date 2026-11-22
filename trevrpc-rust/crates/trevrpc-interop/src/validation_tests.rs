@@ -145,7 +145,7 @@ fn expect_empty_message_rejected<T>(outcome: trevrpc::Result<T>) {
     let violations = status
         .find_detail(trevrpc_protovalidate::VIOLATIONS_TYPE)
         .expect("violations detail")
-        .decode::<Violations>()
+        .decode::<Violations>(&trevrpc::codec::Prost)
         .unwrap();
     assert_eq!(violations.violations.len(), 1);
     assert_eq!(violations.violations[0].rule_id(), "string.min_len");

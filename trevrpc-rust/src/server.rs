@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use futures_core::Stream;
 use tokio::sync::watch;
 use tracing::Instrument as _;
@@ -39,12 +40,11 @@ pub use crate::rate_limit::{
 
 type UnaryHandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
 type UnaryHandler =
-    Arc<dyn Fn(RequestContext, Vec<u8>) -> UnaryHandlerFuture + Send + Sync + 'static>;
+    Arc<dyn Fn(RequestContext, Bytes) -> UnaryHandlerFuture + Send + Sync + 'static>;
 type StreamingHandlerFuture =
     Pin<Box<dyn Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static>>;
-type StreamingHandler = Arc<
-    dyn Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> StreamingHandlerFuture + Send + Sync,
->;
+type StreamingHandler =
+    Arc<dyn Fn(RequestContext, Bytes, BoxStream<Bytes>) -> StreamingHandlerFuture + Send + Sync>;
 /// Routes keyed by the full method path, `/<service>/<method>`.
 type RouteMap = HashMap<String, Route>;
 
@@ -1710,7 +1710,7 @@ impl Server {
     /// Panics when `path` is not of the form `/<service>/<method>`.
     pub fn route<F, Fut>(&mut self, path: impl Into<String>, handler: F)
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(Bytes) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
         self.route_with_context(path, move |_context, body| handler(body));
@@ -1724,7 +1724,7 @@ impl Server {
     /// Panics when `path` is not of the form `/<service>/<method>`.
     pub fn route_with_context<F, Fut>(&mut self, path: impl Into<String>, handler: F)
     where
-        F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(RequestContext, Bytes) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
         self.route_with_options(path, RouteOptions::new(), handler);
@@ -1742,7 +1742,7 @@ impl Server {
         options: RouteOptions,
         handler: F,
     ) where
-        F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(RequestContext, Bytes) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
         self.insert_route(
@@ -1761,7 +1761,7 @@ impl Server {
     /// Panics when `path` is not of the form `/<service>/<method>`.
     pub fn route_streaming<F, Fut>(&mut self, path: impl Into<String>, kind: RpcKind, handler: F)
     where
-        F: Fn(Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        F: Fn(Bytes, BoxStream<Bytes>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
     {
         self.route_streaming_with_context(path, kind, move |_context, body, stream| {
@@ -1781,7 +1781,7 @@ impl Server {
         kind: RpcKind,
         handler: F,
     ) where
-        F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        F: Fn(RequestContext, Bytes, BoxStream<Bytes>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
     {
         self.route_streaming_with_options(path, kind, RouteOptions::new(), handler);
@@ -1800,7 +1800,7 @@ impl Server {
         options: RouteOptions,
         handler: F,
     ) where
-        F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        F: Fn(RequestContext, Bytes, BoxStream<Bytes>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
     {
         self.insert_route(
@@ -1900,7 +1900,7 @@ impl Server {
     pub async fn handle_request(
         &self,
         request: RpcRequest,
-        body: Vec<u8>,
+        body: Bytes,
     ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
         let cancellation = CancellationToken::new();
         let mut completion = self.start_call(&request, body.len(), &cancellation, false);
@@ -1970,7 +1970,7 @@ impl Server {
     pub(crate) async fn handle_request_with_cancellation(
         &self,
         request: RpcRequest,
-        body: Vec<u8>,
+        body: Bytes,
         cancellation: CancellationToken,
         info: CallInfo,
         completion: &mut CallCompletion,
@@ -2056,8 +2056,8 @@ impl Server {
     pub async fn handle_streaming_request(
         &self,
         request: RpcRequest,
-        body: Vec<u8>,
-        request_body: BoxStream<Vec<u8>>,
+        body: Bytes,
+        request_body: BoxStream<Bytes>,
     ) -> BoxStream<ResponseFrame> {
         let cancellation = CancellationToken::new();
         let mut completion = self.start_call(&request, body.len(), &cancellation, true);
@@ -2089,8 +2089,8 @@ impl Server {
     pub(crate) async fn handle_streaming_request_with_cancellation(
         &self,
         request: RpcRequest,
-        body: Vec<u8>,
-        request_body: BoxStream<Vec<u8>>,
+        body: Bytes,
+        request_body: BoxStream<Bytes>,
         admitted: Option<Admitted>,
         cancellation: CancellationToken,
         info: CallInfo,
@@ -2316,7 +2316,7 @@ where
 fn invoke_unary_handler(
     handler: &UnaryHandler,
     context: RequestContext,
-    body: Vec<u8>,
+    body: Bytes,
 ) -> std::result::Result<UnaryHandlerFuture, Status> {
     catch_unwind(AssertUnwindSafe(|| handler(context, body)))
         .map_err(|_| Status::internal("RPC handler panicked"))
@@ -2325,8 +2325,8 @@ fn invoke_unary_handler(
 fn invoke_streaming_handler(
     handler: &StreamingHandler,
     context: RequestContext,
-    body: Vec<u8>,
-    request_body: BoxStream<Vec<u8>>,
+    body: Bytes,
+    request_body: BoxStream<Bytes>,
 ) -> std::result::Result<StreamingHandlerFuture, Status> {
     catch_unwind(AssertUnwindSafe(|| handler(context, body, request_body)))
         .map_err(|_| Status::internal("RPC handler panicked"))
@@ -2430,7 +2430,7 @@ impl StreamLimits {
 }
 
 struct LimitedStream {
-    inner: BoxStream<Vec<u8>>,
+    inner: BoxStream<Bytes>,
     limits: StreamLimits,
     timer: StreamTimer,
     direction: &'static str,
@@ -2441,11 +2441,11 @@ struct LimitedStream {
 }
 
 fn limit_stream(
-    inner: BoxStream<Vec<u8>>,
+    inner: BoxStream<Bytes>,
     limits: StreamLimits,
     direction: &'static str,
     cancellation: CancellationToken,
-) -> BoxStream<Vec<u8>> {
+) -> BoxStream<Bytes> {
     Box::pin(LimitedStream {
         inner,
         limits,
@@ -2459,7 +2459,7 @@ fn limit_stream(
 }
 
 impl Stream for LimitedStream {
-    type Item = Result<Vec<u8>>;
+    type Item = Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -2523,13 +2523,13 @@ impl StreamTimer {
 
     /// Polls `inner` for its next item, failing once the call's deadline passes or once the
     /// stream's idle timeout runs out while it waits.
-    fn poll_item(
+    fn poll_item<T>(
         &mut self,
-        inner: &mut BoxStream<Vec<u8>>,
+        inner: &mut BoxStream<T>,
         direction: &'static str,
         cancellation: &CancellationToken,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<Vec<u8>>>> {
+    ) -> Poll<Result<Option<T>>> {
         Poll::Ready(match std::task::ready!(self.poll_next(inner, cx)) {
             Ok(item) => item.transpose(),
             Err(reason) => {
@@ -2541,11 +2541,11 @@ impl StreamTimer {
 
     /// Polls `inner` for its next item, failing once the deadline passes or once the idle timeout
     /// runs out after `inner` returned `Pending`.
-    fn poll_next(
+    fn poll_next<T>(
         &mut self,
-        inner: &mut BoxStream<Vec<u8>>,
+        inner: &mut BoxStream<T>,
         cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<Option<Result<Vec<u8>>>, StreamTimeoutReason>> {
+    ) -> Poll<std::result::Result<Option<Result<T>>, StreamTimeoutReason>> {
         if let Some(deadline) = &mut self.deadline
             && deadline.as_mut().poll(cx).is_ready()
         {
@@ -2983,7 +2983,7 @@ mod tests {
             .insert("authorization".to_owned(), b"ok".to_vec());
 
         let response = server
-            .handle_request(request, Vec::new())
+            .handle_request(request, bytes::Bytes::new())
             .await
             .expect("authorized request should succeed");
 
@@ -3008,7 +3008,10 @@ mod tests {
         });
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("missing metadata should be rejected");
 
@@ -3024,7 +3027,10 @@ mod tests {
         });
 
         let response = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect("request should succeed despite panicking metrics");
 
@@ -3117,7 +3123,7 @@ mod tests {
         configure(&mut server);
 
         let code = server
-            .handle_request(request, Vec::new())
+            .handle_request(request, bytes::Bytes::new())
             .await
             .map_or_else(|status| status.code(), |_| Code::Ok);
 
@@ -3134,7 +3140,10 @@ mod tests {
         });
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/Panic"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/Panic"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("a panicking handler should fail");
 
@@ -3150,7 +3159,10 @@ mod tests {
         });
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/Panic"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/Panic"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("a panicking handler should fail");
 
@@ -3170,7 +3182,7 @@ mod tests {
         let request = RpcRequest::new("/example.Greeter/Panic").with_kind(RpcKind::ServerStreaming);
 
         let mut response = server
-            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+            .handle_streaming_request(request, bytes::Bytes::new(), crate::stream::empty())
             .await;
         let frame = response
             .next()
@@ -3194,7 +3206,7 @@ mod tests {
         let request = RpcRequest::new("/example.Greeter/SayHello").with_timeout_nanos(1_000_000);
 
         let status = server
-            .handle_request(request, Vec::new())
+            .handle_request(request, bytes::Bytes::new())
             .await
             .expect_err("the authorizer should hit the deadline");
 
@@ -3227,7 +3239,7 @@ mod tests {
             .insert("Authorization".to_owned(), b"ok".to_vec());
 
         let status = server
-            .handle_request(request, Vec::new())
+            .handle_request(request, bytes::Bytes::new())
             .await
             .expect_err("invalid metadata should be rejected");
 
@@ -3249,7 +3261,10 @@ mod tests {
         ));
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/Missing"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/Missing"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("unauthenticated requests should be rejected");
 
@@ -3275,7 +3290,7 @@ mod tests {
             "/example.Greeter//SayHello",
         ] {
             let status = server
-                .handle_request(RpcRequest::new(path), Vec::new())
+                .handle_request(RpcRequest::new(path), bytes::Bytes::new())
                 .await
                 .expect_err("a malformed path should be rejected");
             assert_eq!(status.code(), Code::InvalidArgument, "{path:?}");
@@ -3294,7 +3309,10 @@ mod tests {
         server.set_authorizer(MetadataValueAuthorizer::bearer("secret"));
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/Missing"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/Missing"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("an unauthenticated request should be rejected");
 
@@ -3314,7 +3332,7 @@ mod tests {
             "/example/Greeter",
         ] {
             let status = server
-                .handle_request(RpcRequest::new(path), Vec::new())
+                .handle_request(RpcRequest::new(path), bytes::Bytes::new())
                 .await
                 .expect_err("an unknown method should fail");
             assert_eq!(status.code(), Code::Unimplemented, "{path:?}");
@@ -3341,7 +3359,10 @@ mod tests {
         });
 
         let response = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect("the call should succeed");
 
@@ -3422,7 +3443,10 @@ mod tests {
         server.route("/example.Greeter/SayHello", |_| async { Ok(Vec::new()) });
 
         server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect("the call should succeed");
 
@@ -3440,7 +3464,7 @@ mod tests {
         request.kind = 99;
 
         let status = server
-            .handle_request(request, Vec::new())
+            .handle_request(request, bytes::Bytes::new())
             .await
             .expect_err("the kind should be rejected");
 
@@ -3719,7 +3743,7 @@ mod tests {
         request.timeout_nanos = u64::MAX;
 
         let status = server
-            .handle_request(request, Vec::new())
+            .handle_request(request, bytes::Bytes::new())
             .await
             .expect_err("the timeout should be rejected");
 
@@ -3744,7 +3768,11 @@ mod tests {
         let request =
             RpcRequest::new("/example.Greeter/StreamHello").with_kind(RpcKind::ServerStreaming);
         let mut response = server
-            .handle_streaming_request(request, b"request".to_vec(), crate::stream::empty())
+            .handle_streaming_request(
+                request,
+                bytes::Bytes::from_static(b"request"),
+                crate::stream::empty(),
+            )
             .await;
 
         let first = response
@@ -3794,7 +3822,7 @@ mod tests {
         let request =
             RpcRequest::new("/example.Greeter/Download").with_kind(RpcKind::ServerStreaming);
         let response = server
-            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+            .handle_streaming_request(request, bytes::Bytes::new(), crate::stream::empty())
             .await;
 
         drop(response);
@@ -3824,8 +3852,11 @@ mod tests {
         let mut response = server
             .handle_streaming_request(
                 request,
-                Vec::new(),
-                crate::stream::from_iter([b"one".to_vec(), b"two".to_vec()]),
+                bytes::Bytes::new(),
+                crate::stream::from_iter([
+                    bytes::Bytes::from_static(b"one"),
+                    bytes::Bytes::from_static(b"two"),
+                ]),
             )
             .await;
 
@@ -3851,7 +3882,7 @@ mod tests {
         let request =
             RpcRequest::new("/example.Greeter/Download").with_kind(RpcKind::ServerStreaming);
         let mut response = server
-            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+            .handle_streaming_request(request, bytes::Bytes::new(), crate::stream::empty())
             .await;
 
         let status = response
@@ -3888,7 +3919,7 @@ mod tests {
         let mut response = server
             .handle_streaming_request(
                 request,
-                Vec::new(),
+                bytes::Bytes::new(),
                 Box::pin(futures_util::stream::pending()),
             )
             .await;
@@ -3920,7 +3951,7 @@ mod tests {
         let request =
             RpcRequest::new("/example.Greeter/Download").with_kind(RpcKind::ServerStreaming);
         let mut response = server
-            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+            .handle_streaming_request(request, bytes::Bytes::new(), crate::stream::empty())
             .await;
 
         let status = response
@@ -3937,7 +3968,7 @@ mod tests {
     async fn streaming_status_code(server: &Server, path: &str) -> Option<Code> {
         let request = RpcRequest::new(path).with_kind(RpcKind::ServerStreaming);
         let mut response = server
-            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+            .handle_streaming_request(request, bytes::Bytes::new(), crate::stream::empty())
             .await;
         let frame = response
             .next()
@@ -3962,7 +3993,7 @@ mod tests {
     async fn unary_handlers_receive_the_request_message_and_return_headers() {
         let mut server = Server::new();
         server.route_with_context("/example.Greeter/SayHello", |context, body| async move {
-            assert_eq!(body, b"request");
+            assert_eq!(body, &b"request"[..]);
             context.set_response_header("X-Header", b"h".to_vec())?;
             context.set_response_metadata("x-trailer", b"t".to_vec())?;
             Ok(b"reply".to_vec())
@@ -3971,7 +4002,7 @@ mod tests {
         let response = server
             .handle_request(
                 RpcRequest::new("/example.Greeter/SayHello"),
-                b"request".to_vec(),
+                bytes::Bytes::from_static(b"request"),
             )
             .await
             .expect("request should succeed");
@@ -4006,7 +4037,7 @@ mod tests {
         server
             .handle_request(
                 RpcRequest::new("/example.Greeter/SayHello"),
-                b"four".to_vec(),
+                bytes::Bytes::from_static(b"four"),
             )
             .await
             .expect("request should succeed");
@@ -4030,7 +4061,10 @@ mod tests {
         });
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("invalid metadata should fail the call");
 
@@ -4049,7 +4083,10 @@ mod tests {
         });
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("the handler failed");
 
@@ -4101,7 +4138,7 @@ mod tests {
         );
 
         let frames: Vec<_> = server
-            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(watch_request(), bytes::Bytes::new(), crate::stream::empty())
             .await
             .map(|frame| frame.expect("frame should be ok"))
             .collect()
@@ -4158,7 +4195,7 @@ mod tests {
         );
 
         let mut response = server
-            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(watch_request(), bytes::Bytes::new(), crate::stream::empty())
             .await;
         let first = response
             .next()
@@ -4179,7 +4216,7 @@ mod tests {
         );
 
         let frames: Vec<_> = server
-            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(watch_request(), bytes::Bytes::new(), crate::stream::empty())
             .await
             .map(|frame| frame.expect("frame should be ok"))
             .collect()
@@ -4205,7 +4242,7 @@ mod tests {
         );
 
         let frames: Vec<_> = server
-            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(watch_request(), bytes::Bytes::new(), crate::stream::empty())
             .await
             .map(|frame| frame.expect("frame should be ok"))
             .collect()
@@ -4253,7 +4290,7 @@ mod tests {
         for (path, _) in routes {
             let request = RpcRequest::new(path).with_kind(RpcKind::BidirectionalStreaming);
             let frames: Vec<_> = server
-                .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+                .handle_streaming_request(request, bytes::Bytes::new(), crate::stream::empty())
                 .await
                 .map(|frame| frame.expect("frame should be ok"))
                 .collect()
@@ -4286,7 +4323,7 @@ mod tests {
         );
 
         let frames: Vec<_> = server
-            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(watch_request(), bytes::Bytes::new(), crate::stream::empty())
             .await
             .map(|frame| frame.expect("frame should be ok"))
             .collect()
@@ -4396,7 +4433,10 @@ mod tests {
         });
 
         let response = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect("intercepted request should succeed");
 
@@ -4463,14 +4503,17 @@ mod tests {
         );
 
         let response = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect("unary call should succeed");
         assert_eq!(response.message(), b"inner");
         assert_eq!(log.take(), ["outer in none", "inner in outer"]);
 
         let frames: Vec<_> = server
-            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(watch_request(), bytes::Bytes::new(), crate::stream::empty())
             .await
             .collect()
             .await;
@@ -4514,7 +4557,7 @@ mod tests {
 
         for path in ["/example.Greeter/SayHello", "/example.Greeter/Missing"] {
             let _ = server
-                .handle_request(RpcRequest::new(path), Vec::new())
+                .handle_request(RpcRequest::new(path), bytes::Bytes::new())
                 .await;
         }
 
@@ -4544,7 +4587,7 @@ mod tests {
         );
 
         let mut frames = server
-            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(watch_request(), bytes::Bytes::new(), crate::stream::empty())
             .await;
         assert!(log.take().is_empty(), "the call is still streaming");
         let first = frames
@@ -4577,7 +4620,10 @@ mod tests {
         });
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("the interceptor should end the call");
 
@@ -4599,7 +4645,11 @@ mod tests {
                 |_body, _requests| async { Ok(crate::stream::empty()) },
             );
             server
-                .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+                .handle_streaming_request(
+                    watch_request(),
+                    bytes::Bytes::new(),
+                    crate::stream::empty(),
+                )
                 .await
                 .collect()
                 .await
@@ -4646,7 +4696,10 @@ mod tests {
         });
 
         let status = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("the panic should end the call");
 
@@ -4722,7 +4775,7 @@ mod tests {
                 server
                     .handle_request(
                         RpcRequest::new(format!("/example.Errors/{method}")),
-                        Vec::new(),
+                        bytes::Bytes::new(),
                     )
                     .await
             }
@@ -4786,7 +4839,11 @@ mod tests {
         let redacted = Status::internal(super::INTERNAL_SERVER_ERROR);
 
         let frames: Vec<_> = server
-            .handle_streaming_request(request("Before"), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(
+                request("Before"),
+                bytes::Bytes::new(),
+                crate::stream::empty(),
+            )
             .await
             .collect()
             .await;
@@ -4801,7 +4858,11 @@ mod tests {
         );
 
         let frames: Vec<_> = server
-            .handle_streaming_request(request("During"), Vec::new(), crate::stream::empty())
+            .handle_streaming_request(
+                request("During"),
+                bytes::Bytes::new(),
+                crate::stream::empty(),
+            )
             .await
             .collect()
             .await;
@@ -4825,7 +4886,7 @@ mod tests {
         let request = RpcRequest::new("/example.Greeter/SayHello").with_timeout_nanos(1_000_000);
 
         let status = server
-            .handle_request(request, Vec::new())
+            .handle_request(request, bytes::Bytes::new())
             .await
             .expect_err("the interceptor should hit the deadline");
 
@@ -4844,7 +4905,10 @@ mod tests {
         });
 
         let response = server
-            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Greeter/SayHello"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect("request should succeed");
 
@@ -4958,7 +5022,7 @@ mod tests {
             .metadata
             .insert("authorization".to_owned(), b"Bearer token".to_vec());
         let response = server
-            .handle_request(request, Vec::new())
+            .handle_request(request, bytes::Bytes::new())
             .await
             .expect("authorized request should succeed");
         assert_eq!(response.message(), b"session>user>interceptor");
@@ -4968,7 +5032,7 @@ mod tests {
             .metadata
             .insert("authorization".to_owned(), b"Bearer token".to_vec());
         let first = server
-            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+            .handle_streaming_request(request, bytes::Bytes::new(), crate::stream::empty())
             .await
             .next()
             .await
@@ -5089,14 +5153,14 @@ mod tests {
             "/example.Auth/ByHand",
         ] {
             server
-                .handle_request(RpcRequest::new(path), Vec::new())
+                .handle_request(RpcRequest::new(path), bytes::Bytes::new())
                 .await
                 .expect("the call should succeed");
         }
         let mut watch = RpcRequest::new("/example.Auth/Watch");
         watch.kind = RpcKind::ServerStreaming.into();
         let frames: Vec<_> = server
-            .handle_streaming_request(watch, Vec::new(), crate::stream::empty())
+            .handle_streaming_request(watch, bytes::Bytes::new(), crate::stream::empty())
             .await
             .collect()
             .await;
@@ -5104,7 +5168,10 @@ mod tests {
         // The authorizer runs before the route lookup, so it sees an unknown method too, without
         // options, and the caller gets the usual status.
         let status = server
-            .handle_request(RpcRequest::new("/example.Auth/Missing"), Vec::new())
+            .handle_request(
+                RpcRequest::new("/example.Auth/Missing"),
+                bytes::Bytes::new(),
+            )
             .await
             .expect_err("an unknown method should fail");
         assert_eq!(status.code(), Code::Unimplemented);

@@ -1195,7 +1195,7 @@ impl MessageCount {
 /// and dropped, so datagrams that arrive later are dropped, and the requests end.
 pub struct MergedRequests {
     /// Polled only when it woke, so a datagram does not also cost a poll of the stream.
-    requests: Gated<BoxStream<Vec<u8>>>,
+    requests: Gated<BoxStream<Bytes>>,
     datagrams: Option<queue::Receiver<Bytes>>,
     stragglers: Stragglers,
     count: MessageCount,
@@ -1209,11 +1209,11 @@ impl MergedRequests {
     /// `count` as they are delivered. The datagrams `expected` says the request side is owed are
     /// waited for when it ends.
     pub fn boxed(
-        requests: BoxStream<Vec<u8>>,
+        requests: BoxStream<Bytes>,
         datagrams: queue::Receiver<Bytes>,
         expected: Expected,
         count: MessageCount,
-    ) -> BoxStream<Vec<u8>> {
+    ) -> BoxStream<Bytes> {
         Box::pin(Self {
             requests: Gated::new(requests),
             datagrams: Some(datagrams),
@@ -1224,7 +1224,7 @@ impl MergedRequests {
         })
     }
 
-    fn poll_requests(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>>>> {
+    fn poll_requests(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes>>> {
         if self.requests_done {
             return Poll::Pending;
         }
@@ -1244,14 +1244,14 @@ impl MergedRequests {
     }
 
     /// The next datagram message, while the request side is open.
-    fn poll_datagrams(&mut self, cx: &Context<'_>) -> Poll<Option<Result<Vec<u8>>>> {
+    fn poll_datagrams(&mut self, cx: &Context<'_>) -> Poll<Option<Result<Bytes>>> {
         let Some(datagrams) = &mut self.datagrams else {
             return Poll::Pending;
         };
         match datagrams.poll_recv(cx) {
             Poll::Ready(Some(message)) => {
                 self.count.add();
-                Poll::Ready(Some(Ok(message.to_vec())))
+                Poll::Ready(Some(Ok(message)))
             }
             Poll::Ready(None) => {
                 self.datagrams = None;
@@ -1263,7 +1263,7 @@ impl MergedRequests {
 
     /// The request side has ended: delivers the datagram messages that are queued, and ends once
     /// no announced datagram is awaited any more.
-    fn poll_ending(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>>>> {
+    fn poll_ending(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes>>> {
         let Some(datagrams) = &mut self.datagrams else {
             // The call failed: nothing more is delivered.
             return Poll::Ready(None);
@@ -1272,7 +1272,7 @@ impl MergedRequests {
         let over = self.stragglers.poll_over(cx).is_ready();
         if let Some(message) = datagrams.try_recv() {
             self.count.add();
-            return Poll::Ready(Some(Ok(message.to_vec())));
+            return Poll::Ready(Some(Ok(message)));
         }
         if over {
             self.datagrams = None;
@@ -1284,7 +1284,7 @@ impl MergedRequests {
 }
 
 impl Stream for MergedRequests {
-    type Item = Result<Vec<u8>>;
+    type Item = Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
@@ -2273,12 +2273,12 @@ mod tests {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
         let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
-        let (stream_tx, stream) = channel_stream::<Vec<u8>>();
+        let (stream_tx, stream) = channel_stream::<Bytes>();
         let count = MessageCount::new();
         let mut merged =
             MergedRequests::boxed(stream, requests, flow.expected.clone(), count.clone());
 
-        stream_tx.send(Ok(b"s1".to_vec())).unwrap();
+        stream_tx.send(Ok(Bytes::from_static(b"s1"))).unwrap();
         fake.arrive_for(1, b"d1");
         settle().await;
         let mut got = vec![
@@ -2294,7 +2294,7 @@ mod tests {
         settle().await;
         assert!(!waiting.is_finished());
         fake.arrive_for(1, b"d2");
-        assert_eq!(waiting.await.unwrap(), b"d2");
+        assert_eq!(waiting.await.unwrap(), &b"d2"[..]);
         assert_eq!(count.get(), 2);
         drop(flow);
     }
@@ -2304,13 +2304,13 @@ mod tests {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
         let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
-        let (stream_tx, stream) = channel_stream::<Vec<u8>>();
+        let (stream_tx, stream) = channel_stream::<Bytes>();
         let mut merged =
             MergedRequests::boxed(stream, requests, flow.expected.clone(), MessageCount::new());
 
         fake.arrive_for(1, b"queued");
         settle().await;
-        stream_tx.send(Ok(b"last".to_vec())).unwrap();
+        stream_tx.send(Ok(Bytes::from_static(b"last"))).unwrap();
         drop(stream_tx);
 
         let mut delivered = vec![
@@ -2332,7 +2332,7 @@ mod tests {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
         let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
-        let (stream_tx, stream) = channel_stream::<Vec<u8>>();
+        let (stream_tx, stream) = channel_stream::<Bytes>();
         let mut merged =
             MergedRequests::boxed(stream, requests, flow.expected.clone(), MessageCount::new());
 
@@ -2354,16 +2354,16 @@ mod tests {
         _demux: Demux,
         /// Keeps the call's flow registered.
         _flow: ServerFlow,
-        stream_tx: mpsc::UnboundedSender<Result<Vec<u8>>>,
+        stream_tx: mpsc::UnboundedSender<Result<Bytes>>,
         announced: Announced,
-        merged: BoxStream<Vec<u8>>,
+        merged: BoxStream<Bytes>,
     }
 
     fn merged_call() -> MergedCall {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
         let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
-        let (stream_tx, stream) = channel_stream::<Vec<u8>>();
+        let (stream_tx, stream) = channel_stream::<Bytes>();
         let announced = flow.expected.announced();
         let merged =
             MergedRequests::boxed(stream, requests, flow.expected.clone(), MessageCount::new());
@@ -2378,7 +2378,7 @@ mod tests {
     }
 
     /// Reads merged requests to their end, sorted, and how long that took.
-    async fn read_to_end(merged: &mut BoxStream<Vec<u8>>) -> (Vec<Vec<u8>>, Duration) {
+    async fn read_to_end(merged: &mut BoxStream<Bytes>) -> (Vec<Bytes>, Duration) {
         let started = Instant::now();
         let mut delivered = Vec::new();
         while let Some(message) = merged.next().await {
@@ -2511,7 +2511,7 @@ mod tests {
         settle().await;
 
         let (requests, flow) = requests_of(demux.open_server_flow(9, BIDI, &Accept::None).unwrap());
-        let (stream_tx, stream) = channel_stream::<Vec<u8>>();
+        let (stream_tx, stream) = channel_stream::<Bytes>();
         flow.expected.announced().set(2);
         let mut merged =
             MergedRequests::boxed(stream, requests, flow.expected.clone(), MessageCount::new());

@@ -65,13 +65,13 @@ pub struct Blob {
 
 fn register_raw(server: &mut Server) {
     // Unary and bidi echo the bytes they receive, undecoded.
-    server.route(RAW_UNARY, |body| async move { Ok(body) });
+    server.route(RAW_UNARY, |body| async move { Ok(Vec::from(body)) });
     server.route_streaming(
         RAW_SERVER_STREAM,
         RpcKind::ServerStreaming,
         |body, _requests| async move {
             Ok(trevrpc::stream::from_iter(
-                (0..MESSAGES).map(move |_| body.clone()),
+                (0..MESSAGES).map(move |_| body.to_vec()),
             ))
         },
     );
@@ -93,7 +93,11 @@ fn register_raw(server: &mut Server) {
     server.route_streaming(
         RAW_BIDI,
         RpcKind::BidirectionalStreaming,
-        |_body, requests| async move { Ok(requests) },
+        |_body, requests| async move {
+            let echoes: trevrpc::BoxStream<Vec<u8>> =
+                Box::pin(requests.map(|body| body.map(Vec::from)));
+            Ok(echoes)
+        },
     );
 }
 
@@ -286,9 +290,15 @@ where
     pub async fn unary(&self) {
         match self {
             Self::Raw { transport, request } => {
-                let reply: Blob = trevrpc::client::unary(transport, RAW_UNARY, request, options())
-                    .await
-                    .unwrap();
+                let reply: Blob = trevrpc::client::unary(
+                    transport,
+                    RAW_UNARY,
+                    request,
+                    options(),
+                    trevrpc::codec::Prost,
+                )
+                .await
+                .unwrap();
                 assert_eq!(reply.data.len(), request.data.len());
             }
             Self::Greeter { client, request } => {
@@ -307,11 +317,12 @@ where
         let mut received = 0_usize;
         match self {
             Self::Raw { transport, request } => {
-                let mut responses = trevrpc::client::server_streaming::<_, _, Blob>(
+                let mut responses = trevrpc::client::server_streaming::<_, _, Blob, _>(
                     transport,
                     RAW_SERVER_STREAM,
                     request,
                     options(),
+                    trevrpc::codec::Prost,
                 )
                 .await
                 .unwrap();
@@ -339,10 +350,11 @@ where
     pub async fn client_stream(&self) {
         let sent = match self {
             Self::Raw { transport, request } => {
-                let call = trevrpc::client::client_streaming::<_, Blob, Blob>(
+                let call = trevrpc::client::client_streaming::<_, Blob, Blob, _>(
                     transport,
                     RAW_CLIENT_STREAM,
                     options(),
+                    trevrpc::codec::Prost,
                 )
                 .await
                 .unwrap();
@@ -376,9 +388,14 @@ where
     pub async fn open_bidi(&self) -> Bidi {
         match self {
             Self::Raw { transport, request } => Bidi::Raw {
-                call: trevrpc::client::bidirectional_streaming(transport, RAW_BIDI, options())
-                    .await
-                    .unwrap(),
+                call: trevrpc::client::bidirectional_streaming(
+                    transport,
+                    RAW_BIDI,
+                    options(),
+                    trevrpc::codec::Prost,
+                )
+                .await
+                .unwrap(),
                 request: request.clone(),
             },
             Self::Greeter { client, request } => Bidi::Greeter {

@@ -7,6 +7,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use futures_util::StreamExt;
 
+use crate::codec::{Decode, Encode, EncodeError, Prost};
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::queue;
 use crate::response_state::{
@@ -19,7 +20,6 @@ use crate::{
     Result, RpcKind, RpcRequest, Status, Unreliable,
 };
 use bytes::Bytes;
-use prost::Message;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -411,16 +411,18 @@ pub async fn collect_unary_response(
 
 /// Makes a unary call whose encoded request message is `body` and returns the decoded response
 /// with the response headers and trailing metadata.
-async fn unary_response<T, Res>(
+async fn unary_response<T, Res, C>(
     transport: &T,
     method: &str,
-    body: Vec<u8>,
+    body: std::result::Result<Vec<u8>, EncodeError>,
     options: CallOptions,
+    codec: C,
 ) -> Result<ResponseEnvelope<Res>>
 where
     T: RpcTransport + ?Sized,
-    Res: Message + Default,
+    C: Decode<Res>,
 {
+    let body = body?;
     let CallOptions {
         timeout,
         max_response_body_size,
@@ -462,23 +464,26 @@ where
     }
 
     let (body, headers, metadata) = response.into_parts();
-    let message = Res::decode(body).map_err(Error::from)?;
+    let message = codec.decode(body)?;
     Ok(ResponseEnvelope::new(message)
         .with_headers(headers)
         .with_metadata(metadata))
 }
 
 /// Starts a server-streaming call whose encoded request message is `request`.
-async fn start_server_streaming<T, Res>(
+async fn start_server_streaming<T, Res, C>(
     transport: &T,
     method: &str,
-    request: Vec<u8>,
+    request: std::result::Result<Vec<u8>, EncodeError>,
     options: CallOptions,
-) -> Result<ResponseStream<Res>>
+    codec: C,
+) -> Result<ResponseStream<Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Res: Message + Default + Send + 'static,
+    Res: Send + 'static,
+    C: Decode<Res>,
 {
+    let request = request?;
     let prepared = prepare_streaming_request(method, RpcKind::ServerStreaming, options)?;
     if let Some(check) = &prepared.request_check {
         check.check(&request)?;
@@ -488,83 +493,102 @@ where
         prepared,
         crate::stream::from_iter([request]),
         None,
+        codec,
     )
     .await
 }
 
 /// Starts a client-streaming call and returns its sendable call object.
-async fn start_client_streaming<T, Req, Res>(
+async fn start_client_streaming<T, Req, Res, C>(
     transport: &T,
     method: &str,
     options: CallOptions,
-) -> Result<ClientStreamingCall<Req, Res>>
+    codec: C,
+) -> Result<ClientStreamingCall<Req, Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
     let prepared = prepare_streaming_request(method, RpcKind::ClientStreaming, options)?;
-    let (sender, requests, call_end) =
-        request_channel(prepared.deadline, prepared.request_check.clone());
-    let response = open_response_stream(transport, prepared, requests, Some(call_end)).await?;
+    let (sender, requests, call_end) = request_channel(
+        codec.clone(),
+        prepared.deadline,
+        prepared.request_check.clone(),
+    );
+    let response =
+        open_response_stream(transport, prepared, requests, Some(call_end), codec).await?;
 
     Ok(ClientStreamingCall::new(sender, response))
 }
 
 /// Makes a client-streaming call that sends `requests` and returns its response with the
 /// response headers and trailing metadata.
-async fn client_streaming_send_all<T, Req, Res>(
+async fn client_streaming_send_all<T, Req, Res, C>(
     transport: &T,
     method: &str,
     requests: BoxStream<Req>,
     options: CallOptions,
+    codec: C,
 ) -> Result<ResponseEnvelope<Res>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
     let prepared = prepare_streaming_request(method, RpcKind::ClientStreaming, options)?;
-    let requests = crate::stream::encode_checked(requests, prepared.request_check.clone());
-    let mut response = open_response_stream(transport, prepared, requests, None).await?;
+    let requests =
+        crate::stream::encode_checked(requests, codec.clone(), prepared.request_check.clone());
+    let mut response = open_response_stream(transport, prepared, requests, None, codec).await?;
 
     read_unary_response_envelope_from_message_stream(&mut response).await
 }
 
 /// Starts a bidirectional-streaming call and returns its splittable call object.
-async fn start_bidirectional_streaming<T, Req, Res>(
+async fn start_bidirectional_streaming<T, Req, Res, C>(
     transport: &T,
     method: &str,
     options: CallOptions,
-) -> Result<BidirectionalCall<Req, Res>>
+    codec: C,
+) -> Result<BidirectionalCall<Req, Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
     let prepared = prepare_streaming_request(method, RpcKind::BidirectionalStreaming, options)?;
-    let (sender, requests, call_end) =
-        request_channel(prepared.deadline, prepared.request_check.clone());
-    let response = open_response_stream(transport, prepared, requests, Some(call_end)).await?;
+    let (sender, requests, call_end) = request_channel(
+        codec.clone(),
+        prepared.deadline,
+        prepared.request_check.clone(),
+    );
+    let response =
+        open_response_stream(transport, prepared, requests, Some(call_end), codec).await?;
 
     Ok(BidirectionalCall::new(sender, response))
 }
 
 /// Starts a bidirectional-streaming call that sends `requests` and returns its response stream.
-async fn bidirectional_streaming_send_all<T, Req, Res>(
+async fn bidirectional_streaming_send_all<T, Req, Res, C>(
     transport: &T,
     method: &str,
     requests: BoxStream<Req>,
     options: CallOptions,
-) -> Result<ResponseStream<Res>>
+    codec: C,
+) -> Result<ResponseStream<Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
     let prepared = prepare_streaming_request(method, RpcKind::BidirectionalStreaming, options)?;
-    let requests = crate::stream::encode_checked(requests, prepared.request_check.clone());
-    open_response_stream(transport, prepared, requests, None).await
+    let requests =
+        crate::stream::encode_checked(requests, codec.clone(), prepared.request_check.clone());
+    open_response_stream(transport, prepared, requests, None, codec).await
 }
 
 #[derive(Clone, Copy)]
@@ -603,11 +627,13 @@ impl Stream for RequestMessageStream {
 /// Creates the request half of a streaming call: the sender, and the stream of encoded messages
 /// the transport uploads. The returned [`call_end::EndSender`] belongs to whoever reads the
 /// response; it lets sends fail with the call's terminal status. A send of a message that
-/// `request_check` rejects fails with the status it returns, without ending the call.
-fn request_channel<T>(
+/// `request_check` rejects fails with the status it returns, without ending the call. The sender
+/// encodes its messages with `codec`.
+fn request_channel<T, C>(
+    codec: C,
     deadline: Option<Instant>,
     request_check: Option<RequestCheck>,
-) -> (RequestSender<T>, BoxStream<Vec<u8>>, call_end::EndSender) {
+) -> (RequestSender<T, C>, BoxStream<Vec<u8>>, call_end::EndSender) {
     let (sender, receiver) = queue::channel(queue::MESSAGES);
     let (control, control_rx) = mpsc::unbounded_channel();
     let (call_end, call_end_watch) = call_end::channel(deadline);
@@ -620,6 +646,7 @@ fn request_channel<T>(
             }),
             control,
             finished: false,
+            codec,
             _messages: PhantomData,
         },
         Box::pin(RequestMessageStream {
@@ -639,16 +666,18 @@ struct RequestSenderState {
 }
 
 /// The independently movable request half of a streaming call.
-pub struct RequestSender<T> {
+pub struct RequestSender<T, C = Prost> {
     state: Arc<RequestSenderState>,
     control: mpsc::UnboundedSender<RequestControl>,
     finished: bool,
+    /// Encodes the messages sent.
+    codec: C,
     _messages: PhantomData<fn(T)>,
 }
 
-impl<T> RequestSender<T>
+impl<T, C> RequestSender<T, C>
 where
-    T: Message + Send + 'static,
+    C: Encode<T>,
 {
     /// Sends one request message with bounded backpressure.
     ///
@@ -667,11 +696,11 @@ where
         &self,
         request: T,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
-        send_message(&self.state, request)
+        send_message(&self.state, &self.codec, request)
     }
 }
 
-impl<T> RequestSender<T> {
+impl<T, C> RequestSender<T, C> {
     /// Gracefully finishes the request stream after all accepted messages.
     pub fn finish(mut self) -> Result<()> {
         self.finish_in_place();
@@ -716,15 +745,18 @@ impl RequestSenderState {
     }
 }
 
-/// Encodes `request` and sends it. The message is encoded, and dropped, before the returned future
-/// is first polled.
-fn send_message<T: Message>(
+/// Encodes `request` with `codec` and sends it. The message is encoded, and dropped, before the
+/// returned future is first polled. A message that cannot be encoded fails the send, and the call
+/// stays open.
+fn send_message<T, C: Encode<T>>(
     state: &Arc<RequestSenderState>,
+    codec: &C,
     request: T,
 ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
-    let body = request.encode_to_vec();
+    let body = codec.encode(&request);
     drop(request);
-    send_encoded(Arc::clone(state), body)
+    let state = Arc::clone(state);
+    async move { send_encoded(state, body?).await }
 }
 
 async fn send_encoded(state: Arc<RequestSenderState>, body: Vec<u8>) -> Result<()> {
@@ -760,7 +792,10 @@ async fn send_encoded(state: Arc<RequestSenderState>, body: Vec<u8>) -> Result<(
     }
 }
 
-impl<T> Drop for RequestSender<T> {
+// The codec is never pinned.
+impl<T, C> Unpin for RequestSender<T, C> {}
+
+impl<T, C> Drop for RequestSender<T, C> {
     fn drop(&mut self) {
         if !self.finished {
             let _ = self.control.send(RequestControl::Cancel);
@@ -768,21 +803,22 @@ impl<T> Drop for RequestSender<T> {
     }
 }
 
-pub struct ClientStreamingCall<Req, Res> {
-    sender: RequestSender<Req>,
-    response: ResponseStream<Res>,
+pub struct ClientStreamingCall<Req, Res, C = Prost> {
+    sender: RequestSender<Req, C>,
+    response: ResponseStream<Res, C>,
 }
 
-impl<Req, Res> ClientStreamingCall<Req, Res> {
-    const fn new(sender: RequestSender<Req>, response: ResponseStream<Res>) -> Self {
+impl<Req, Res, C> ClientStreamingCall<Req, Res, C> {
+    const fn new(sender: RequestSender<Req, C>, response: ResponseStream<Res, C>) -> Self {
         Self { sender, response }
     }
 }
 
-impl<Req, Res> ClientStreamingCall<Req, Res>
+impl<Req, Res, C> ClientStreamingCall<Req, Res, C>
 where
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
     /// Sends one request message; see [`RequestSender::send`] for how it fails once the server
     /// has ended the call.
@@ -790,7 +826,7 @@ where
         &self,
         request: Req,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
-        send_message(&self.sender.state, request)
+        send_message(&self.sender.state, &self.sender.codec, request)
     }
 
     pub fn close_send(&mut self) -> Result<()> {
@@ -817,27 +853,28 @@ where
 }
 
 /// A bidirectional call whose request and response halves can move independently.
-pub struct BidirectionalCall<Req, Res> {
-    sender: RequestSender<Req>,
-    response: ResponseStream<Res>,
+pub struct BidirectionalCall<Req, Res, C = Prost> {
+    sender: RequestSender<Req, C>,
+    response: ResponseStream<Res, C>,
 }
 
-impl<Req, Res> BidirectionalCall<Req, Res> {
-    const fn new(sender: RequestSender<Req>, response: ResponseStream<Res>) -> Self {
+impl<Req, Res, C> BidirectionalCall<Req, Res, C> {
+    const fn new(sender: RequestSender<Req, C>, response: ResponseStream<Res, C>) -> Self {
         Self { sender, response }
     }
 
     /// Splits the call into independently movable request and response halves.
     #[must_use]
-    pub fn split(self) -> (RequestSender<Req>, ResponseStream<Res>) {
+    pub fn split(self) -> (RequestSender<Req, C>, ResponseStream<Res, C>) {
         (self.sender, self.response)
     }
 }
 
-impl<Req, Res> BidirectionalCall<Req, Res>
+impl<Req, Res, C> BidirectionalCall<Req, Res, C>
 where
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
     /// Sends one request message; see [`RequestSender::send`] for how it fails once the server
     /// has ended the call.
@@ -845,7 +882,7 @@ where
         &self,
         request: Req,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
-        send_message(&self.sender.state, request)
+        send_message(&self.sender.state, &self.sender.codec, request)
     }
 
     pub async fn recv(&mut self) -> Result<Option<Res>> {
@@ -868,9 +905,12 @@ where
     }
 }
 
-impl<Req, Res> Stream for BidirectionalCall<Req, Res>
+// Both halves are `Unpin` whatever the codec.
+impl<Req, Res, C> Unpin for BidirectionalCall<Req, Res, C> {}
+
+impl<Req, Res, C> Stream for BidirectionalCall<Req, Res, C>
 where
-    Res: Message + Default,
+    C: Decode<Res>,
 {
     type Item = Result<Res>;
 
@@ -969,15 +1009,17 @@ where
     }
 }
 
-async fn open_response_stream<T, Res>(
+async fn open_response_stream<T, Res, C>(
     transport: &T,
     prepared: PreparedStreamingCall,
     request_body: BoxStream<Vec<u8>>,
     call_end: Option<call_end::EndSender>,
-) -> Result<ResponseStream<Res>>
+    codec: C,
+) -> Result<ResponseStream<Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Res: Message + Default + Send + 'static,
+    Res: Send + 'static,
+    C: Decode<Res>,
 {
     let PreparedStreamingCall {
         request,
@@ -1000,7 +1042,8 @@ where
         None => response,
     };
 
-    Ok(ResponseStream::<Res>::new(
+    Ok(ResponseStream::new(
+        codec,
         response,
         max_response_body_size,
         max_response_messages,
@@ -1020,9 +1063,11 @@ async fn read_unary_response_from_stream<Res>(
     deadline: Option<Instant>,
 ) -> Result<Res>
 where
-    Res: Message + Default + Send + 'static,
+    Res: Send + 'static,
+    Prost: Decode<Res>,
 {
     let mut response = ResponseStream::<Res>::new(
+        Prost,
         response,
         max_response_body_size,
         max_response_messages,
@@ -1033,11 +1078,12 @@ where
     read_unary_response_from_message_stream(&mut response).await
 }
 
-pub(crate) async fn read_unary_response_from_message_stream<Res>(
-    response: &mut ResponseStream<Res>,
+pub(crate) async fn read_unary_response_from_message_stream<Res, C>(
+    response: &mut ResponseStream<Res, C>,
 ) -> Result<Res>
 where
-    Res: Message + Default + Send + 'static,
+    Res: Send + 'static,
+    C: Decode<Res>,
 {
     Ok(read_unary_response_envelope_from_message_stream(response)
         .await?
@@ -1045,11 +1091,12 @@ where
         .0)
 }
 
-async fn read_unary_response_envelope_from_message_stream<Res>(
-    response: &mut ResponseStream<Res>,
+async fn read_unary_response_envelope_from_message_stream<Res, C>(
+    response: &mut ResponseStream<Res, C>,
 ) -> Result<ResponseEnvelope<Res>>
 where
-    Res: Message + Default + Send + 'static,
+    Res: Send + 'static,
+    C: Decode<Res>,
 {
     let mut first = None;
     let mut response_count = 0_usize;
@@ -1084,7 +1131,9 @@ where
 /// what the caller can observe: the headers once known, the message that `headers()` read ahead,
 /// and the failure that ended the call before the headers were known, which `headers()` keeps
 /// reporting. None of them costs anything per message.
-pub struct ResponseStream<T> {
+pub struct ResponseStream<T, C = Prost> {
+    /// Decodes the messages.
+    codec: C,
     inner: BoxStream<ResponseFrame>,
     max_body_size: usize,
     max_messages: Option<usize>,
@@ -1112,7 +1161,8 @@ struct EarlyFailure {
     returned: bool,
 }
 
-impl<T> Unpin for ResponseStream<T> {}
+// Neither the read-ahead message nor the codec is pinned.
+impl<T, C> Unpin for ResponseStream<T, C> {}
 
 /// What one step through the response stream produced.
 enum Step<T> {
@@ -1120,11 +1170,12 @@ enum Step<T> {
     Message(T),
 }
 
-impl<T> ResponseStream<T>
+impl<T, C> ResponseStream<T, C>
 where
-    T: Message + Default,
+    C: Decode<T>,
 {
     pub(crate) fn new(
+        codec: C,
         inner: BoxStream<ResponseFrame>,
         max_body_size: usize,
         max_messages: Option<usize>,
@@ -1133,6 +1184,7 @@ where
         deadline: Option<Instant>,
     ) -> Self {
         Self {
+            codec,
             inner,
             max_body_size,
             max_messages,
@@ -1314,7 +1366,7 @@ where
                     return Poll::Ready(Some(Ok(Step::Headers)));
                 }
                 Ok(ResponseEvent::Message(body)) => {
-                    let Ok(message) = T::decode(body) else {
+                    let Ok(message) = self.codec.decode(body) else {
                         return self.fail_state(ResponseStateFailure::malformed_protobuf());
                     };
                     if self.headers.is_none() {
@@ -1329,9 +1381,9 @@ where
     }
 }
 
-impl<T> Stream for ResponseStream<T>
+impl<T, C> Stream for ResponseStream<T, C>
 where
-    T: Message + Default,
+    C: Decode<T>,
 {
     type Item = Result<T>;
 
@@ -1432,6 +1484,7 @@ mod tests {
 
     use bytes::Bytes;
 
+    use crate::codec::Prost;
     use crate::{
         Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest, Status,
     };
@@ -1487,7 +1540,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_sender_finish_gracefully_drains_accepted_messages() {
-        let (sender, mut requests, _end) = request_channel(None, None);
+        let (sender, mut requests, _end) = request_channel(Prost, None, None);
         let message = TestMessage {
             value: "accepted".to_owned(),
         };
@@ -1506,7 +1559,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_unfinished_request_sender_emits_cancellation() {
-        let (sender, mut requests, _end) = request_channel::<TestMessage>(None, None);
+        let (sender, mut requests, _end) = request_channel::<TestMessage, _>(Prost, None, None);
         drop(sender);
 
         let error = requests
@@ -1520,7 +1573,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_send_future_cannot_outlive_graceful_finish() {
-        let (sender, mut requests, _end) = request_channel::<TestMessage>(None, None);
+        let (sender, mut requests, _end) = request_channel::<TestMessage, _>(Prost, None, None);
         let send = sender.send(TestMessage::default());
         sender.finish().expect("request sender should finish");
 
@@ -1539,8 +1592,9 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_halves_move_to_independent_tasks() {
-        let (sender, _requests, _end) = request_channel::<TestMessage>(None, None);
+        let (sender, _requests, _end) = request_channel::<TestMessage, _>(Prost, None, None);
         let response = ResponseStream::<TestMessage>::new(
+            Prost,
             crate::stream::from_iter([ResponseFrame::Status(Status::ok())]),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -1611,11 +1665,12 @@ mod tests {
             value: "request".to_owned(),
         };
 
-        let response = unary::<_, _, TestMessage>(
+        let response = unary::<_, _, TestMessage, _>(
             &transport,
             "/example.Greeter/SayHello",
             &request,
             CallOptions::new().with_timeout(Duration::from_secs(5)),
+            Prost,
         )
         .await
         .expect("unary call should succeed");
@@ -1648,21 +1703,23 @@ mod tests {
             value: "request".to_owned(),
         };
 
-        let decoded = unary::<_, _, TestMessage>(
+        let decoded = unary::<_, _, TestMessage, _>(
             &transport,
             "/example.Greeter/SayHello",
             &request,
             CallOptions::new().with_max_response_body_size(body.len()),
+            Prost,
         )
         .await
         .expect("exact response body limit should pass");
         assert_eq!(decoded.value, "response");
 
-        let error = unary::<_, _, TestMessage>(
+        let error = unary::<_, _, TestMessage, _>(
             &transport,
             "/example.Greeter/SayHello",
             &request,
             CallOptions::new().with_max_response_body_size(body.len() - 1),
+            Prost,
         )
         .await
         .expect_err("one byte over response body limit should fail");
@@ -1700,13 +1757,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn unary_deadline_cancels_pending_transport() {
-        let error = unary::<_, _, TestMessage>(
+        let error = unary::<_, _, TestMessage, _>(
             &PendingTransport,
             "/example.Greeter/SayHello",
             &TestMessage {
                 value: "request".to_owned(),
             },
             CallOptions::new().with_timeout(Duration::from_millis(1)),
+            Prost,
         )
         .await
         .expect_err("pending unary should hit deadline");
@@ -1716,13 +1774,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn server_streaming_deadline_cancels_pending_open() {
-        let Err(error) = server_streaming::<_, _, TestMessage>(
+        let Err(error) = server_streaming::<_, _, TestMessage, _>(
             &PendingTransport,
             "/example.Greeter/LotsOfReplies",
             &TestMessage {
                 value: "request".to_owned(),
             },
             CallOptions::new().with_timeout(Duration::from_millis(1)),
+            Prost,
         )
         .await
         else {
@@ -1782,10 +1841,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn client_streaming_deadline_drops_pending_upload() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let call = client_streaming::<_, TestMessage, TestMessage>(
+        let call = client_streaming::<_, TestMessage, TestMessage, _>(
             &UploadWaitingTransport,
             "/example.Greeter/LotsOfGreetings",
             CallOptions::new().with_timeout(Duration::from_millis(1)),
+            Prost,
         )
         .send_all(Box::pin(DropTrackedPendingStream {
             dropped: Arc::clone(&dropped),
@@ -1853,10 +1913,11 @@ mod tests {
 
     #[tokio::test]
     async fn client_streaming_from_stream_sends_all_requests() {
-        let response = client_streaming::<_, TestMessage, TestMessage>(
+        let response = client_streaming::<_, TestMessage, TestMessage, _>(
             &CollectingStreamingTransport,
             "/example.Greeter/LotsOfGreetings",
             CallOptions::new(),
+            Prost,
         )
         .send_all(crate::stream::from_iter([
             TestMessage {
@@ -1876,10 +1937,11 @@ mod tests {
     async fn streaming_transport_capability_is_object_safe() {
         let concrete = CollectingStreamingTransport;
         let transport: &dyn StreamingRpcTransport = &concrete;
-        let response = client_streaming::<_, TestMessage, TestMessage>(
+        let response = client_streaming::<_, TestMessage, TestMessage, _>(
             transport,
             "/example.Greeter/LotsOfGreetings",
             CallOptions::new(),
+            Prost,
         )
         .send_all(crate::stream::from_iter([TestMessage {
             value: "one".to_owned(),
@@ -1889,10 +1951,11 @@ mod tests {
         assert_eq!(response.value, "1");
 
         let transport: Arc<dyn StreamingRpcTransport> = Arc::new(CollectingStreamingTransport);
-        let response = client_streaming::<_, TestMessage, TestMessage>(
+        let response = client_streaming::<_, TestMessage, TestMessage, _>(
             &transport,
             "/example.Greeter/LotsOfGreetings",
             CallOptions::new(),
+            Prost,
         )
         .send_all(crate::stream::from_iter([TestMessage {
             value: "two".to_owned(),
@@ -1904,10 +1967,11 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_streaming_from_stream_sends_all_requests() {
-        let mut response = bidirectional_streaming::<_, TestMessage, TestMessage>(
+        let mut response = bidirectional_streaming::<_, TestMessage, TestMessage, _>(
             &CollectingStreamingTransport,
             "/example.Greeter/BidiHello",
             CallOptions::new(),
+            Prost,
         )
         .send_all(crate::stream::from_iter([
             TestMessage {
@@ -1930,10 +1994,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bidirectional_streaming_deadline_cancels_pending_response_read() {
-        let mut responses = bidirectional_streaming::<_, TestMessage, TestMessage>(
+        let mut responses = bidirectional_streaming::<_, TestMessage, TestMessage, _>(
             &UploadWaitingTransport,
             "/example.Greeter/BidiHello",
             CallOptions::new().with_timeout(Duration::from_millis(1)),
+            Prost,
         )
         .await
         .expect("stream should open");
@@ -1957,6 +2022,7 @@ mod tests {
             value: "hello".to_owned(),
         };
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             crate::stream::from_iter([
                 ResponseFrame::message(prost::Message::encode_to_vec(&message)),
                 ResponseFrame::message(prost::Message::encode_to_vec(&message)),
@@ -1996,6 +2062,7 @@ mod tests {
             value: "two".to_owned(),
         };
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             crate::stream::from_iter([
                 ResponseFrame::message(prost::Message::encode_to_vec(&first)),
                 ResponseFrame::message(prost::Message::encode_to_vec(&second)),
@@ -2030,6 +2097,7 @@ mod tests {
         frames: impl IntoIterator<Item = ResponseFrame, IntoIter: Send + Unpin + 'static>,
     ) -> ResponseStream<TestMessage> {
         ResponseStream::<TestMessage>::new(
+            Prost,
             crate::stream::from_iter(frames),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -2145,6 +2213,7 @@ mod tests {
     async fn headers_resolve_before_the_first_streamed_message_arrives() {
         let (frames, receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             Box::pin(futures_util::stream::unfold(
                 receiver,
                 |mut receiver| async move { receiver.recv().await.map(|frame| (Ok(frame), receiver)) },
@@ -2181,6 +2250,7 @@ mod tests {
     #[tokio::test]
     async fn headers_report_a_stream_failure_before_any_frame() {
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             error_frame_stream(),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -2208,7 +2278,7 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_call_delegates_headers() {
-        let (sender, _requests, _end) = request_channel::<TestMessage>(None, None);
+        let (sender, _requests, _end) = request_channel::<TestMessage, _>(Prost, None, None);
         let mut call = BidirectionalCall::new(
             sender,
             response_stream_of([
@@ -2226,7 +2296,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_streaming_call_delegates_headers_and_fills_the_envelope() {
-        let (sender, _requests, _end) = request_channel::<TestMessage>(None, None);
+        let (sender, _requests, _end) = request_channel::<TestMessage, _>(Prost, None, None);
         let trailers = header_map("x-t", b"2");
         let mut call = super::ClientStreamingCall::new(
             sender,
@@ -2262,11 +2332,12 @@ mod tests {
             .with_metadata(header_map("x-t", b"2")),
         };
 
-        let envelope = unary::<_, _, TestMessage>(
+        let envelope = unary::<_, _, TestMessage, _>(
             &transport,
             "/example.Greeter/SayHello",
             &TestMessage::default(),
             CallOptions::new(),
+            Prost,
         )
         .with_response()
         .await
@@ -2283,11 +2354,12 @@ mod tests {
             response: ResponseEnvelope::new(Bytes::new()).with_headers(header_map("Bad Key", b"1")),
         };
 
-        let error = unary::<_, _, TestMessage>(
+        let error = unary::<_, _, TestMessage, _>(
             &transport,
             "/example.Greeter/SayHello",
             &TestMessage::default(),
             CallOptions::new(),
+            Prost,
         )
         .with_response()
         .await
@@ -2371,6 +2443,7 @@ mod tests {
     #[tokio::test]
     async fn response_stream_idle_timeout_returns_unavailable() {
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             pending_frame_stream(),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -2394,6 +2467,7 @@ mod tests {
         let mut metadata = crate::Metadata::new();
         metadata.insert("x-terminal".to_owned(), b"complete".to_vec());
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             crate::stream::from_iter([ResponseFrame::Status(
                 Status::ok().with_metadata(metadata.clone()),
             )]),
@@ -2416,6 +2490,7 @@ mod tests {
         let mut metadata = crate::Metadata::new();
         metadata.insert("x-error".to_owned(), b"denied".to_vec());
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             crate::stream::from_iter([ResponseFrame::Status(
                 Status::new(Code::PermissionDenied, "denied").with_metadata(metadata.clone()),
             )]),
@@ -2445,6 +2520,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_post_terminal_read_does_not_commit_terminal_status() {
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             terminal_then_pending_frame_stream(),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -2468,6 +2544,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_post_terminal_read_is_classified_as_trailing_data() {
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             terminal_then_decode_error_frame_stream(),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -2495,6 +2572,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn response_stream_deadline_returns_deadline_exceeded() {
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             pending_frame_stream(),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -2516,6 +2594,7 @@ mod tests {
     #[tokio::test]
     async fn response_stream_deadline_wins_over_ready_response_error() {
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             error_frame_stream(),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -2583,6 +2662,7 @@ mod tests {
     #[tokio::test]
     async fn headers_repeat_the_failure_of_an_oversized_first_message() {
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             crate::stream::from_iter([
                 test_message("too long"),
                 ResponseFrame::Status(Status::ok()),
@@ -2604,6 +2684,7 @@ mod tests {
     #[tokio::test]
     async fn headers_report_a_failure_the_stream_already_returned() {
         let mut response = ResponseStream::<TestMessage>::new(
+            Prost,
             error_frame_stream(),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             None,
@@ -2678,6 +2759,7 @@ mod tests {
 
         for (error, is_variant) in cases {
             let mut response = ResponseStream::<TestMessage>::new(
+                Prost,
                 Box::pin(futures_util::stream::iter([Err(error())])),
                 crate::framing::DEFAULT_MAX_FRAME_SIZE,
                 None,
@@ -2705,6 +2787,7 @@ mod tests {
     async fn timeouts_never_commit_a_pending_status_or_lose_a_message_read_ahead() {
         let idle = |frames: Vec<ResponseFrame>| {
             ResponseStream::<TestMessage>::new(
+                Prost,
                 Box::pin(crate::stream::from_iter(frames).chain(futures_util::stream::pending())),
                 crate::framing::DEFAULT_MAX_FRAME_SIZE,
                 None,
@@ -2791,6 +2874,7 @@ mod tests {
             };
 
             let mut stream = ResponseStream::<TestMessage>::new(
+                Prost,
                 frames(),
                 crate::framing::DEFAULT_MAX_FRAME_SIZE,
                 None,
@@ -2904,6 +2988,7 @@ mod tests {
                 ended: false,
             });
             ResponseStream::new(
+                crate::codec::Prost,
                 script,
                 crate::framing::DEFAULT_MAX_FRAME_SIZE,
                 None,

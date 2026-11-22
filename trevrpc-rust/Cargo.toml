@@ -217,6 +217,8 @@ harness = false
 
 [features]
 default = ["webpki-roots"]
+# codec::Buffa, the codec of buffa messages.
+buffa = ["dep:buffa"]
 # DevelopmentCertificate, a rotating self-signed certificate for local development.
 dev-certificate = ["dep:rcgen", "dep:time"]
 # The Mozilla roots that Channel::builder verifies servers with by default.
@@ -224,6 +226,8 @@ webpki-roots = ["dep:webpki-roots"]
 
 [dependencies]
 async-trait = "0.1.89"
+# The messages of codec::Buffa, behind the "buffa" feature.
+buffa = { version = "0.9.2", optional = true }
 bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"

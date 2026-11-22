@@ -108,13 +108,17 @@ where
     pub fn say_hello(
         &self,
         request: &HelloRequest,
-    ) -> ::trevrpc::client::Call<'_, T, ::trevrpc::client::call::Unary<HelloRequest, HelloReply>>
-    {
+    ) -> ::trevrpc::client::Call<
+        '_,
+        T,
+        ::trevrpc::client::call::Unary<HelloRequest, HelloReply, ::trevrpc::codec::Prost>,
+    > {
         ::trevrpc::client::unary(
             &self.transport,
             greeter_paths::SAY_HELLO,
             request,
             self.default_options.clone(),
+            ::trevrpc::codec::Prost,
         )
         .message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
     }
@@ -131,13 +135,14 @@ where
     ) -> ::trevrpc::client::Call<
         '_,
         T,
-        ::trevrpc::client::call::ServerStreaming<HelloRequest, HelloReply>,
+        ::trevrpc::client::call::ServerStreaming<HelloRequest, HelloReply, ::trevrpc::codec::Prost>,
     > {
         ::trevrpc::client::server_streaming(
             &self.transport,
             greeter_paths::LOTS_OF_REPLIES,
             request,
             self.default_options.clone(),
+            ::trevrpc::codec::Prost,
         )
         .message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
     }
@@ -148,12 +153,13 @@ where
     ) -> ::trevrpc::client::Call<
         '_,
         T,
-        ::trevrpc::client::call::ClientStreaming<HelloRequest, HelloReply>,
+        ::trevrpc::client::call::ClientStreaming<HelloRequest, HelloReply, ::trevrpc::codec::Prost>,
     > {
         ::trevrpc::client::client_streaming(
             &self.transport,
             greeter_paths::LOTS_OF_GREETINGS,
             self.default_options.clone(),
+            ::trevrpc::codec::Prost,
         )
         .message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
     }
@@ -164,12 +170,17 @@ where
     ) -> ::trevrpc::client::Call<
         '_,
         T,
-        ::trevrpc::client::call::BidirectionalStreaming<HelloRequest, HelloReply>,
+        ::trevrpc::client::call::BidirectionalStreaming<
+            HelloRequest,
+            HelloReply,
+            ::trevrpc::codec::Prost,
+        >,
     > {
         ::trevrpc::client::bidirectional_streaming(
             &self.transport,
             greeter_paths::BIDI_HELLO,
             self.default_options.clone(),
+            ::trevrpc::codec::Prost,
         )
         .message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
     }
@@ -192,9 +203,10 @@ where
             move |context, body| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
-                    let request = <HelloRequest as ::prost::Message>::decode(body.as_slice())?;
+                    let request =
+                        ::trevrpc::codec::decode::<HelloRequest>(&::trevrpc::codec::Prost, body)?;
                     let response = service.say_hello(context, request).await?;
-                    Ok(::prost::Message::encode_to_vec(&response))
+                    ::trevrpc::codec::encode(&::trevrpc::codec::Prost, &response)
                 }
             },
         );
@@ -211,9 +223,13 @@ where
             move |context, body, _request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
-                    let request = <HelloRequest as ::prost::Message>::decode(body.as_slice())?;
+                    let request =
+                        ::trevrpc::codec::decode::<HelloRequest>(&::trevrpc::codec::Prost, body)?;
                     let responses = service.lots_of_replies(context, request).await?;
-                    Ok(::trevrpc::stream::encode(responses))
+                    Ok(::trevrpc::stream::encode(
+                        responses,
+                        ::trevrpc::codec::Prost,
+                    ))
                 }
             },
         );
@@ -230,11 +246,15 @@ where
             move |context, _body, request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
-                    let requests = ::trevrpc::stream::decode::<HelloRequest>(request_stream);
+                    let requests = ::trevrpc::stream::decode::<HelloRequest, _>(
+                        request_stream,
+                        ::trevrpc::codec::Prost,
+                    );
                     let response = service.lots_of_greetings(context, requests).await?;
-                    Ok(::trevrpc::stream::encode(::trevrpc::stream::from_iter([
-                        response,
-                    ])))
+                    Ok(::trevrpc::stream::encode(
+                        ::trevrpc::stream::from_iter([response]),
+                        ::trevrpc::codec::Prost,
+                    ))
                 }
             },
         );
@@ -251,9 +271,15 @@ where
             move |context, _body, request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
-                    let requests = ::trevrpc::stream::decode::<HelloRequest>(request_stream);
+                    let requests = ::trevrpc::stream::decode::<HelloRequest, _>(
+                        request_stream,
+                        ::trevrpc::codec::Prost,
+                    );
                     let responses = service.bidi_hello(context, requests).await?;
-                    Ok(::trevrpc::stream::encode(responses))
+                    Ok(::trevrpc::stream::encode(
+                        responses,
+                        ::trevrpc::codec::Prost,
+                    ))
                 }
             },
         );

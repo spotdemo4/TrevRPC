@@ -32,7 +32,7 @@ const SUFFIX_METADATA_KEY: &str = "interop-suffix";
 const HEADER_METADATA_KEY: &str = "interop-header";
 const TRAILER_METADATA_KEY: &str = "interop-trailer";
 
-struct EchoService;
+pub(crate) struct EchoService;
 
 /// Answers the `interop-header` request metadata.
 ///
@@ -354,10 +354,15 @@ fn register_refusing_echo(server: &mut Server) {
             "trevrpc.interop.v1.EchoResponse",
         ),
         |_context, _body, requests| async move {
-            let response = concatenate(trevrpc::stream::decode::<EchoRequest>(requests)).await?;
-            Ok(trevrpc::stream::encode(trevrpc::stream::from_iter([
-                response,
-            ])))
+            let response = concatenate(trevrpc::stream::decode::<EchoRequest, _>(
+                requests,
+                trevrpc::codec::Prost,
+            ))
+            .await?;
+            Ok(trevrpc::stream::encode(
+                trevrpc::stream::from_iter([response]),
+                trevrpc::codec::Prost,
+            ))
         },
     );
 }

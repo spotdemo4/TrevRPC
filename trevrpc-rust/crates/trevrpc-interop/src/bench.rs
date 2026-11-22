@@ -551,11 +551,12 @@ where
             Scenario::UnreliableClientStream => self.unreliable_client_stream().await,
             Scenario::ValidationUnary => {
                 let request = bench_request(self.messages_source.next());
-                trevrpc::client::unary::<_, _, EchoResponse>(
+                trevrpc::client::unary::<_, _, EchoResponse, _>(
                     &self.transport,
                     self.validation.unary_path(),
                     &request,
                     self.options.clone(),
+                    trevrpc::codec::Prost,
                 )
                 .await?;
                 Ok(Outcome::delivered(1))
@@ -610,6 +611,7 @@ where
             &self.transport,
             self.validation.client_stream_path(),
             self.options.clone(),
+            trevrpc::codec::Prost,
         )
         .await?;
         self.send_client_stream(call, |worker| bench_request(worker.messages_source.next()))

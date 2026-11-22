@@ -96,16 +96,16 @@ fn the_option_is_read_from_descriptors_and_emitted_for_clients_and_servers() {
 
     // Clients make the schema's marks the call's default, which options can override.
     assert!(content.contains(
-        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::BOTH)"
+        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::BOTH)"
     ), "{content}");
     assert!(content.contains(
-        "client_streaming(&self.transport, telemetry_paths::UPLOAD, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::REQUESTS)"
+        "client_streaming(&self.transport, telemetry_paths::UPLOAD, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::REQUESTS)"
     ));
     assert!(content.contains(
-        "server_streaming(&self.transport, telemetry_paths::WATCH, request, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::RESPONSES)"
+        "server_streaming(&self.transport, telemetry_paths::WATCH, request, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::RESPONSES)"
     ));
     assert!(content.contains(
-        "bidirectional_streaming(&self.transport, telemetry_paths::RELIABLE, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\")\n"
+        "bidirectional_streaming(&self.transport, telemetry_paths::RELIABLE, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Position\")\n"
     ));
 
     // Servers register every route with route options carrying its message types, and the
@@ -204,18 +204,18 @@ service Telemetry {
     );
 
     assert!(content.contains(
-        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress_stream(::trevrpc::CompressStream::BOTH)"
+        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress_stream(::trevrpc::CompressStream::BOTH)"
     ), "{content}");
     assert!(content.contains(
-        "client_streaming(&self.transport, telemetry_paths::UPLOAD, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress_stream(::trevrpc::CompressStream::REQUESTS)"
+        "client_streaming(&self.transport, telemetry_paths::UPLOAD, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress_stream(::trevrpc::CompressStream::REQUESTS)"
     ));
     // A message type that holds a redacted field, even in a nested message, is never compressed
     // this way, so its direction is left out.
     assert!(content.contains(
-        "bidirectional_streaming(&self.transport, telemetry_paths::LEAK, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Holder\").compress_stream(::trevrpc::CompressStream::REQUESTS)"
+        "bidirectional_streaming(&self.transport, telemetry_paths::LEAK, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Holder\").compress_stream(::trevrpc::CompressStream::REQUESTS)"
     ));
     assert!(content.contains(
-        "server_streaming(&self.transport, telemetry_paths::HIDDEN, request, self.default_options.clone()).message_types(\"demo.v1.Secret\", \"demo.v1.Secret\")\n"
+        "server_streaming(&self.transport, telemetry_paths::HIDDEN, request, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Secret\", \"demo.v1.Secret\")\n"
     ));
     assert!(content.contains(
         "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress_stream(::trevrpc::CompressStream::BOTH).with_compress(::trevrpc::CompressMessages::BOTH).with_method_options(b\"\\xba\\xb8\\x1c"
@@ -243,7 +243,7 @@ service Telemetry {
     );
 
     assert!(content.contains(
-        "unary(&self.transport, telemetry_paths::GET, request, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress(::trevrpc::CompressMessages::BOTH)\n"
+        "unary(&self.transport, telemetry_paths::GET, request, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress(::trevrpc::CompressMessages::BOTH)\n"
     ), "{content}");
     // A redacted type's direction is left out.
     assert!(content.contains(
@@ -254,7 +254,7 @@ service Telemetry {
         ".compress_stream(::trevrpc::CompressStream::REQUESTS).compress(::trevrpc::CompressMessages::BOTH)\n"
     ));
     assert!(content.contains(
-        "unary(&self.transport, telemetry_paths::PLAIN, request, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\")\n"
+        "unary(&self.transport, telemetry_paths::PLAIN, request, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"demo.v1.Position\", \"demo.v1.Position\")\n"
     ));
     assert!(content.contains(
         "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress(::trevrpc::CompressMessages::BOTH).with_method_options(b\"\\xba\\xb8\\x1c"

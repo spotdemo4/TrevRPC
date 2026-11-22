@@ -155,11 +155,11 @@ impl trevrpc::server::Interceptor for CountingInterceptor {
 /// stream-compressed in the trailing metadata.
 async fn concatenate(
     context: trevrpc::server::RequestContext,
-    mut requests: trevrpc::BoxStream<Vec<u8>>,
+    mut requests: trevrpc::BoxStream<bytes::Bytes>,
 ) -> trevrpc::Result<trevrpc::BoxStream<Vec<u8>>> {
     let mut value = String::new();
     while let Some(body) = requests.next().await {
-        value.push_str(&<Echo as prost::Message>::decode(body?.as_slice())?.value);
+        value.push_str(&<Echo as prost::Message>::decode(body?)?.value);
     }
     context.set_response_metadata(
         STREAM_COMPRESSED_KEY,
@@ -172,7 +172,7 @@ async fn concatenate(
 /// Echoes each request, then reports how many arrived stream-compressed.
 fn echo_and_count(
     context: trevrpc::server::RequestContext,
-    requests: trevrpc::BoxStream<Vec<u8>>,
+    requests: trevrpc::BoxStream<bytes::Bytes>,
 ) -> trevrpc::BoxStream<Vec<u8>> {
     let report = futures_util::stream::once(async move {
         context.set_response_metadata(
@@ -185,7 +185,7 @@ fn echo_and_count(
             .err()
             .map(|status| Err(trevrpc::Error::from(status)))
     });
-    Box::pin(requests.chain(report))
+    Box::pin(requests.map(|body| body.map(Vec::from)).chain(report))
 }
 
 /// Serves an echo service whose routes name their message types, over QUIC and TCP.
@@ -209,16 +209,22 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<(Serving, Count
                 PLAIN_COMPRESSED_KEY,
                 context.plain_compressed_requests_received().to_string(),
             )?;
-            Ok(body)
+            Ok(Vec::from(body))
         },
     );
     let options = RouteOptions::new().with_message_types(MESSAGE_TYPE, MESSAGE_TYPE);
-    server.route_with_options(UNARY, options, |_context, body| async move { Ok(body) });
+    server.route_with_options(UNARY, options, |_context, body| async move {
+        Ok(Vec::from(body))
+    });
     server.route_streaming_with_options(
         BIDI,
         RpcKind::BidirectionalStreaming,
         options,
-        |_context, _body, requests| async move { Ok(requests) },
+        |_context, _body, requests| async move {
+            let echoes: trevrpc::BoxStream<Vec<u8>> =
+                Box::pin(requests.map(|body| body.map(Vec::from)));
+            Ok(echoes)
+        },
     );
     server.route_streaming_with_options(
         STREAM,
@@ -410,15 +416,17 @@ async fn compressed_calls_work_over_quic_and_qmux() -> TestResult {
                 UNARY,
                 &sample(i),
                 trevrpc::client::CallOptions::new(),
+                trevrpc::codec::Prost,
             )
             .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
             .await?;
             ensure!(reply == sample(i), "{policy:?}: {reply:?}");
         }
-        let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo>(
+        let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo, _>(
             &channel,
             BIDI,
             trevrpc::client::CallOptions::new(),
+            trevrpc::codec::Prost,
         )
         .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
         .await?;
@@ -552,6 +560,7 @@ async fn the_client_queries_then_compresses_its_requests() -> TestResult {
                 UNARY,
                 &sample(i),
                 trevrpc::client::CallOptions::new(),
+                trevrpc::codec::Prost,
             )
             .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
             .await?;
@@ -792,10 +801,11 @@ async fn stream_compressed_calls_work_over_quic_and_qmux() -> TestResult {
         let (server, _) = spawn_server(compression.clone()).await?;
         for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
             let (_endpoint, channel) = compressed_channel(&server, policy).await?;
-            let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo>(
+            let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo, _>(
                 &channel,
                 STREAM,
                 trevrpc::client::CallOptions::new(),
+                trevrpc::codec::Prost,
             )
             .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
             .compress_stream(CompressStream::BOTH)
@@ -901,10 +911,11 @@ async fn client_streaming_uploads_are_stream_compressed_from_the_third_message()
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
         let (_endpoint, channel) = compressed_channel(&server, policy).await?;
         // Calls are optimistic, so a burst compresses without waiting for the server's answer.
-        let upload = trevrpc::client::client_streaming::<_, Echo, Echo>(
+        let upload = trevrpc::client::client_streaming::<_, Echo, Echo, _>(
             &channel,
             UPLOAD,
             trevrpc::client::CallOptions::new(),
+            trevrpc::codec::Prost,
         )
         .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
         .compress_stream(CompressStream::REQUESTS)
@@ -933,10 +944,11 @@ async fn client_streaming_uploads_are_stream_compressed_from_the_third_message()
             }
             Ok(sample(i))
         });
-        let response = trevrpc::client::client_streaming::<_, Echo, Echo>(
+        let response = trevrpc::client::client_streaming::<_, Echo, Echo, _>(
             &channel,
             UPLOAD,
             trevrpc::client::CallOptions::new(),
+            trevrpc::codec::Prost,
         )
         .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
         .compress_stream(CompressStream::REQUESTS)
@@ -1101,10 +1113,11 @@ async fn the_server_refuses_optimistic_calls_it_cannot_decode_once_authorized() 
 /// Echoes six messages one at a time on `STREAM`: the call is answered, so the connection's
 /// calls are optimistic again after a refusal.
 async fn ping_pong(channel: &trevrpc::client::Channel, method: &str) -> TestResult<Vec<u8>> {
-    let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo>(
+    let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo, _>(
         channel,
         method,
         trevrpc::client::CallOptions::new(),
+        trevrpc::codec::Prost,
     )
     .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
     .compress_stream(CompressStream::BOTH)
@@ -1131,10 +1144,11 @@ async fn refused_calls_are_replayed_over_quic_and_qmux() -> TestResult {
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
         let (_endpoint, channel) = compressed_channel(&server, policy).await?;
         let upload = || {
-            trevrpc::client::client_streaming::<_, Echo, Echo>(
+            trevrpc::client::client_streaming::<_, Echo, Echo, _>(
                 &channel,
                 REFUSING_UPLOAD,
                 trevrpc::client::CallOptions::new(),
+                trevrpc::codec::Prost,
             )
             .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
             .compress_stream(CompressStream::REQUESTS)
@@ -1343,13 +1357,18 @@ async fn burst<T: StreamingRpcTransport>(
     count: u32,
     options: trevrpc::client::CallOptions,
 ) -> trevrpc::Result<Echo> {
-    trevrpc::client::client_streaming::<_, Echo, Echo>(transport, UPLOAD, options)
-        .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
-        .compress_stream(CompressStream::REQUESTS)
-        .send_all(futures_util::stream::iter(
-            (0..count).map(|i| Ok(sample(i))),
-        ))
-        .await
+    trevrpc::client::client_streaming::<_, Echo, Echo, _>(
+        transport,
+        UPLOAD,
+        options,
+        trevrpc::codec::Prost,
+    )
+    .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+    .compress_stream(CompressStream::REQUESTS)
+    .send_all(futures_util::stream::iter(
+        (0..count).map(|i| Ok(sample(i))),
+    ))
+    .await
 }
 
 #[tokio::test]
@@ -1482,10 +1501,11 @@ async fn an_optimistic_call_keeps_at_most_a_mebibyte_until_the_answer() -> TestR
     let large = |i: u32| Echo {
         value: format!("{i:064}").repeat(1024),
     };
-    let response = trevrpc::client::client_streaming::<_, Echo, Echo>(
+    let response = trevrpc::client::client_streaming::<_, Echo, Echo, _>(
         &transport,
         UPLOAD,
         trevrpc::client::CallOptions::new(),
+        trevrpc::codec::Prost,
     )
     .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
     .compress_stream(CompressStream::REQUESTS)
@@ -1610,11 +1630,12 @@ async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_i
         .await?;
         let mut counts = Vec::new();
         for i in 0..2 {
-            let reply = trevrpc::client::unary::<_, Echo, Echo>(
+            let reply = trevrpc::client::unary::<_, Echo, Echo, _>(
                 &channel,
                 PLAIN,
                 &long_sample(i),
                 trevrpc::client::CallOptions::new(),
+                trevrpc::codec::Prost,
             )
             .message_types(PLAIN_TYPE, PLAIN_TYPE)
             .compress(CompressMessages::BOTH)

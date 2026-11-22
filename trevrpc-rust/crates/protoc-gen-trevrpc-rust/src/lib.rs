@@ -467,6 +467,80 @@ struct PluginOptions {
     /// Check the request messages of methods whose request type carries `buf.validate` rules
     /// with `trevrpc-protovalidate`.
     validate: bool,
+    /// The protobuf library of the messages, whose codec the generated code uses.
+    codec: Codec,
+    /// Decode `buffa` messages as zero-copy view handles: the requests of servers and the
+    /// responses of clients.
+    views: bool,
+}
+
+/// The protobuf library that generates the messages the services carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Codec {
+    /// `prost`, through `trevrpc::codec::Prost`.
+    #[default]
+    Prost,
+    /// `buffa`, through `trevrpc::codec::Buffa`, which needs the runtime's `buffa` feature.
+    Buffa,
+}
+
+/// How the generated code of a service encodes and decodes its messages.
+struct Codecs<'a> {
+    runtime_path: &'a str,
+    codec: Codec,
+    /// Decoded messages are `buffa` view handles.
+    views: bool,
+}
+
+impl<'a> Codecs<'a> {
+    const fn new(runtime_path: &'a str, codec: Codec, views: bool) -> Self {
+        Self {
+            runtime_path,
+            codec,
+            views,
+        }
+    }
+
+    /// The codec that encodes messages, as a value, which is also its type. Without views it
+    /// decodes them too.
+    fn encoder(&self) -> String {
+        let runtime_path = self.runtime_path;
+        match self.codec {
+            Codec::Prost => format!("{runtime_path}::codec::Prost"),
+            Codec::Buffa => format!("{runtime_path}::codec::Buffa"),
+        }
+    }
+
+    /// The type of a decoded message of the type `message`.
+    fn decoded(&self, message: &str) -> String {
+        if self.views {
+            format!("{}::codec::BuffaViewHandle<{message}>", self.runtime_path)
+        } else {
+            message.to_owned()
+        }
+    }
+
+    /// The codec that decodes messages of the type `message`, as a value. With views it encodes
+    /// owned messages too, so it is the codec of a client call whose responses are `message`.
+    fn decoder(&self, message: &str) -> String {
+        if self.views {
+            format!(
+                "{}::codec::BuffaView::<{message}>::new()",
+                self.runtime_path
+            )
+        } else {
+            self.encoder()
+        }
+    }
+
+    /// The type of [`Self::decoder`].
+    fn decoder_type(&self, message: &str) -> String {
+        if self.views {
+            format!("{}::codec::BuffaView<{message}>", self.runtime_path)
+        } else {
+            self.encoder()
+        }
+    }
 }
 
 impl Default for PluginOptions {
@@ -477,6 +551,8 @@ impl Default for PluginOptions {
             package_root: "crate".to_owned(),
             extern_paths: Vec::new(),
             validate: false,
+            codec: Codec::Prost,
+            views: false,
         }
     }
 }
@@ -611,7 +687,12 @@ fn generate_plugin_response_with(
 
             generate_validator(&services, method_options, &mut content);
             for service in &services {
-                generate_service(&options.runtime_path, service, &mut content);
+                generate_service(
+                    &options.runtime_path,
+                    &Codecs::new(&options.runtime_path, options.codec, options.views),
+                    service,
+                    &mut content,
+                );
                 content.push('\n');
             }
 
@@ -671,6 +752,24 @@ fn parse_plugin_options(parameter: Option<&str>) -> Result<PluginOptions, String
                     }
                 };
             }
+            "views" => {
+                options.views = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(format!("invalid views {value:?}; expected true or false"));
+                    }
+                };
+            }
+            "codec" => {
+                options.codec = match value {
+                    "prost" => Codec::Prost,
+                    "buffa" => Codec::Buffa,
+                    _ => {
+                        return Err(format!("invalid codec {value:?}; expected prost or buffa"));
+                    }
+                };
+            }
             "extern_path" => {
                 let Some((proto_path, rust_path)) = value.split_once('=') else {
                     return Err(format!(
@@ -697,6 +796,9 @@ fn parse_plugin_options(parameter: Option<&str>) -> Result<PluginOptions, String
         }
     }
 
+    if options.views && options.codec != Codec::Buffa {
+        return Err("views=true needs codec=buffa".to_owned());
+    }
     Ok(options)
 }
 
@@ -923,7 +1025,7 @@ impl TypeIndex {
             .ok_or_else(|| format!("unresolved protobuf message type {proto_type:?}"))?;
 
         if let Some(rust_path) = resolve_extern_path(&proto_type, &options.extern_paths)
-            .or_else(|| resolve_default_well_known_type(&proto_type))
+            .or_else(|| resolve_default_well_known_type(&proto_type, options.codec))
         {
             return Ok(rust_path);
         }
@@ -1017,7 +1119,17 @@ fn resolve_extern_path(proto_type: &str, extern_paths: &[(String, String)]) -> O
     Some(path)
 }
 
-fn resolve_default_well_known_type(proto_type: &str) -> Option<String> {
+/// The Rust type of a well-known type, which the protobuf library of `codec` provides: `prost`
+/// maps the wrappers to Rust primitives and `Empty` to `()`, and puts the rest in `prost-types`;
+/// `buffa` keeps every one a message of `buffa-types`.
+fn resolve_default_well_known_type(proto_type: &str, codec: Codec) -> Option<String> {
+    if codec == Codec::Buffa {
+        let name = proto_type.strip_prefix(".google.protobuf.")?;
+        return Some(format!(
+            "::buffa_types::google::protobuf::{}",
+            to_rust_type_name(name)
+        ));
+    }
     let rust_type = match proto_type {
         ".google.protobuf.BoolValue" => "bool",
         ".google.protobuf.BytesValue" => "::prost::alloc::vec::Vec<u8>",
@@ -1378,11 +1490,12 @@ fn byte_string_literal(bytes: &[u8]) -> String {
     literal
 }
 
-fn generate_service(runtime_path: &str, service: &Service, buf: &mut String) {
+/// Emits a service, whose messages `codecs` encode and decode.
+fn generate_service(runtime_path: &str, codecs: &Codecs, service: &Service, buf: &mut String) {
     generate_paths(service, buf);
-    generate_trait(runtime_path, service, buf);
-    generate_client(runtime_path, service, buf);
-    generate_registration(runtime_path, service, buf);
+    generate_trait(runtime_path, codecs, service, buf);
+    generate_client(runtime_path, codecs, service, buf);
+    generate_registration(runtime_path, codecs, service, buf);
 }
 
 /// Returns the module holding the method path constants of a service.
@@ -1426,7 +1539,7 @@ fn generate_paths(service: &Service, buf: &mut String) {
     buf.push_str("}\n\n");
 }
 
-fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
+fn generate_trait(runtime_path: &str, codecs: &Codecs, service: &Service, buf: &mut String) {
     buf.push_str(&format!(
         "#[allow(clippy::missing_errors_doc)]\n#[{runtime_path}::async_trait]\npub trait {}: Send + Sync + 'static {{\n",
         service.name
@@ -1441,22 +1554,30 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
         if method.client_streaming && method.server_streaming {
             buf.push_str(&format!(
                 "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::BoxStream<{}>, {runtime_path}::Status>;\n",
-                method.name, method.input_type, method.output_type
+                method.name,
+                codecs.decoded(&method.input_type),
+                method.output_type
             ));
         } else if method.client_streaming {
             buf.push_str(&format!(
                 "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
-                method.name, method.input_type, method.output_type
+                method.name,
+                codecs.decoded(&method.input_type),
+                method.output_type
             ));
         } else if method.server_streaming {
             buf.push_str(&format!(
                 "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{runtime_path}::BoxStream<{}>, {runtime_path}::Status>;\n",
-                method.name, method.input_type, method.output_type
+                method.name,
+                codecs.decoded(&method.input_type),
+                method.output_type
             ));
         } else {
             buf.push_str(&format!(
                 "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
-                method.name, method.input_type, method.output_type
+                method.name,
+                codecs.decoded(&method.input_type),
+                method.output_type
             ));
         }
     }
@@ -1464,7 +1585,7 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
     buf.push_str("}\n\n");
 }
 
-fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
+fn generate_client(runtime_path: &str, codecs: &Codecs, service: &Service, buf: &mut String) {
     let client_name = format!("{}Client", service.name);
     let validated = service.methods.iter().any(|method| method.validated);
 
@@ -1500,7 +1621,7 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
         .iter()
         .filter(|method| !method.client_streaming && !method.server_streaming)
     {
-        generate_client_method(runtime_path, service, method, buf);
+        generate_client_method(runtime_path, codecs, service, method, buf);
     }
 
     buf.push_str("}\n\n");
@@ -1513,7 +1634,7 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
         .iter()
         .filter(|method| method.client_streaming || method.server_streaming)
     {
-        generate_client_method(runtime_path, service, method, buf);
+        generate_client_method(runtime_path, codecs, service, method, buf);
     }
 
     buf.push_str("}\n\n");
@@ -1561,6 +1682,7 @@ fn with_validation_method(service: &Service, client_name: &str) -> String {
 /// call, and its builder methods change the call's options or shape first.
 fn generate_client_method(
     runtime_path: &str,
+    codecs: &Codecs,
     service: &Service,
     method: &Method,
     buf: &mut String,
@@ -1611,17 +1733,19 @@ fn generate_client_method(
                 " request,",
             ),
         };
+    let response = codecs.decoded(&method.output_type);
+    let codec_type = codecs.decoder_type(&method.output_type);
+    let codec = codecs.decoder(&method.output_type);
     buf.push_str(&format!(
-        "    /// Calls the `{}` RPC when the returned call is awaited.\n{}    pub fn {}(&self{request_param}) -> {runtime_path}::client::Call<'_, T, {runtime_path}::client::call::{shape}<{}, {}>> {{\n        {runtime_path}::client::{constructor}(&self.transport, {path},{request_arg} self.default_options.clone()){marks}\n    }}\n\n",
+        "    /// Calls the `{}` RPC when the returned call is awaited.\n{}    pub fn {}(&self{request_param}) -> {runtime_path}::client::Call<'_, T, {runtime_path}::client::call::{shape}<{}, {response}, {codec_type}>> {{\n        {runtime_path}::client::{constructor}(&self.transport, {path},{request_arg} self.default_options.clone(), {codec}){marks}\n    }}\n\n",
         method.proto_name,
         unreliable_docs(method),
         method.name,
         method.input_type,
-        method.output_type,
     ));
 }
 
-fn generate_registration(runtime_path: &str, service: &Service, buf: &mut String) {
+fn generate_registration(runtime_path: &str, codecs: &Codecs, service: &Service, buf: &mut String) {
     let register_name = format!("register_{}", to_snake_case(&service.name));
     let service_name = service_path(service);
 
@@ -1640,7 +1764,7 @@ fn generate_registration(runtime_path: &str, service: &Service, buf: &mut String
     }
 
     for method in &service.methods {
-        generate_registration_method(runtime_path, service, method, buf);
+        generate_registration_method(runtime_path, codecs, service, method, buf);
     }
 
     buf.push_str("}\n");
@@ -1648,12 +1772,13 @@ fn generate_registration(runtime_path: &str, service: &Service, buf: &mut String
 
 fn generate_registration_method(
     runtime_path: &str,
+    codecs: &Codecs,
     service: &Service,
     method: &Method,
     buf: &mut String,
 ) {
     let start = buf.len();
-    emit_registration_method(runtime_path, service, method, buf);
+    emit_registration_method(runtime_path, codecs, service, method, buf);
     // Routes register through the options variants of `route_with_context` and
     // `route_streaming_with_context`, which take the route's message types, its marks and the
     // encoded options of its method as one more argument before the handler.
@@ -1676,7 +1801,7 @@ fn generate_registration_method(
     ));
     let mut emitted = buf.split_off(start);
     if method.validated {
-        emitted = validate_requests(runtime_path, method, &emitted);
+        emitted = validate_requests(runtime_path, codecs, method, &emitted);
     }
     buf.push_str(
         &emitted
@@ -1692,15 +1817,17 @@ fn generate_registration_method(
 /// Makes an emitted registration check each request message against its `buf.validate` rules
 /// with the generated file's validator: after the request of a unary or server-streaming method
 /// decodes, and as each request of a client-streaming or bidirectional one does.
-fn validate_requests(runtime_path: &str, method: &Method, emitted: &str) -> String {
-    let decode = format!(
-        "let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n",
-        method.input_type
-    );
-    let stream = format!(
-        "{runtime_path}::stream::decode::<{}>(request_stream)",
-        method.input_type
-    );
+fn validate_requests(
+    runtime_path: &str,
+    codecs: &Codecs,
+    method: &Method,
+    emitted: &str,
+) -> String {
+    let request = codecs.decoded(&method.input_type);
+    let decoder = codecs.decoder(&method.input_type);
+    let decode = format!("{runtime_path}::codec::decode::<{request}>(&{decoder}, body)");
+    let stream =
+        format!("{runtime_path}::stream::decode::<{request}, _>(request_stream, {decoder})");
     emitted
         .replacen(
             "        let service = ::std::sync::Arc::clone(&service);\n        server.",
@@ -1717,14 +1844,15 @@ fn validate_requests(runtime_path: &str, method: &Method, emitted: &str) -> Stri
         )
         .replacen(
             &decode,
-            &format!("{decode}                validate.validate(&body)?;\n"),
+            &format!(
+                "{runtime_path}::codec::decode_validated::<{request}>(&{decoder}, body, |body| validate.validate(body))"
+            ),
             1,
         )
         .replacen(
             &stream,
             &format!(
-                "{runtime_path}::stream::decode_validated::<{}, _>(request_stream, move |body| validate.validate(body))",
-                method.input_type
+                "{runtime_path}::stream::decode_validated::<{request}, _, _>(request_stream, {decoder}, move |body| validate.validate(body))"
             ),
             1,
         )
@@ -1732,30 +1860,34 @@ fn validate_requests(runtime_path: &str, method: &Method, emitted: &str) -> Stri
 
 fn emit_registration_method(
     runtime_path: &str,
+    codecs: &Codecs,
     service: &Service,
     method: &Method,
     buf: &mut String,
 ) {
     let path = path_const_expr(service, method);
+    let request = codecs.decoded(&method.input_type);
+    let decoder = codecs.decoder(&method.input_type);
+    let codec = codecs.encoder();
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::BidirectionalStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let responses = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
-            method.input_type, method.name
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::BidirectionalStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{request}, _>(request_stream, {decoder});\n                let responses = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode(responses, {codec}))\n            }}\n        }});\n    }}\n",
+            method.name
         ));
     } else if method.client_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::ClientStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let response = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode({runtime_path}::stream::from_iter([response])))\n            }}\n        }});\n    }}\n",
-            method.input_type, method.name
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::ClientStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{request}, _>(request_stream, {decoder});\n                let response = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode({runtime_path}::stream::from_iter([response]), {codec}))\n            }}\n        }});\n    }}\n",
+            method.name
         ));
     } else if method.server_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::ServerStreaming, move |context, body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let responses = service.{}(context, request).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
-            method.input_type, method.name
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::ServerStreaming, move |context, body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = {runtime_path}::codec::decode::<{request}>(&{decoder}, body)?;\n                let responses = service.{}(context, request).await?;\n                Ok({runtime_path}::stream::encode(responses, {codec}))\n            }}\n        }});\n    }}\n",
+            method.name
         ));
     } else {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_with_context({path}, move |context, body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(context, request).await?;\n                Ok(::prost::Message::encode_to_vec(&response))\n            }}\n        }});\n    }}\n",
-            method.input_type, method.name
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_with_context({path}, move |context, body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = {runtime_path}::codec::decode::<{request}>(&{decoder}, body)?;\n                let response = service.{}(context, request).await?;\n                {runtime_path}::codec::encode(&{codec}, &response)\n            }}\n        }});\n    }}\n",
+            method.name
         ));
     }
 }
@@ -1844,8 +1976,8 @@ mod tests {
     };
 
     use super::{
-        Service, generate_plugin_response, generate_service, package_file_name, service_path,
-        to_rust_method_name, to_snake_case,
+        Codec, Codecs, Service, generate_plugin_response, generate_service, package_file_name,
+        service_path, to_rust_method_name, to_snake_case,
     };
 
     use super::{CompressedDirections, Method, MethodMarks};
@@ -1906,7 +2038,12 @@ mod tests {
         };
         let mut generated = String::new();
 
-        generate_service("::trevrpc", &service, &mut generated);
+        generate_service(
+            "::trevrpc",
+            &Codecs::new("::trevrpc", Codec::Prost, false),
+            &service,
+            &mut generated,
+        );
 
         assert!(generated.contains("pub trait Greeter"));
         assert!(generated.contains("pub struct GreeterClient<T>"));
@@ -1939,16 +2076,21 @@ mod tests {
         };
         let mut generated = String::new();
 
-        generate_service("::trevrpc", &service, &mut generated);
+        generate_service(
+            "::trevrpc",
+            &Codecs::new("::trevrpc", Codec::Prost, false),
+            &service,
+            &mut generated,
+        );
 
         assert!(generated.contains("pub mod greeter_paths {"));
         assert!(generated.contains("pub const SAY_HELLO: &str = \"/hello.v1.Greeter/SayHello\";"));
         assert!(generated.contains(
-            "::trevrpc::client::unary(&self.transport, greeter_paths::SAY_HELLO, request, self.default_options.clone()).message_types(\"example.HelloRequest\", \"example.HelloReply\")"
+            "::trevrpc::client::unary(&self.transport, greeter_paths::SAY_HELLO, request, self.default_options.clone(), ::trevrpc::codec::Prost).message_types(\"example.HelloRequest\", \"example.HelloReply\")"
         ));
         // One client method per RPC: the returned call carries the options and response variants.
         assert!(generated.contains(
-            "pub fn say_hello(&self, request: &HelloRequest) -> ::trevrpc::client::Call<'_, T, ::trevrpc::client::call::Unary<HelloRequest, HelloReply>>"
+            "pub fn say_hello(&self, request: &HelloRequest) -> ::trevrpc::client::Call<'_, T, ::trevrpc::client::call::Unary<HelloRequest, HelloReply, ::trevrpc::codec::Prost>>"
         ));
         for variant in ["_with_options", "_envelope", "_from_stream"] {
             assert!(
@@ -1991,7 +2133,12 @@ mod tests {
         };
         let mut generated = String::new();
 
-        generate_service("::trevrpc", &service, &mut generated);
+        generate_service(
+            "::trevrpc",
+            &Codecs::new("::trevrpc", Codec::Prost, false),
+            &service,
+            &mut generated,
+        );
 
         assert!(generated.contains("pub const SAY_HELLO: &str = \"/Greeter/SayHello\";"));
     }
@@ -2052,7 +2199,12 @@ mod tests {
         };
         let mut generated = String::new();
 
-        generate_service("::trevrpc", &service, &mut generated);
+        generate_service(
+            "::trevrpc",
+            &Codecs::new("::trevrpc", Codec::Prost, false),
+            &service,
+            &mut generated,
+        );
 
         assert!(generated.contains("BoxStream<HelloRequest>"));
         assert!(generated.contains("BoxStream<HelloReply>"));
@@ -2060,12 +2212,12 @@ mod tests {
         assert!(generated.contains("::trevrpc::client::client_streaming"));
         assert!(
             generated
-                .contains("::trevrpc::client::call::ClientStreaming<HelloRequest, HelloReply>")
+                .contains("::trevrpc::client::call::ClientStreaming<HelloRequest, HelloReply, ::trevrpc::codec::Prost>")
         );
         assert!(generated.contains("::trevrpc::client::bidirectional_streaming"));
         assert!(
             generated.contains(
-                "::trevrpc::client::call::BidirectionalStreaming<HelloRequest, HelloReply>"
+                "::trevrpc::client::call::BidirectionalStreaming<HelloRequest, HelloReply, ::trevrpc::codec::Prost>"
             )
         );
         assert!(generated.contains("server.route_streaming"));
@@ -2075,8 +2227,12 @@ mod tests {
         assert!(generated.contains("::trevrpc::RpcKind::ServerStreaming"));
         assert!(generated.contains("::trevrpc::RpcKind::ClientStreaming"));
         assert!(generated.contains("::trevrpc::RpcKind::BidirectionalStreaming"));
-        assert!(generated.contains("::trevrpc::stream::decode::<HelloRequest>"));
-        assert!(generated.contains("::trevrpc::stream::encode"));
+        assert!(generated.contains(
+            "::trevrpc::stream::decode::<HelloRequest, _>(request_stream, ::trevrpc::codec::Prost)"
+        ));
+        assert!(
+            generated.contains("::trevrpc::stream::encode(responses, ::trevrpc::codec::Prost)")
+        );
     }
 
     #[test]
@@ -2149,6 +2305,93 @@ mod tests {
         assert!(content.contains("request: ()"));
         assert!(content.contains("-> ::core::result::Result<(), ::trevrpc::Status>;"));
         assert!(!content.contains("crate::google::protobuf::Empty"));
+    }
+
+    #[test]
+    fn plugin_generates_buffa_services_with_buffa_well_known_types() {
+        let mut request = hello_request(Some("codec=buffa".to_owned()));
+        request.proto_file.push(FileDescriptorProto {
+            name: Some("google/protobuf/empty.proto".to_owned()),
+            package: Some("google.protobuf".to_owned()),
+            message_type: vec![message("Empty"), message("StringValue")],
+            ..Default::default()
+        });
+        request.proto_file[0].service[0].method[0].input_type =
+            Some(".google.protobuf.Empty".to_owned());
+        request.proto_file[0].service[0].method[0].output_type =
+            Some(".google.protobuf.StringValue".to_owned());
+
+        let response = generate_plugin_response(&request);
+
+        assert_eq!(response.error, None);
+        let content = response.file[0]
+            .content
+            .as_deref()
+            .expect("plugin should generate service content");
+        // `buffa` keeps the well-known types messages, wrappers and `Empty` included.
+        assert!(content.contains("request: ::buffa_types::google::protobuf::Empty"));
+        assert!(content.contains(
+            "-> ::core::result::Result<::buffa_types::google::protobuf::StringValue, ::trevrpc::Status>;"
+        ));
+        assert!(content.contains(
+            "::trevrpc::client::call::Unary<::buffa_types::google::protobuf::Empty, ::buffa_types::google::protobuf::StringValue, ::trevrpc::codec::Buffa>"
+        ));
+        assert!(content.contains("self.default_options.clone(), ::trevrpc::codec::Buffa)"));
+        assert!(content.contains(
+            "::trevrpc::codec::decode::<::buffa_types::google::protobuf::Empty>(&::trevrpc::codec::Buffa, body)?"
+        ));
+        assert!(content.contains("::trevrpc::codec::encode(&::trevrpc::codec::Buffa, &response)"));
+        assert!(!content.contains("Prost"));
+        assert!(!content.contains("prost"));
+    }
+
+    #[test]
+    fn plugin_decodes_buffa_views_with_views() {
+        let response =
+            generate_plugin_response(&hello_request(Some("codec=buffa,views=true".to_owned())));
+
+        assert_eq!(response.error, None);
+        let content = response.file[0]
+            .content
+            .as_deref()
+            .expect("plugin should generate service content");
+        // Handlers receive request views and return owned responses.
+        assert!(content.contains(
+            "request: ::trevrpc::codec::BuffaViewHandle<HelloRequest>) -> ::core::result::Result<HelloReply, ::trevrpc::Status>;"
+        ));
+        assert!(content.contains(
+            "::trevrpc::codec::decode::<::trevrpc::codec::BuffaViewHandle<HelloRequest>>(&::trevrpc::codec::BuffaView::<HelloRequest>::new(), body)?"
+        ));
+        assert!(content.contains("::trevrpc::codec::encode(&::trevrpc::codec::Buffa, &response)"));
+        // Clients send owned requests and receive response views.
+        assert!(content.contains(
+            "::trevrpc::client::call::Unary<HelloRequest, ::trevrpc::codec::BuffaViewHandle<HelloReply>, ::trevrpc::codec::BuffaView<HelloReply>>"
+        ));
+        assert!(content.contains(
+            "self.default_options.clone(), ::trevrpc::codec::BuffaView::<HelloReply>::new())"
+        ));
+    }
+
+    #[test]
+    fn plugin_rejects_views_without_buffa() {
+        let response = generate_plugin_response(&hello_request(Some("views=true".to_owned())));
+
+        assert_eq!(
+            response.error.as_deref(),
+            Some("views=true needs codec=buffa")
+        );
+        assert_eq!(response.file, []);
+    }
+
+    #[test]
+    fn plugin_rejects_unknown_codecs() {
+        let response = generate_plugin_response(&hello_request(Some("codec=protobuf".to_owned())));
+
+        assert_eq!(
+            response.error.as_deref(),
+            Some("invalid codec \"protobuf\"; expected prost or buffa")
+        );
+        assert_eq!(response.file, []);
     }
 
     #[test]

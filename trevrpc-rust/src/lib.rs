@@ -15,6 +15,7 @@ extern crate self as trevrpc;
 mod bearer;
 mod call_completion;
 pub mod client;
+pub mod codec;
 pub mod compression;
 mod congestion;
 mod connection_metadata;
@@ -72,6 +73,9 @@ pub const QMUX_ALPN: &[u8] = b"qmux-02.trevrpc-1";
 
 pub use async_trait::async_trait;
 pub use bearer::bearer_metadata;
+/// The buffer type of request message bodies, re-exported so that hand-written routes and
+/// transports need no `bytes` dependency of their own.
+pub use bytes::Bytes;
 pub use compression::{CompressMessages, CompressStream, Compression, Dictionary};
 pub use datagram::Unreliable;
 pub use error::{Error, Result};

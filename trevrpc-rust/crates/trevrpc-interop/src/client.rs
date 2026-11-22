@@ -531,7 +531,7 @@ pub(crate) fn expect_violation(
     let violations = status
         .find_detail(trevrpc_protovalidate::VIOLATIONS_TYPE)
         .ok_or_else(|| format!("{what}: no buf.validate.Violations detail in {status:?}"))?
-        .decode::<Violations>()
+        .decode::<Violations>(&trevrpc::codec::Prost)
         .map_err(|error| format!("{what}: buf.validate.Violations does not decode: {error}"))?;
     let [violation] = violations.violations.as_slice() else {
         return Err(format!("{what}: want one violation, got {violations:?}"));

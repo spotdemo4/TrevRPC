@@ -311,11 +311,12 @@ over_each_wire!(
         slot_limited_options().with_max_concurrent_streams_per_connection(Some(1)),
         |transport| async move {
             let client = greeter::GreeterClient::new(Arc::clone(&transport));
-            let mut held = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+            let mut held = trevrpc::client::server_streaming::<_, _, greeter::HelloReply, _>(
                 transport.as_ref(),
                 &support::greeter_path(HOLD),
                 &name(0),
                 long_options(),
+                trevrpc::codec::Prost,
             )
             .await?;
             ensure!(held.next().await.is_some());
@@ -419,10 +420,11 @@ over_each_wire!(
     [quic, qmux],
     |wire| run(wire, ServerOptions::new(), |transport| async move {
         let call =
-            trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
+            trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply, _>(
                 transport.as_ref(),
                 &support::greeter_path(REJECT),
                 long_options(),
+                trevrpc::codec::Prost,
             )
             .await?;
         send_until_failure(|| call.send(large_message())).await?;
@@ -445,10 +447,12 @@ over_each_wire!(
             _,
             greeter::HelloRequest,
             greeter::HelloReply,
+            _,
         >(
             transport.as_ref(),
             &support::greeter_path("RejectBidi"),
             long_options(),
+            trevrpc::codec::Prost,
         )
         .await?;
         send_until_failure(|| call.send(large_message())).await?;
@@ -562,12 +566,14 @@ fn rejection() -> Status {
 async fn client_streaming_upload_stops_on_a_status_the_server_never_follows_up() -> TestResult {
     let server = spawn_deaf_server(rejection())?;
     let (_endpoint, transport) = connect_quic_to(server.addr, &server.cert).await?;
-    let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-        &transport,
-        &support::greeter_path("Deaf"),
-        long_options(),
-    )
-    .await?;
+    let call =
+        trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply, _>(
+            &transport,
+            &support::greeter_path("Deaf"),
+            long_options(),
+            trevrpc::codec::Prost,
+        )
+        .await?;
 
     let error = send_until_failure(|| call.send(large_message())).await?;
     ensure_eq!(error.into_status().code(), Code::PermissionDenied);
@@ -588,7 +594,13 @@ async fn bidi_upload_stops_on_a_status_the_server_never_follows_up() -> TestResu
         _,
         greeter::HelloRequest,
         greeter::HelloReply,
-    >(&transport, &support::greeter_path("Deaf"), long_options())
+        _,
+    >(
+        &transport,
+        &support::greeter_path("Deaf"),
+        long_options(),
+        trevrpc::codec::Prost,
+    )
     .await?;
 
     // Nobody reads the responses while the upload runs.
@@ -603,12 +615,14 @@ async fn bidi_upload_stops_on_a_status_the_server_never_follows_up() -> TestResu
 async fn send_reports_an_ok_status_as_cancelled() -> TestResult {
     let server = spawn_deaf_server(Status::ok())?;
     let (_endpoint, transport) = connect_quic_to(server.addr, &server.cert).await?;
-    let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-        &transport,
-        &support::greeter_path("Deaf"),
-        long_options(),
-    )
-    .await?;
+    let call =
+        trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply, _>(
+            &transport,
+            &support::greeter_path("Deaf"),
+            long_options(),
+            trevrpc::codec::Prost,
+        )
+        .await?;
 
     let error = send_until_failure(|| call.send(large_message())).await?;
     let status = error.into_status();
@@ -630,7 +644,13 @@ async fn bidi_send_reports_a_status_queued_behind_unread_responses() -> TestResu
         _,
         greeter::HelloRequest,
         greeter::HelloReply,
-    >(&transport, &support::greeter_path("Deaf"), long_options())
+        _,
+    >(
+        &transport,
+        &support::greeter_path("Deaf"),
+        long_options(),
+        trevrpc::codec::Prost,
+    )
     .await?;
 
     let error = send_until_failure(|| call.send(large_message())).await?;
@@ -655,13 +675,18 @@ async fn send_reports_resource_exhausted_when_the_status_is_beyond_the_buffer_bo
         status: None,
     })?;
     let (_endpoint, transport) = connect_quic_to(server.addr, &server.cert).await?;
-    let call =
-        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-            &transport,
-            &support::greeter_path("Deaf"),
-            long_options().with_max_response_messages(Some(8)),
-        )
-        .await?;
+    let call = trevrpc::client::bidirectional_streaming::<
+        _,
+        greeter::HelloRequest,
+        greeter::HelloReply,
+        _,
+    >(
+        &transport,
+        &support::greeter_path("Deaf"),
+        long_options().with_max_response_messages(Some(8)),
+        trevrpc::codec::Prost,
+    )
+    .await?;
 
     let error = send_until_failure(|| call.send(large_message())).await?;
     ensure_eq!(error.into_status().code(), Code::ResourceExhausted);
@@ -732,12 +757,14 @@ async fn send_after_upload_stops_first(connection_lost: bool) -> TestResult<trev
         dropped: std::sync::Mutex::new(Some(dropped)),
         connection_lost,
     };
-    let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-        &transport,
-        &support::greeter_path("Teardown"),
-        long_options(),
-    )
-    .await?;
+    let call =
+        trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply, _>(
+            &transport,
+            &support::greeter_path("Teardown"),
+            long_options(),
+            trevrpc::codec::Prost,
+        )
+        .await?;
     upload_dropped.await?;
 
     // The upload is gone and the end of the call is not recorded yet. The send has to wait for

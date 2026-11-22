@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::Status;
+use crate::codec::{DecodeError, EncodeError};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -13,9 +14,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone)]
 pub enum Error {
     Status(Status),
-    Encode(prost::EncodeError),
-    Decode(prost::DecodeError),
-    FrameTooLarge { len: usize, max: usize },
+    /// A message that could not be encoded.
+    Encode(EncodeError),
+    /// A message body that could not be decoded.
+    Decode(DecodeError),
+    FrameTooLarge {
+        len: usize,
+        max: usize,
+    },
     Transport(Arc<dyn StdError + Send + Sync>),
 }
 
@@ -84,15 +90,27 @@ impl From<Error> for Status {
     }
 }
 
+impl From<EncodeError> for Error {
+    fn from(error: EncodeError) -> Self {
+        Self::Encode(error)
+    }
+}
+
+impl From<DecodeError> for Error {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
 impl From<prost::EncodeError> for Error {
     fn from(error: prost::EncodeError) -> Self {
-        Self::Encode(error)
+        Self::Encode(error.into())
     }
 }
 
 impl From<prost::DecodeError> for Error {
     fn from(error: prost::DecodeError) -> Self {
-        Self::Decode(error)
+        Self::Decode(error.into())
     }
 }
 

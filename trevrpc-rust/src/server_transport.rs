@@ -54,7 +54,7 @@ pub trait ResponseWriter: Send + 'static {
 pub struct IncomingRequest {
     pub(crate) request: RpcRequest,
     /// The request message of a unary or server-streaming call, empty for the other kinds.
-    pub(crate) body: Vec<u8>,
+    pub(crate) body: Bytes,
     /// What the rest of the request stream may still send.
     pub(crate) budget: RequestBudget,
     /// The call's datagram flow, once [`open_flow`] has registered it.
@@ -177,7 +177,7 @@ where
         })
         .await?;
         match frame {
-            RequestFrame::Message(body) => Vec::from(body),
+            RequestFrame::Message(body) => body,
             RequestFrame::End(_) => {
                 return Err(Error::from(Status::invalid_argument(
                     "request stream ended before the request message",
@@ -185,7 +185,7 @@ where
             }
         }
     } else {
-        Vec::new()
+        Bytes::new()
     };
     Ok(IncomingRequest {
         request,
@@ -1149,7 +1149,7 @@ mod tests {
                 .await
                 .expect("request should read");
             assert_eq!(incoming.request.rpc_kind(), kind);
-            assert_eq!(incoming.body, b"hi");
+            assert_eq!(incoming.body, &b"hi"[..]);
         }
     }
 
@@ -1160,7 +1160,7 @@ mod tests {
             let incoming = read(&server, vec![request_frame(kind), message_frame(b"later")])
                 .await
                 .expect("request should read");
-            assert_eq!(incoming.body, []);
+            assert!(incoming.body.is_empty());
         }
     }
 
@@ -1179,7 +1179,7 @@ mod tests {
         )
         .await
         .expect("request should read");
-        assert_eq!(incoming.body, b"hi");
+        assert_eq!(incoming.body, &b"hi"[..]);
     }
 
     #[tokio::test]

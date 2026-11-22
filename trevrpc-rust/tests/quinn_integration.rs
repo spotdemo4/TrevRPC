@@ -784,12 +784,14 @@ fn register_backpressured_upload_route(server: &mut Server) {
 async fn backpressured_upload<T: StreamingRpcTransport>(transport: &T) -> TestResult {
     const MESSAGES: usize = 8;
 
-    let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-        transport,
-        &support::greeter_path("BackpressuredUpload"),
-        CallOptions::new().with_timeout(TEST_TIMEOUT),
-    )
-    .await?;
+    let call =
+        trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply, _>(
+            transport,
+            &support::greeter_path("BackpressuredUpload"),
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+            trevrpc::codec::Prost,
+        )
+        .await?;
     for _ in 0..MESSAGES {
         call.send(greeter::HelloRequest {
             name: "x".repeat(IGNORED_UPLOAD_MESSAGE),
@@ -2072,13 +2074,14 @@ async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
 
     if let Ok(connection) = connect {
         let transport = trevrpc::client::QuicTransport::new(connection.clone());
-        let error = trevrpc::client::unary::<_, _, greeter::HelloReply>(
+        let error = trevrpc::client::unary::<_, _, greeter::HelloReply, _>(
             &transport,
             &support::greeter_path("SayHello"),
             &greeter::HelloRequest {
                 name: "refused".to_owned(),
             },
             CallOptions::new().with_timeout(Duration::from_millis(100)),
+            trevrpc::codec::Prost,
         )
         .await
         .expect_err("RPC on refused connection should fail");
@@ -2129,11 +2132,12 @@ async fn quinn_response_drop_reports_peer_reset_to_request_context() -> TestResu
     })?;
     let (endpoint, connection, _) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
-    let mut responses = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+    let mut responses = trevrpc::client::server_streaming::<_, _, greeter::HelloReply, _>(
         &transport,
         "/lifecycle.Probe/Watch",
         &greeter::HelloRequest::default(),
         CallOptions::new().with_timeout(TEST_TIMEOUT),
+        trevrpc::codec::Prost,
     )
     .await?;
     responses
@@ -2159,11 +2163,12 @@ async fn quinn_shutdown_reports_server_shutdown_to_request_context() -> TestResu
     })?;
     let (_endpoint, connection, _) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
-    let mut responses = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+    let mut responses = trevrpc::client::server_streaming::<_, _, greeter::HelloReply, _>(
         &transport,
         "/lifecycle.Probe/Watch",
         &greeter::HelloRequest::default(),
         CallOptions::new().with_timeout(TEST_TIMEOUT),
+        trevrpc::codec::Prost,
     )
     .await?;
     responses
@@ -2384,13 +2389,18 @@ async fn terminal_status_drops_pending_request_stream(wire: Wire) -> TestResult 
     let server = spawn_greeter_server(register_reject_upload_route)?;
     let (connection, _client) = WireClient::connect(wire, &server).await?;
     let transport = connection.transport();
-    let mut replies =
-        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-            &transport,
-            &support::greeter_path("RejectUpload"),
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
-        .await?;
+    let mut replies = trevrpc::client::bidirectional_streaming::<
+        _,
+        greeter::HelloRequest,
+        greeter::HelloReply,
+        _,
+    >(
+        &transport,
+        &support::greeter_path("RejectUpload"),
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+        trevrpc::codec::Prost,
+    )
+    .await?;
 
     let error = replies
         .recv()
@@ -2731,13 +2741,18 @@ async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let server = spawn_greeter_server(register_accept_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
-    let mut replies =
-        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-            &transport,
-            &support::greeter_path("AcceptUpload"),
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
-        .await?;
+    let mut replies = trevrpc::client::bidirectional_streaming::<
+        _,
+        greeter::HelloRequest,
+        greeter::HelloReply,
+        _,
+    >(
+        &transport,
+        &support::greeter_path("AcceptUpload"),
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+        trevrpc::codec::Prost,
+    )
+    .await?;
 
     replies
         .send(greeter::HelloRequest {
@@ -2759,13 +2774,18 @@ async fn webtransport_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let server = spawn_greeter_server(register_accept_upload_route)?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
     let transport = support::WebTransportRpc::new(session.clone());
-    let mut replies =
-        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-            &transport,
-            &support::greeter_path("AcceptUpload"),
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
-        .await?;
+    let mut replies = trevrpc::client::bidirectional_streaming::<
+        _,
+        greeter::HelloRequest,
+        greeter::HelloReply,
+        _,
+    >(
+        &transport,
+        &support::greeter_path("AcceptUpload"),
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+        trevrpc::codec::Prost,
+    )
+    .await?;
 
     replies
         .send(greeter::HelloRequest {
@@ -2917,13 +2937,14 @@ async fn shutdown_is_bounded_with_pending_unary_handler(wire: Wire) -> TestResul
     let (connection, _client) = WireClient::connect(wire, &server).await?;
     let transport = connection.transport();
     let call = tokio::spawn(async move {
-        trevrpc::client::unary::<_, _, greeter::HelloReply>(
+        trevrpc::client::unary::<_, _, greeter::HelloReply, _>(
             &transport,
             &support::greeter_path("Never"),
             &greeter::HelloRequest {
                 name: "shutdown".to_owned(),
             },
             CallOptions::new().with_timeout(TEST_TIMEOUT),
+            trevrpc::codec::Prost,
         )
         .await
     });
@@ -3000,13 +3021,14 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
 
     if let Ok(connection) = result {
         let transport = trevrpc::client::QuicTransport::new(connection.clone());
-        let status = trevrpc::client::unary::<_, _, greeter::HelloReply>(
+        let status = trevrpc::client::unary::<_, _, greeter::HelloReply, _>(
             &transport,
             &support::greeter_path("SayHello"),
             &greeter::HelloRequest {
                 name: "anonymous".to_owned(),
             },
             CallOptions::new().with_timeout(Duration::from_millis(100)),
+            trevrpc::codec::Prost,
         )
         .await
         .map_err(trevrpc::Error::into_status)
@@ -4055,11 +4077,12 @@ async fn quinn_streaming_headers_arrive_before_the_first_message_exists() -> Tes
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
 
-    let mut replies = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+    let mut replies = trevrpc::client::server_streaming::<_, _, greeter::HelloReply, _>(
         &transport,
         "/test.Headers/Gate",
         &greeter::HelloRequest::default(),
         CallOptions::new().with_timeout(TEST_TIMEOUT),
+        trevrpc::codec::Prost,
     )
     .await?;
 
@@ -4147,7 +4170,7 @@ async fn quinn_unary_requests_need_exactly_one_message() -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.route(support::greeter_path("Slow"), |body| async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            Ok(body)
+            Ok(Vec::from(body))
         });
     })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;

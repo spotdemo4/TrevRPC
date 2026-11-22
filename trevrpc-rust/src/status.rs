@@ -1,6 +1,9 @@
 use std::fmt;
 use std::time::Duration;
 
+use bytes::Bytes;
+
+use crate::codec::{Decode, DecodeError, Encode, EncodeError, Name};
 use crate::retry_info::{self, RETRY_INFO_TYPE};
 use crate::{Metadata, RpcStatus};
 
@@ -323,8 +326,8 @@ impl From<RpcStatus> for Status {
 pub struct Detail {
     #[prost(string, tag = "1")]
     type_name: String,
-    #[prost(bytes = "vec", tag = "2")]
-    value: Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    value: Bytes,
 }
 
 impl Detail {
@@ -334,14 +337,24 @@ impl Detail {
     pub fn new(type_name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         Self {
             type_name: type_name.into(),
-            value: value.into(),
+            value: Bytes::from(value.into()),
         }
     }
 
-    /// Creates a detail that carries `message`.
-    #[must_use]
-    pub fn from_message<M: prost::Name>(message: &M) -> Self {
-        Self::new(M::full_name(), message.encode_to_vec())
+    /// Creates a detail that carries `message`, which `codec` names and encodes, such as
+    /// [`Prost`](crate::codec::Prost) for a `prost` message that implements `prost::Name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encode error if `codec` cannot encode `message`.
+    pub fn from_message<M, C>(codec: &C, message: &M) -> Result<Self, EncodeError>
+    where
+        C: Encode<M> + Name<M>,
+    {
+        Ok(Self {
+            type_name: codec.full_name(),
+            value: Bytes::from(codec.encode(message)?),
+        })
     }
 
     /// Returns the full name of the message the detail carries.
@@ -356,14 +369,15 @@ impl Detail {
         &self.value
     }
 
-    /// Decodes the message the detail carries. The caller picks `M` by the detail's
-    /// [`type_name`](Self::type_name).
+    /// Decodes the message the detail carries with `codec`, such as
+    /// [`Prost`](crate::codec::Prost): `detail.decode::<Violations>(&Prost)`. The caller picks
+    /// `M` by the detail's [`type_name`](Self::type_name).
     ///
     /// # Errors
     ///
     /// Returns the decode error if the value is not a valid encoding of `M`.
-    pub fn decode<M: prost::Message + Default>(&self) -> Result<M, prost::DecodeError> {
-        M::decode(self.value.as_slice())
+    pub fn decode<M>(&self, codec: &impl Decode<M>) -> Result<M, DecodeError> {
+        codec.decode(self.value.clone())
     }
 }
 

@@ -69,7 +69,7 @@ fn broken_rules_fail_with_violations() {
     let detail = status
         .find_detail(VIOLATIONS_TYPE)
         .expect("violations detail");
-    let violations = detail.decode::<Violations>().unwrap();
+    let violations = detail.decode::<Violations>(&trevrpc::codec::Prost).unwrap();
     let mut rules: Vec<_> = violations
         .violations
         .iter()
@@ -89,7 +89,7 @@ fn cel_rules_are_enforced() {
     let violations = status
         .find_detail(VIOLATIONS_TYPE)
         .expect("violations detail")
-        .decode::<Violations>()
+        .decode::<Violations>(&trevrpc::codec::Prost)
         .unwrap();
     assert_eq!(violations.violations.len(), 1);
     assert_eq!(violations.violations[0].rule_id(), "name_not_inner");
@@ -134,7 +134,7 @@ fn many_violations_fail_with_a_status_that_fits_a_frame() {
     let violations = status
         .find_detail(VIOLATIONS_TYPE)
         .expect("violations detail")
-        .decode::<Violations>()
+        .decode::<Violations>(&trevrpc::codec::Prost)
         .unwrap();
     assert_eq!(violations.violations.len(), MAX_DETAIL_VIOLATIONS);
 }

@@ -1052,11 +1052,12 @@ async fn qmux_calls_fail_promptly_when_the_session_dies() -> TestResult {
     let unary = tokio::spawn({
         let (transport, hello) = (transport.clone(), hello.clone());
         async move {
-            trevrpc::client::unary::<_, _, greeter::HelloReply>(
+            trevrpc::client::unary::<_, _, greeter::HelloReply, _>(
                 &transport,
                 HANG_UNARY,
                 &hello,
                 CallOptions::default(),
+                trevrpc::codec::Prost,
             )
             .await
             .map(drop)
@@ -1065,11 +1066,12 @@ async fn qmux_calls_fail_promptly_when_the_session_dies() -> TestResult {
     let server_stream = tokio::spawn({
         let (transport, hello) = (transport.clone(), hello.clone());
         async move {
-            let mut replies = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+            let mut replies = trevrpc::client::server_streaming::<_, _, greeter::HelloReply, _>(
                 &transport,
                 HANG_SERVER_STREAM,
                 &hello,
                 CallOptions::default(),
+                trevrpc::codec::Prost,
             )
             .await?;
             match replies.next().await {
@@ -1085,7 +1087,13 @@ async fn qmux_calls_fail_promptly_when_the_session_dies() -> TestResult {
                 _,
                 greeter::HelloRequest,
                 greeter::HelloReply,
-            >(&transport, path, CallOptions::default())
+                _,
+            >(
+                &transport,
+                path,
+                CallOptions::default(),
+                trevrpc::codec::Prost,
+            )
             .await?;
             call.recv().await.map(drop)
         })

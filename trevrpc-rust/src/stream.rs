@@ -2,10 +2,11 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use futures_core::Stream;
-use prost::Message;
 
 use crate::client::RequestCheck;
+use crate::codec::{Decode, Encode, Prost};
 use crate::{Error, Result, Status};
 
 /// A sendable, heap-allocated asynchronous message stream.
@@ -74,33 +75,44 @@ where
     Box::pin(IterStream::new(iter.into_iter()))
 }
 
-pub struct EncodeStream<T> {
+pub struct EncodeStream<T, C = Prost> {
     inner: BoxStream<T>,
+    codec: C,
     check: Option<RequestCheck>,
 }
 
-impl<T> EncodeStream<T> {
-    /// Creates a stream that encodes protobuf messages into byte bodies.
+impl<T, C> EncodeStream<T, C> {
+    /// Creates a stream that encodes messages into byte bodies with `codec`.
     #[must_use]
-    pub fn new(inner: BoxStream<T>) -> Self {
-        Self { inner, check: None }
+    pub fn new(inner: BoxStream<T>, codec: C) -> Self {
+        Self {
+            inner,
+            codec,
+            check: None,
+        }
     }
 }
 
-impl<T> Stream for EncodeStream<T>
+// The codec is never pinned.
+impl<T, C> Unpin for EncodeStream<T, C> {}
+
+impl<T, C> Stream for EncodeStream<T, C>
 where
-    T: Message,
+    C: Encode<T>,
 {
     type Item = Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(message))) => {
-                let body = message.encode_to_vec();
-                let checked = match &self.check {
-                    Some(check) => check.check(&body).map(|()| body),
-                    None => Ok(body),
-                };
+                let checked = self
+                    .codec
+                    .encode(&message)
+                    .map_err(Error::from)
+                    .and_then(|body| match &self.check {
+                        Some(check) => check.check(&body).map(|()| body),
+                        None => Ok(body),
+                    });
                 Poll::Ready(Some(checked))
             }
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
@@ -110,77 +122,91 @@ where
     }
 }
 
-/// Wraps a message stream and encodes each protobuf message into bytes.
-pub fn encode<T>(inner: BoxStream<T>) -> BoxStream<Vec<u8>>
+/// Wraps a message stream and encodes each message into bytes with `codec`.
+pub fn encode<T, C>(inner: BoxStream<T>, codec: C) -> BoxStream<Vec<u8>>
 where
-    T: Message + Send + 'static,
+    T: Send + 'static,
+    C: Encode<T>,
 {
-    Box::pin(EncodeStream::new(inner))
+    Box::pin(EncodeStream::new(inner, codec))
 }
 
 /// [`encode`] for the request messages of a client call, which `check` vets in their encoded form
 /// when there is one. A message it rejects ends the stream with the status it returns, as an
 /// error of the wrapped stream does, which cancels the call.
-pub(crate) fn encode_checked<T>(
+pub(crate) fn encode_checked<T, C>(
     inner: BoxStream<T>,
+    codec: C,
     check: Option<RequestCheck>,
 ) -> BoxStream<Vec<u8>>
 where
-    T: Message + Send + 'static,
+    T: Send + 'static,
+    C: Encode<T>,
 {
-    Box::pin(EncodeStream { inner, check })
+    Box::pin(EncodeStream {
+        inner,
+        codec,
+        check,
+    })
 }
 
 /// Checks the encoded body of a request message before it is decoded; see [`decode_validated`].
 type ValidateBody = Box<dyn Fn(&[u8]) -> std::result::Result<(), Status> + Send>;
 
-pub struct DecodeStream<T> {
-    inner: BoxStream<Vec<u8>>,
+pub struct DecodeStream<T, C = Prost> {
+    inner: BoxStream<Bytes>,
+    codec: C,
     validate: Option<ValidateBody>,
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<T> DecodeStream<T> {
-    /// Creates a stream that decodes byte bodies into protobuf messages.
+impl<T, C> DecodeStream<T, C> {
+    /// Creates a stream that decodes byte bodies into messages with `codec`.
     #[must_use]
-    pub fn new(inner: BoxStream<Vec<u8>>) -> Self {
+    pub fn new(inner: BoxStream<Bytes>, codec: C) -> Self {
         Self {
             inner,
+            codec,
             validate: None,
             _marker: PhantomData,
         }
     }
 
-    /// Creates a stream that decodes byte bodies into protobuf messages that `validate` accepts;
-    /// see [`decode_validated`].
+    /// Creates a stream that decodes byte bodies with `codec` into messages that `validate`
+    /// accepts; see [`decode_validated`].
     #[must_use]
-    pub fn validated<F>(inner: BoxStream<Vec<u8>>, validate: F) -> Self
+    pub fn validated<F>(inner: BoxStream<Bytes>, codec: C, validate: F) -> Self
     where
         F: Fn(&[u8]) -> std::result::Result<(), Status> + Send + 'static,
     {
         Self {
             inner,
+            codec,
             validate: Some(Box::new(validate)),
             _marker: PhantomData,
         }
     }
 }
 
-impl<T> Stream for DecodeStream<T>
+// The codec is never pinned.
+impl<T, C> Unpin for DecodeStream<T, C> {}
+
+impl<T, C> Stream for DecodeStream<T, C>
 where
-    T: Message + Default,
+    C: Decode<T>,
 {
     type Item = Result<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(body))) => {
-                let message = T::decode(body.as_slice()).map_err(Error::from);
-                let checked = match (&self.validate, message) {
-                    (Some(validate), Ok(message)) => {
-                        validate(&body).map(|()| message).map_err(Error::from)
-                    }
-                    (_, message) => message,
+                let checked = match &self.validate {
+                    None => self.codec.decode(body).map_err(Error::from),
+                    Some(validate) => self
+                        .codec
+                        .decode(body.clone())
+                        .map_err(Error::from)
+                        .and_then(|message| validate(&body).map(|()| message).map_err(Error::from)),
                 };
                 Poll::Ready(Some(checked))
             }
@@ -191,32 +217,36 @@ where
     }
 }
 
-/// Wraps a byte stream and decodes each body into a protobuf message.
-pub fn decode<T>(inner: BoxStream<Vec<u8>>) -> BoxStream<T>
+/// Wraps a byte stream and decodes each body into a message with `codec`.
+pub fn decode<T, C>(inner: BoxStream<Bytes>, codec: C) -> BoxStream<T>
 where
-    T: Message + Default + Send + 'static,
+    T: 'static,
+    C: Decode<T>,
 {
-    Box::pin(DecodeStream::new(inner))
+    Box::pin(DecodeStream::new(inner, codec))
 }
 
-/// Wraps a byte stream and decodes each body into a protobuf message, which `validate` checks in
-/// its encoded form. A body `validate` rejects ends the stream with the status it returns, as a
-/// body that does not decode does. Code generated with `validate=true` checks request messages
+/// Wraps a byte stream and decodes each body into a message with `codec`, which `validate` checks
+/// in its encoded form. A body `validate` rejects ends the stream with the status it returns, as
+/// a body that does not decode does. Code generated with `validate=true` checks request messages
 /// with it.
-pub fn decode_validated<T, F>(inner: BoxStream<Vec<u8>>, validate: F) -> BoxStream<T>
+pub fn decode_validated<T, C, F>(inner: BoxStream<Bytes>, codec: C, validate: F) -> BoxStream<T>
 where
-    T: Message + Default + Send + 'static,
+    T: 'static,
+    C: Decode<T>,
     F: Fn(&[u8]) -> std::result::Result<(), Status> + Send + 'static,
 {
-    Box::pin(DecodeStream::validated(inner, validate))
+    Box::pin(DecodeStream::validated(inner, codec, validate))
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use futures_util::StreamExt;
 
-    use super::{decode, decode_validated, encode, encode_checked, from_iter};
+    use super::{BoxStream, decode, decode_validated, encode, encode_checked, from_iter};
     use crate::client::RequestCheck;
+    use crate::codec::Prost;
     use crate::{Code, Status};
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -225,13 +255,18 @@ mod tests {
         value: String,
     }
 
+    /// The encoded bodies of `stream` as the server receives them.
+    fn to_bytes(stream: BoxStream<Vec<u8>>) -> BoxStream<Bytes> {
+        Box::pin(stream.map(|body| body.map(Bytes::from)))
+    }
+
     #[tokio::test]
     async fn encode_decode_stream_round_trips_messages() {
         let messages = from_iter([TestMessage {
             value: "hello".to_owned(),
         }]);
-        let encoded = encode(messages);
-        let mut decoded = decode::<TestMessage>(encoded);
+        let encoded = encode(messages, Prost);
+        let mut decoded = decode::<TestMessage, _>(to_bytes(encoded), Prost);
 
         assert_eq!(
             decoded.next().await.expect("stream should yield").unwrap(),
@@ -250,13 +285,17 @@ mod tests {
         let bad = TestMessage {
             value: "bad".to_owned(),
         };
-        let mut decoded = decode_validated::<TestMessage, _>(encode(messages), move |body| {
-            if body == prost::Message::encode_to_vec(&bad) {
-                Err(Status::invalid_argument("bad value"))
-            } else {
-                Ok(())
-            }
-        });
+        let mut decoded = decode_validated::<TestMessage, _, _>(
+            to_bytes(encode(messages, Prost)),
+            Prost,
+            move |body| {
+                if body == prost::Message::encode_to_vec(&bad) {
+                    Err(Status::invalid_argument("bad value"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
 
         assert_eq!(
             decoded.next().await.expect("first message").unwrap().value,
@@ -289,7 +328,7 @@ mod tests {
                 Ok(())
             }
         });
-        let mut encoded = encode_checked(messages, Some(check));
+        let mut encoded = encode_checked(messages, Prost, Some(check));
 
         assert_eq!(
             encoded.next().await.expect("first message").unwrap(),

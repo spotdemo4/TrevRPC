@@ -102,7 +102,7 @@ async fn metrics_record_each_call_by_method_and_status() -> TestResult {
         "/other.Service/Missing",
     ] {
         let _ = server
-            .handle_request(RpcRequest::new(path), b"hi".to_vec())
+            .handle_request(RpcRequest::new(path), trevrpc::Bytes::from_static(b"hi"))
             .await;
     }
     provider.force_flush()?;
@@ -233,7 +233,7 @@ async fn an_untrusted_client_span_is_linked() -> TestResult {
     server
         .handle_request(
             request("/example.Greeter/SayHello", remote_parent()),
-            Vec::new(),
+            trevrpc::Bytes::new(),
         )
         .await?;
 
@@ -285,7 +285,7 @@ async fn a_trusted_client_span_is_the_parent() -> TestResult {
     let Err(status) = server
         .handle_request(
             request("/example.Greeter/Fail", remote_parent()),
-            Vec::new(),
+            trevrpc::Bytes::new(),
         )
         .await
     else {
@@ -317,13 +317,13 @@ async fn a_server_error_records_its_cause_on_the_span() -> TestResult {
     server
         .handle_request(
             request("/example.Greeter/SayHello", Metadata::new()),
-            Vec::new(),
+            trevrpc::Bytes::new(),
         )
         .await?;
     let Err(status) = server
         .handle_request(
             request("/example.Greeter/Fail", Metadata::new()),
-            Vec::new(),
+            trevrpc::Bytes::new(),
         )
         .await
     else {
@@ -376,7 +376,7 @@ async fn a_propagating_client_continues_its_trace_on_a_trusting_server() -> Test
     server
         .handle_request(
             request("/example.Greeter/SayHello", options.metadata().clone()),
-            Vec::new(),
+            trevrpc::Bytes::new(),
         )
         .await?;
     provider.force_flush()?;

@@ -60,12 +60,49 @@ fn validated_methods_check_requests_that_carry_rules() {
     assert!(content.contains("let validator = &*TREVRPC_VALIDATOR;"));
     assert!(content.contains("validator.message(\"example.validated.Request\")"));
     assert!(content.contains("validator.message(\"example.validated.Wrapper\")"));
-    assert!(registration(&content, "UNARY").contains("validate.validate(&body)?;"));
-    assert!(registration(&content, "SERVER_STREAM").contains("validate.validate(&body)?;"));
+    for (path, request) in [("UNARY", "Request"), ("SERVER_STREAM", "Wrapper")] {
+        let route = registration(&content, path);
+        assert!(
+            route.contains(&format!(
+                "::trevrpc::codec::decode_validated::<{request}>(&::trevrpc::codec::Prost, body, |body| validate.validate(body))?;"
+            )),
+            "{route}"
+        );
+    }
     for path in ["CLIENT_STREAM", "BIDI"] {
         assert!(registration(&content, path).contains(
-            "::trevrpc::stream::decode_validated::<Request, _>(request_stream, move |body| validate.validate(body))"
+            "::trevrpc::stream::decode_validated::<Request, _, _>(request_stream, ::trevrpc::codec::Prost, move |body| validate.validate(body))"
         ));
+    }
+    let unchecked = registration(&content, "UNCHECKED");
+    assert!(
+        !unchecked.contains("validator.message") && !unchecked.contains("validate.validate"),
+        "{unchecked}"
+    );
+}
+
+/// With buffa views, the validated routes decode request views and still check their bodies.
+#[test]
+fn validated_buffa_view_methods_check_requests_that_carry_rules() {
+    let content = generate("validate=true,codec=buffa,views=true");
+
+    for (path, request) in [("UNARY", "Request"), ("SERVER_STREAM", "Wrapper")] {
+        let route = registration(&content, path);
+        assert!(
+            route.contains(&format!(
+                "::trevrpc::codec::decode_validated::<::trevrpc::codec::BuffaViewHandle<{request}>>(&::trevrpc::codec::BuffaView::<{request}>::new(), body, |body| validate.validate(body))?;"
+            )),
+            "{route}"
+        );
+    }
+    for path in ["CLIENT_STREAM", "BIDI"] {
+        let route = registration(&content, path);
+        assert!(
+            route.contains(
+                "::trevrpc::stream::decode_validated::<::trevrpc::codec::BuffaViewHandle<Request>, _, _>(request_stream, ::trevrpc::codec::BuffaView::<Request>::new(), move |body| validate.validate(body))"
+            ),
+            "{route}"
+        );
     }
     let unchecked = registration(&content, "UNCHECKED");
     assert!(

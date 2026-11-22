@@ -28,6 +28,8 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+#[cfg(test)]
+mod buffa_tests;
 mod client;
 mod connect;
 mod proto;

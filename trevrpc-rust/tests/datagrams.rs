@@ -55,7 +55,9 @@ fn register_routes(server: &mut Server) {
                 for (key, value) in trailers {
                     context.set_response_metadata(&key, value)?;
                 }
-                Ok(trevrpc::stream::from_iter(messages))
+                Ok(trevrpc::stream::from_iter(
+                    messages.into_iter().map(Vec::from),
+                ))
             },
         );
     }
@@ -64,7 +66,8 @@ fn register_routes(server: &mut Server) {
         RpcKind::BidirectionalStreaming,
         RouteOptions::new().with_unreliable(Unreliable::BOTH),
         |_context, _body, requests| async move {
-            let echoes: trevrpc::BoxStream<Vec<u8>> = Box::pin(requests);
+            let echoes: trevrpc::BoxStream<Vec<u8>> =
+                Box::pin(requests.map(|body| body.map(Vec::from)));
             Ok(echoes)
         },
     );

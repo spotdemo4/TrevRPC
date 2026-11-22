@@ -410,7 +410,7 @@ pub fn start_request_pump<R>(
     input_kind: RequestInputKind,
     max_frame_size: usize,
     budget: RequestBudget,
-) -> (BoxStream<Vec<u8>>, RequestPump)
+) -> (BoxStream<Bytes>, RequestPump)
 where
     R: RequestPumpReader,
 {
@@ -445,7 +445,7 @@ async fn run_request_pump<R>(
     input_kind: RequestInputKind,
     max_frame_size: usize,
     budget: RequestBudget,
-    body_tx: queue::Sender<Result<Vec<u8>>>,
+    body_tx: queue::Sender<Result<Bytes>>,
     state_tx: watch::Sender<RequestPumpState>,
     mut settle_rx: latest::Receiver<Option<RequestPumpSettle>>,
 ) -> RequestPumpOutcome
@@ -528,7 +528,7 @@ async fn run_streaming_pump<R>(
     reader: &mut PumpReaderGuard<R>,
     max_frame_size: usize,
     mut budget: RequestBudget,
-    body_tx: &queue::Sender<Result<Vec<u8>>>,
+    body_tx: &queue::Sender<Result<Bytes>>,
     state_tx: &watch::Sender<RequestPumpState>,
     settle_rx: &mut latest::Receiver<Option<RequestPumpSettle>>,
 ) -> RequestPumpOutcome
@@ -598,7 +598,7 @@ where
                     return fail_and_wait(reader, failure, state_tx, settle_rx, Some(permit)).await;
                 }
                 let size = body.len();
-                permit.send(Ok(Vec::from(body)), size);
+                permit.send(Ok(body), size);
             }
             Ok(None) => {
                 if let Err(error) = reader.reader().validate_transport_end().await {
@@ -627,7 +627,7 @@ async fn fail_and_wait<R>(
     failure: RequestPumpFailure,
     state_tx: &watch::Sender<RequestPumpState>,
     settle_rx: &mut latest::Receiver<Option<RequestPumpSettle>>,
-    permit: Option<queue::Permit<'_, Result<Vec<u8>>>>,
+    permit: Option<queue::Permit<'_, Result<Bytes>>>,
 ) -> RequestPumpOutcome
 where
     R: RequestPumpReader,
@@ -750,7 +750,7 @@ mod tests {
         reader: R,
         kind: RequestInputKind,
         max_frame_size: usize,
-    ) -> (crate::BoxStream<Vec<u8>>, super::RequestPump) {
+    ) -> (crate::BoxStream<bytes::Bytes>, super::RequestPump) {
         start_pump(reader, kind, max_frame_size, RequestBudget::new(None, None))
     }
 
@@ -1007,7 +1007,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(io.reads.load(Ordering::SeqCst), queued.len());
-        assert_eq!(body.next().await.unwrap().unwrap(), b"queued");
+        assert_eq!(body.next().await.unwrap().unwrap(), &b"queued"[..]);
         wait_for(&io.reads, queued.len() + extra.len()).await;
 
         drop(pump);
@@ -1057,7 +1057,7 @@ mod tests {
             failure.cancellation_source(),
             Some(crate::server::CancellationSource::PeerReset)
         );
-        assert_eq!(body.next().await.unwrap().unwrap(), b"queued");
+        assert_eq!(body.next().await.unwrap().unwrap(), &b"queued"[..]);
         let _ = pump.settle(RequestPumpSettle::ResponseStopped).await;
         assert_eq!(io.stops.load(Ordering::SeqCst), 0);
     }
@@ -1296,7 +1296,7 @@ mod tests {
         .expect("the request should end cleanly");
     }
 
-    async fn collect_bodies(body: &mut crate::BoxStream<Vec<u8>>) -> Vec<Vec<u8>> {
+    async fn collect_bodies(body: &mut crate::BoxStream<bytes::Bytes>) -> Vec<bytes::Bytes> {
         let mut bodies = Vec::new();
         while let Some(item) = body.next().await {
             bodies.push(item.expect("request body should not fail"));
@@ -1365,7 +1365,7 @@ mod tests {
             RequestBudget::new(None, Some(100)),
         );
 
-        assert_eq!(body.next().await.unwrap().unwrap(), [1; 20]);
+        assert_eq!(body.next().await.unwrap().unwrap(), &[1_u8; 20][..]);
         let failure = pump.failure().await;
         assert_eq!(failure.status().code(), Code::ResourceExhausted);
         let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
@@ -1583,7 +1583,7 @@ mod tests {
         budget.datagrams = announced.clone();
         let (mut body, pump) = start_pump(io.reader, streaming(), 1024, budget);
 
-        assert_eq!(body.next().await.unwrap().unwrap(), b"m");
+        assert_eq!(body.next().await.unwrap().unwrap(), &b"m"[..]);
         // The count is recorded before the bodies end.
         assert!(body.next().await.is_none());
         assert_eq!(announced.get(), Some(2));

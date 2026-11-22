@@ -19,12 +19,12 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use futures_core::Stream;
-use prost::Message;
 
 use super::{
     BidirectionalCall, CallOptions, ClientStreamingCall, MessageTypes, RequestCheck,
     ResponseStream, RpcTransport, StreamingRpcTransport,
 };
+use crate::codec::{Decode, Encode, EncodeError, Prost};
 use crate::{BoxStream, CompressMessages, CompressStream, ResponseEnvelope, Result, Unreliable};
 
 /// The future of an awaited [`Call`].
@@ -171,34 +171,38 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
 }
 
 /// The shape of a unary call: awaiting it returns the response message.
-pub struct Unary<Req, Res> {
-    /// The encoded request message.
-    body: Vec<u8>,
+pub struct Unary<Req, Res, C = Prost> {
+    /// The encoded request message, or why it could not be encoded.
+    body: std::result::Result<Vec<u8>, EncodeError>,
+    codec: C,
     messages: PhantomData<fn(Req) -> Res>,
 }
 
 /// The shape of a server-streaming call: awaiting it returns the response stream.
-pub struct ServerStreaming<Req, Res> {
-    /// The encoded request message.
-    body: Vec<u8>,
+pub struct ServerStreaming<Req, Res, C = Prost> {
+    /// The encoded request message, or why it could not be encoded.
+    body: std::result::Result<Vec<u8>, EncodeError>,
+    codec: C,
     messages: PhantomData<fn(Req) -> Res>,
 }
 
 /// The shape of a client-streaming call: awaiting it returns a [`ClientStreamingCall`] to send
 /// the requests on.
-pub struct ClientStreaming<Req, Res> {
+pub struct ClientStreaming<Req, Res, C = Prost> {
+    codec: C,
     messages: PhantomData<fn(Req) -> Res>,
 }
 
 /// The shape of a bidirectional-streaming call: awaiting it returns a [`BidirectionalCall`].
-pub struct BidirectionalStreaming<Req, Res> {
+pub struct BidirectionalStreaming<Req, Res, C = Prost> {
+    codec: C,
     messages: PhantomData<fn(Req) -> Res>,
 }
 
 /// The shape of a call that sends an existing stream of requests; see [`Call::send_all`].
 pub struct SendAll<S: StreamsRequests> {
     requests: BoxStream<S::Request>,
-    shape: PhantomData<S>,
+    shape: S,
 }
 
 /// The shape of a call that also returns the response headers and trailing metadata; see
@@ -211,73 +215,81 @@ pub trait StreamsRequests: sealed::Sealed {
     type Request;
 }
 
-impl<Req, Res> StreamsRequests for ClientStreaming<Req, Res> {
+impl<Req, Res, C> StreamsRequests for ClientStreaming<Req, Res, C> {
     type Request = Req;
 }
 
-impl<Req, Res> StreamsRequests for BidirectionalStreaming<Req, Res> {
+impl<Req, Res, C> StreamsRequests for BidirectionalStreaming<Req, Res, C> {
     type Request = Req;
 }
 
 mod sealed {
     pub trait Sealed {}
 
-    impl<Req, Res> Sealed for super::ClientStreaming<Req, Res> {}
-    impl<Req, Res> Sealed for super::BidirectionalStreaming<Req, Res> {}
+    impl<Req, Res, C> Sealed for super::ClientStreaming<Req, Res, C> {}
+    impl<Req, Res, C> Sealed for super::BidirectionalStreaming<Req, Res, C> {}
 }
 
-/// Prepares a unary call of `method`, the path `/package.Service/Method`, made with `options`.
-/// The request is encoded at once.
-pub fn unary<'a, T, Req, Res>(
+/// Prepares a unary call of `method`, the path `/package.Service/Method`, made with `options`,
+/// whose messages `codec` encodes and decodes. The request is encoded at once; a request that
+/// cannot be encoded fails the call when it is awaited.
+pub fn unary<'a, T, Req, Res, C>(
     transport: &'a T,
     method: &'a str,
     request: &Req,
     options: CallOptions,
-) -> Call<'a, T, Unary<Req, Res>>
+    codec: C,
+) -> Call<'a, T, Unary<Req, Res, C>>
 where
     T: ?Sized,
-    Req: Message,
+    C: Encode<Req>,
 {
     Call::new(
         transport,
         method,
         options,
         Unary {
-            body: request.encode_to_vec(),
+            body: codec.encode(request),
+            codec,
             messages: PhantomData,
         },
     )
 }
 
-/// Prepares a server-streaming call of `method`, made with `options`. The request is encoded at
-/// once.
-pub fn server_streaming<'a, T, Req, Res>(
+/// Prepares a server-streaming call of `method`, made with `options`, whose messages `codec`
+/// encodes and decodes. The request is encoded at once; a request that cannot be encoded fails
+/// the call when it is awaited.
+pub fn server_streaming<'a, T, Req, Res, C>(
     transport: &'a T,
     method: &'a str,
     request: &Req,
     options: CallOptions,
-) -> Call<'a, T, ServerStreaming<Req, Res>>
+    codec: C,
+) -> Call<'a, T, ServerStreaming<Req, Res, C>>
 where
     T: ?Sized,
-    Req: Message,
+    C: Encode<Req>,
 {
     Call::new(
         transport,
         method,
         options,
         ServerStreaming {
-            body: request.encode_to_vec(),
+            body: codec.encode(request),
+            codec,
             messages: PhantomData,
         },
     )
 }
 
-/// Prepares a client-streaming call of `method`, made with `options`.
-pub const fn client_streaming<'a, T, Req, Res>(
+/// Prepares a client-streaming call of `method`, made with `options`, whose messages `codec`
+/// encodes and decodes.
+pub const fn client_streaming<'a, T, Req, Res, C>(
     transport: &'a T,
     method: &'a str,
     options: CallOptions,
-) -> Call<'a, T, ClientStreaming<Req, Res>>
+    codec: C,
+) -> Call<'a, T, ClientStreaming<Req, Res, C>>
 where
     T: ?Sized,
 {
@@ -286,17 +298,20 @@ where
         method,
         options,
         ClientStreaming {
+            codec,
             messages: PhantomData,
         },
     )
 }
 
-/// Prepares a bidirectional-streaming call of `method`, made with `options`.
-pub const fn bidirectional_streaming<'a, T, Req, Res>(
+/// Prepares a bidirectional-streaming call of `method`, made with `options`, whose messages
+/// `codec` encodes and decodes.
+pub const fn bidirectional_streaming<'a, T, Req, Res, C>(
     transport: &'a T,
     method: &'a str,
     options: CallOptions,
-) -> Call<'a, T, BidirectionalStreaming<Req, Res>>
+    codec: C,
+) -> Call<'a, T, BidirectionalStreaming<Req, Res, C>>
 where
     T: ?Sized,
 {
@@ -305,14 +320,15 @@ where
         method,
         options,
         BidirectionalStreaming {
+            codec,
             messages: PhantomData,
         },
     )
 }
 
-impl<'a, T: ?Sized, Req, Res> Call<'a, T, Unary<Req, Res>> {
+impl<'a, T: ?Sized, Req, Res, C> Call<'a, T, Unary<Req, Res, C>> {
     /// Makes the call return the response headers and trailing metadata with the message.
-    pub fn with_response(self) -> Call<'a, T, WithResponse<Unary<Req, Res>>> {
+    pub fn with_response(self) -> Call<'a, T, WithResponse<Unary<Req, Res, C>>> {
         self.reshape(WithResponse)
     }
 }
@@ -326,24 +342,30 @@ impl<'a, T: ?Sized, S: StreamsRequests> Call<'a, T, S> {
     where
         R: Stream<Item = Result<S::Request>> + Send + 'static,
     {
-        self.reshape(|_| SendAll {
+        self.reshape(|shape| SendAll {
             requests: Box::pin(requests),
-            shape: PhantomData,
+            shape,
         })
     }
 }
 
-impl<'a, T: ?Sized, Req, Res> Call<'a, T, SendAll<ClientStreaming<Req, Res>>> {
+/// A client-streaming call that sends an existing stream of requests and also returns the response
+/// headers and trailing metadata.
+type ClientStreamingSendAllWithResponse<Req, Res, C> =
+    WithResponse<SendAll<ClientStreaming<Req, Res, C>>>;
+
+impl<'a, T: ?Sized, Req, Res, C> Call<'a, T, SendAll<ClientStreaming<Req, Res, C>>> {
     /// Makes the call return the response headers and trailing metadata with the message.
-    pub fn with_response(self) -> Call<'a, T, WithResponse<SendAll<ClientStreaming<Req, Res>>>> {
+    pub fn with_response(self) -> Call<'a, T, ClientStreamingSendAllWithResponse<Req, Res, C>> {
         self.reshape(WithResponse)
     }
 }
 
-impl<'a, T, Req, Res> IntoFuture for Call<'a, T, Unary<Req, Res>>
+impl<'a, T, Req, Res, C> IntoFuture for Call<'a, T, Unary<Req, Res, C>>
 where
     T: RpcTransport + ?Sized,
-    Res: Message + Default + 'a,
+    Res: 'a,
+    C: Decode<Res>,
 {
     type Output = Result<Res>;
     type IntoFuture = CallFuture<'a, Res>;
@@ -355,15 +377,16 @@ where
             options,
             shape,
         } = self.into_parts();
-        let response = super::unary_response(transport, method, shape.body, options);
+        let response = super::unary_response(transport, method, shape.body, options, shape.codec);
         Box::pin(async move { Ok(response.await?.into_parts().0) })
     }
 }
 
-impl<'a, T, Req, Res> IntoFuture for Call<'a, T, WithResponse<Unary<Req, Res>>>
+impl<'a, T, Req, Res, C> IntoFuture for Call<'a, T, WithResponse<Unary<Req, Res, C>>>
 where
     T: RpcTransport + ?Sized,
-    Res: Message + Default + 'a,
+    Res: 'a,
+    C: Decode<Res>,
 {
     type Output = Result<ResponseEnvelope<Res>>;
     type IntoFuture = CallFuture<'a, ResponseEnvelope<Res>>;
@@ -373,24 +396,26 @@ where
             transport,
             method,
             options,
-            shape,
+            shape: WithResponse(shape),
         } = self.into_parts();
         Box::pin(super::unary_response(
             transport,
             method,
-            shape.0.body,
+            shape.body,
             options,
+            shape.codec,
         ))
     }
 }
 
-impl<'a, T, Req, Res> IntoFuture for Call<'a, T, ServerStreaming<Req, Res>>
+impl<'a, T, Req, Res, C> IntoFuture for Call<'a, T, ServerStreaming<Req, Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Res: Message + Default + Send + 'static,
+    Res: Send + 'static,
+    C: Decode<Res>,
 {
-    type Output = Result<ResponseStream<Res>>;
-    type IntoFuture = CallFuture<'a, ResponseStream<Res>>;
+    type Output = Result<ResponseStream<Res, C>>;
+    type IntoFuture = CallFuture<'a, ResponseStream<Res, C>>;
 
     fn into_future(self) -> Self::IntoFuture {
         let Parts {
@@ -400,36 +425,47 @@ where
             shape,
         } = self.into_parts();
         Box::pin(super::start_server_streaming(
-            transport, method, shape.body, options,
+            transport,
+            method,
+            shape.body,
+            options,
+            shape.codec,
         ))
     }
 }
 
-impl<'a, T, Req, Res> IntoFuture for Call<'a, T, ClientStreaming<Req, Res>>
+impl<'a, T, Req, Res, C> IntoFuture for Call<'a, T, ClientStreaming<Req, Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
-    type Output = Result<ClientStreamingCall<Req, Res>>;
-    type IntoFuture = CallFuture<'a, ClientStreamingCall<Req, Res>>;
+    type Output = Result<ClientStreamingCall<Req, Res, C>>;
+    type IntoFuture = CallFuture<'a, ClientStreamingCall<Req, Res, C>>;
 
     fn into_future(self) -> Self::IntoFuture {
         let Parts {
             transport,
             method,
             options,
-            ..
+            shape,
         } = self.into_parts();
-        Box::pin(super::start_client_streaming(transport, method, options))
+        Box::pin(super::start_client_streaming(
+            transport,
+            method,
+            options,
+            shape.codec,
+        ))
     }
 }
 
-impl<'a, T, Req, Res> IntoFuture for Call<'a, T, SendAll<ClientStreaming<Req, Res>>>
+impl<'a, T, Req, Res, C> IntoFuture for Call<'a, T, SendAll<ClientStreaming<Req, Res, C>>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
     type Output = Result<Res>;
     type IntoFuture = CallFuture<'a, Res>;
@@ -441,16 +477,23 @@ where
             options,
             shape,
         } = self.into_parts();
-        let response = super::client_streaming_send_all(transport, method, shape.requests, options);
+        let response = super::client_streaming_send_all(
+            transport,
+            method,
+            shape.requests,
+            options,
+            shape.shape.codec,
+        );
         Box::pin(async move { Ok(response.await?.into_parts().0) })
     }
 }
 
-impl<'a, T, Req, Res> IntoFuture for Call<'a, T, WithResponse<SendAll<ClientStreaming<Req, Res>>>>
+impl<'a, T, Req, Res, C> IntoFuture for Call<'a, T, ClientStreamingSendAllWithResponse<Req, Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
     type Output = Result<ResponseEnvelope<Res>>;
     type IntoFuture = CallFuture<'a, ResponseEnvelope<Res>>;
@@ -460,47 +503,53 @@ where
             transport,
             method,
             options,
-            shape,
+            shape: WithResponse(shape),
         } = self.into_parts();
         Box::pin(super::client_streaming_send_all(
             transport,
             method,
-            shape.0.requests,
+            shape.requests,
             options,
+            shape.shape.codec,
         ))
     }
 }
 
-impl<'a, T, Req, Res> IntoFuture for Call<'a, T, BidirectionalStreaming<Req, Res>>
+impl<'a, T, Req, Res, C> IntoFuture for Call<'a, T, BidirectionalStreaming<Req, Res, C>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
-    type Output = Result<BidirectionalCall<Req, Res>>;
-    type IntoFuture = CallFuture<'a, BidirectionalCall<Req, Res>>;
+    type Output = Result<BidirectionalCall<Req, Res, C>>;
+    type IntoFuture = CallFuture<'a, BidirectionalCall<Req, Res, C>>;
 
     fn into_future(self) -> Self::IntoFuture {
         let Parts {
             transport,
             method,
             options,
-            ..
+            shape,
         } = self.into_parts();
         Box::pin(super::start_bidirectional_streaming(
-            transport, method, options,
+            transport,
+            method,
+            options,
+            shape.codec,
         ))
     }
 }
 
-impl<'a, T, Req, Res> IntoFuture for Call<'a, T, SendAll<BidirectionalStreaming<Req, Res>>>
+impl<'a, T, Req, Res, C> IntoFuture for Call<'a, T, SendAll<BidirectionalStreaming<Req, Res, C>>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Encode<Req> + Decode<Res>,
 {
-    type Output = Result<ResponseStream<Res>>;
-    type IntoFuture = CallFuture<'a, ResponseStream<Res>>;
+    type Output = Result<ResponseStream<Res, C>>;
+    type IntoFuture = CallFuture<'a, ResponseStream<Res, C>>;
 
     fn into_future(self) -> Self::IntoFuture {
         let Parts {
@@ -514,6 +563,7 @@ where
             method,
             shape.requests,
             options,
+            shape.shape.codec,
         ))
     }
 }
@@ -526,6 +576,7 @@ mod tests {
 
     use super::{CallOptions, bidirectional_streaming, unary};
     use crate::client::{CallInfo, MessageTypes, RpcTransport, StreamingRpcTransport};
+    use crate::codec::Prost;
     use crate::{
         BoxStream, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status, Unreliable,
     };
@@ -607,7 +658,7 @@ mod tests {
             value: "hi".to_owned(),
         };
 
-        let reply: Echo = unary(&transport, "/test.Echo/Say", &request, defaults)
+        let reply: Echo = unary(&transport, "/test.Echo/Say", &request, defaults, Prost)
             .metadata("trace", "1")
             .timeout(std::time::Duration::from_secs(5))
             .await
@@ -634,11 +685,15 @@ mod tests {
                 Unreliable::REQUESTS,
             ),
         ] {
-            let _call =
-                bidirectional_streaming::<_, Echo, Echo>(&transport, "/test.Echo/Chat", options)
-                    .default_unreliable(Unreliable::BOTH)
-                    .await
-                    .expect("the call should open");
+            let _call = bidirectional_streaming::<_, Echo, Echo, _>(
+                &transport,
+                "/test.Echo/Chat",
+                options,
+                Prost,
+            )
+            .default_unreliable(Unreliable::BOTH)
+            .await
+            .expect("the call should open");
             assert_eq!(transport.last().1.unreliable, expected);
         }
     }
@@ -649,19 +704,26 @@ mod tests {
         let request = Echo {
             value: "hi".to_owned(),
         };
-        let _: Echo = unary(&transport, "/test.Echo/Say", &request, CallOptions::new())
-            .message_types("test.Echo", "test.Echo")
-            .await
-            .unwrap();
+        let _: Echo = unary(
+            &transport,
+            "/test.Echo/Say",
+            &request,
+            CallOptions::new(),
+            Prost,
+        )
+        .message_types("test.Echo", "test.Echo")
+        .await
+        .unwrap();
         assert_eq!(
             transport.last().1.message_types,
             Some(MessageTypes::new("test.Echo", "test.Echo"))
         );
 
-        let _ = bidirectional_streaming::<_, Echo, Echo>(
+        let _ = bidirectional_streaming::<_, Echo, Echo, _>(
             &transport,
             "/test.Echo/Chat",
             CallOptions::new(),
+            Prost,
         )
         .message_types("test.Echo", "test.Echo")
         .default_unreliable(Unreliable::BOTH)

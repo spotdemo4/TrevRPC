@@ -26,6 +26,8 @@ Generate the service code with `protoc-gen-trevrpc-rust`, and the messages with 
 protoc --trevrpc-rust_out=. greeter.proto
 ```
 
+To carry [`buffa`](https://github.com/anthropics/buffa) messages instead, generate the messages with `buffa`, pass the plugin `codec=buffa` (`--trevrpc-rust_opt=codec=buffa`), and enable the runtime's `buffa` feature. The generated code then uses `trevrpc::codec::Buffa` in place of the default `trevrpc::codec::Prost`. Both encode the same protobuf, so their clients and servers talk to each other and to every other TrevRPC runtime, and one server can host services of both. With `views=true` as well, handlers receive requests, and clients responses, as buffa's zero-copy view handles (`trevrpc::codec::BuffaViewHandle<M>`), which read strings, bytes and nested messages from the received message in place instead of copying them out.
+
 Serve it:
 
 ```rust
