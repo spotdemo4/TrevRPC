@@ -7,11 +7,11 @@
 # You should check this file into your source control repository.
 
 packages = [
-  { name = "erlang_h1", version = "0.13.0", build_tools = ["rebar3"], requirements = [], otp_app = "h1", source = "hex", outer_checksum = "5B270C4C737765F9DE0029037FF627746B0D12ABAE192C4B09E9451052D2DE79" },
+  { name = "erlang_h1", version = "0.13.1", build_tools = ["rebar3"], requirements = [], otp_app = "h1", source = "hex", outer_checksum = "57612D98DDC1C3E5C9AF1C6E4FC70DE4FA6AE285061A196C7379D134D020CA71" },
   { name = "erlang_ws", version = "0.5.0", build_tools = ["rebar3"], requirements = [], otp_app = "ws", source = "hex", outer_checksum = "CAD7961A5AF19C463948A77DDE525E43D55D71F709A21AE3EA929EC6E50B065F" },
-  { name = "gleam_stdlib", version = "1.0.5", build_tools = ["gleam"], requirements = [], otp_app = "gleam_stdlib", source = "hex", outer_checksum = "CEE5B6C076A85B45F60C585F4316C63EC8B7127C119D5738C3958A9C4D50404E" },
+  { name = "gleam_stdlib", version = "1.2.0", build_tools = ["gleam"], requirements = [], otp_app = "gleam_stdlib", source = "hex", outer_checksum = "93D27B978967D61211E06BB1F1062BCF36B6E546F67A575EFA928605F467AF65" },
   { name = "gleeunit", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleeunit", source = "hex", outer_checksum = "EC31ABA74256AEA531EDF8169931D775BBB384FED0A8A1BDC4DD9354E3E21826" },
-  { name = "h2", version = "0.18.0", build_tools = ["rebar3"], requirements = [], otp_app = "h2", source = "hex", outer_checksum = "11824E2963716B1DF80A1F2C6C1EB31E67BF2176931E6FBC74C362E0F872539A" },
+  { name = "h2", version = "0.18.3", build_tools = ["rebar3"], requirements = [], otp_app = "h2", source = "hex", outer_checksum = "CC53D7A6CB67DCCA975DBAAA0B41C190677E77808A6748D11810CC1D76320E0F" },
   { name = "idna", version = "8.0.0", build_tools = ["rebar3"], requirements = [], otp_app = "idna", source = "hex", outer_checksum = "E0C5CE7846F14515AF66142A55B8097D5F46D10DF9235E781F168BEF5622BCF9" },
   { name = "quic", version = "3.3.0", build_tools = ["rebar3"], requirements = ["idna"], otp_app = "quic", source = "hex", outer_checksum = "8BE3AF3C8FE9B11A60C7443C6173019264DD2147DA62759BC772CD9233E16BEC" },
   { name = "webtransport", version = "0.5.13", build_tools = ["rebar3"], requirements = ["h2", "quic"], otp_app = "webtransport", source = "hex", outer_checksum = "97C89AB850110DF2EDC000C37E880FEDC629954E12E2A3BEED7EF804B55A165B" },
