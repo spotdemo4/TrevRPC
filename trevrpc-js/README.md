@@ -1,34 +1,28 @@
 # trevrpc-js
 
-TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients, and call Go or Rust servers over WebTransport, falling back to QMux over WebSocket where WebTransport is missing or UDP is blocked.
-
-`trevrpc-js` is the **browser client**: a WebTransport runtime with a QMux over WebSocket fallback, for the messages and service descriptors that [protobuf-es](https://github.com/bufbuild/protobuf-es) generates. It has no Node.js runtime; servers are written in Go or Rust, native QUIC clients in Go or Rust, and HTTP/3 clients in Kotlin.
+The browser client for [TrevRPC](https://trev.zip/llc/TrevRPC), an RPC framework like gRPC built on QUIC instead of HTTP/2: a WebTransport runtime with a QMux over WebSocket fallback for where WebTransport is missing or UDP is blocked, for the messages and service descriptors that [protobuf-es](https://github.com/bufbuild/protobuf-es) generates. It has no Node.js runtime, and it talks to TrevRPC servers written in Go, Rust or Erlang.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, and `trevrpc-kotlin`
-> 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, `trevrpc-kotlin`
+> 1.12.0, and the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a
+> milestone for 2.0.
 
-Full documentation: https://trev.zip/llc/TrevRPC/wiki
+## Packages
 
-## Protobuf
+| Package                                                                                          | Install                                                      | Purpose                                                                      |
+| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| [`@trevrpc/trevrpc-js`](https://www.npmjs.com/package/@trevrpc/trevrpc-js)                       | `npm install @trevrpc/trevrpc-js @bufbuild/protobuf`         | Browser client runtime                                                       |
+| [`@trevrpc/protoc-gen-trevrpc-js`](https://www.npmjs.com/package/@trevrpc/protoc-gen-trevrpc-js) | `npm install --save-dev @trevrpc/protoc-gen-trevrpc-js`      | Optional `protoc` plugin: message codecs, faster than protobuf-es            |
+| [`@trevrpc/effect`](https://www.npmjs.com/package/@trevrpc/effect)                               | `npm install @trevrpc/effect effect`                         | [Effect](https://effect.website) clients whose calls are effects and streams |
+| [`@trevrpc/protovalidate`](https://www.npmjs.com/package/@trevrpc/protovalidate)                 | `npm install @trevrpc/protovalidate @bufbuild/protovalidate` | Checks requests against protovalidate rules before sending                   |
 
-```proto
-syntax = "proto3";
+The `@trevrpc/trevrpc-js/zstd` entry point provides `createCompression()` for [compressed messages](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide#compressed-messages); it loads libzstd as WebAssembly (about 85 KB gzipped), so applications without compression never load it.
 
-package example.greeter;
+The `trevrpc-js` Nix package provides the plugin: `nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js`.
 
-service Greeter {
-  rpc SayHello(HelloRequest) returns (HelloReply);
-  rpc LotsOfReplies(HelloRequest) returns (stream HelloReply);
-  rpc LotsOfGreetings(stream HelloRequest) returns (HelloReply);
-  rpc BidiHello(stream HelloRequest) returns (stream HelloReply);
-}
+## Example
 
-message HelloRequest { string name = 1; }
-message HelloReply { string message = 1; }
-```
-
-Generate the messages and the service descriptor with protobuf-es's `protoc-gen-es`, and pass the descriptor to `createClient()`. TrevRPC's own plugin, [`protoc-gen-trevrpc-js`](#message-codecs), is optional and only makes messages encode and decode faster.
+Generate the messages and the service descriptor for a service with `protoc-gen-es`:
 
 ```sh
 npm install @trevrpc/trevrpc-js @bufbuild/protobuf
@@ -39,55 +33,7 @@ protoc \
   greeter.proto
 ```
 
-This writes `greeter_pb.ts` with `HelloRequestSchema`, `HelloReplySchema` and the `Greeter` service descriptor ([`buf generate`](https://buf.build/docs/generate/overview/) with the `buf.build/bufbuild/es` plugin works the same). `@bufbuild/protobuf` is a peer dependency, so the generated code and the client share one copy.
-
-### Messages
-
-Messages are protobuf-es messages; see its [manual](https://github.com/bufbuild/protobuf-es/blob/main/MANUAL.md) for the details. Requests take a message or the init object `create()` takes, in which every field may be left out; calls return and streams yield messages, in which scalars, repeated fields and maps always have a value and message fields are `undefined` when unset. Oneofs are `{ case, value }`, 64-bit integers are `bigint` (or `string` with `[jstype = JS_STRING]`), `google.protobuf.Struct` is a JSON object, and `@bufbuild/protobuf/wkt` has helpers for the well-known types, such as `timestampFromDate` and `timestampDate`.
-
-```ts
-import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
-
-import { Metrics, TimeInterval } from "./gen/metrics_pb.js";
-
-const metrics = createClient(Metrics, channel);
-const sample = await metrics.get({
-  interval: TimeInterval.HOUR,
-  at: timestampFromDate(new Date()),
-});
-sample.count; // bigint, never undefined
-const at = sample.at && timestampDate(sample.at);
-```
-
-`JSON.stringify` throws on a `bigint`; use protobuf-es's `toJson()` or `toJsonString()` to serialize a message.
-
-### Message codecs
-
-[`@trevrpc/protoc-gen-trevrpc-js`](protoc-gen-trevrpc-js) runs after `protoc-gen-es` and writes `greeter_trevrpc.ts` next to `greeter_pb.ts`, with a codec for each message and the codecs of each service, which `createClient()` takes as its `codecs` option:
-
-```sh
-npm install --save-dev @trevrpc/protoc-gen-trevrpc-js
-protoc \
-  --plugin=protoc-gen-es=node_modules/.bin/protoc-gen-es \
-  --es_out=src/gen --es_opt=target=ts \
-  --plugin=protoc-gen-trevrpc-js=node_modules/.bin/protoc-gen-trevrpc-js \
-  --trevrpc-js_out=src/gen --trevrpc-js_opt=target=ts \
-  greeter.proto
-```
-
-```ts
-import { GreeterCodecs } from "./gen/greeter_trevrpc.js";
-
-const client = createClient(Greeter, channel, { codecs: GreeterCodecs });
-```
-
-A codec encodes and decodes the same messages, to the same bytes, as protobuf-es, and fails where protobuf-es fails, with its error; it does so with code written for its message type instead of protobuf-es's generic one. Decoding differs on two kinds of malformed input: a known field sent with another wire type is kept in `$unknown`, as the Go and Rust runtimes keep it, where `fromBinary` reads it as its declared type anyway; and a nested message whose last field runs past its length makes the codec fail and fall back to `fromBinary`, which accepts it, so such input is decoded twice. Types without a codec use protobuf-es, as do messages that protobuf-es represents specially (see the plugin's [README](protoc-gen-trevrpc-js#readme)). A codec's `encode(message)` and `decode(bytes)` run it directly, like `toBinary` and `fromBinary`.
-
-### Method options
-
-`createClient()` reads the `trevrpc.method` option of each method (from [`trevrpc/options.proto`](https://trev.zip/llc/TrevRPC/wiki/Getting-Started#schema-options)) from the descriptor, which protoc-gen-es keeps: `unreliable_requests` and `unreliable_responses` mark directions whose messages may travel as WebTransport datagrams ([Datagram Messages](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#datagram-messages)), and `compression` lets messages be compressed without a dictionary or a stream be compressed ([Compression](#compression)). A direction that sent datagrams ends with a DATAGRAM_COUNT frame, which says how many, so that the last datagrams are not lost to the end of the stream: the client writes it right before it ends the request stream, and a call whose server announced more response datagrams than have arrived waits for them, for at most 10 ms (and not past a cancellation or the deadline), before it reports the end of the responses and the final status. An option the method's kind cannot use, such as `unreliable_requests` on a unary method or `COMPRESSION_STREAM` on one that streams nothing, makes `createClient()` throw `InvalidArgument`. Message types with a field marked `debug_redact` are never compressed that way.
-
-## Client
+Connect and call it:
 
 ```js
 import { connect, createClient } from "@trevrpc/trevrpc-js";
@@ -97,244 +43,15 @@ import { Greeter } from "./gen/greeter_pb.js";
 const channel = await connect("https://example.com:4433/trevrpc");
 const client = createClient(Greeter, channel, { timeoutMs: 5_000 });
 
-// Unary
 const reply = await client.sayHello({ name: "TrevRPC" });
-
-// Server streaming
-const replies = await client.lotsOfReplies({ name: "TrevRPC" });
-for await (const reply of replies) console.log(reply.message);
-
-// Client streaming
-const upload = await client.lotsOfGreetings();
-await upload.send({ name: "Alice" });
-await upload.send({ name: "Bob" });
-const summary = await upload.closeAndRecv();
-
-// Client streaming from an iterable or async iterable
-const batch = await client.lotsOfGreetings();
-await batch.sendAll([{ name: "Alice" }, { name: "Bob" }]);
-const batchSummary = await batch.closeAndRecv();
-
-// Bidirectional streaming
-const chat = await client.bidiHello();
-await chat.send({ name: "Alice" });
-console.log(await chat.recv());
-await chat.closeSend();
-for await (const reply of chat) console.log(reply.message);
+console.log(reply.message);
 
 channel.close();
 ```
 
-### Call options
+## Documentation
 
-A client has one function per method, named by the method's `localName` (`SayHello` is `sayHello`). Every method takes `CallOptions` as its last argument; the same options can be given to `createClient()` as defaults, and per-call `metadata` is merged over the defaults per key. `createClient()` also takes `interceptors` ([below](#interceptors)), `validator` ([below](#request-validation)) and `codecs` ([above](#message-codecs)).
-
-| Option               | Meaning                                                                                       |
-| -------------------- | --------------------------------------------------------------------------------------------- |
-| `timeoutMs`          | Deadline for the whole call, from the request to the final status. Also sent to the server.   |
-| `signal`             | `AbortSignal` that cancels the call.                                                          |
-| `metadata`           | Request metadata (`{ key: "value" }` or a `Map`); keys are lowercase, `trevrpc-` is reserved. |
-| `maxFrameSize`       | Largest frame accepted or sent in bytes (default 4 MiB).                                      |
-| `onResponseHeaders`  | Called with the response headers.                                                             |
-| `onResponseMetadata` | Called with the trailing metadata of a successful call.                                       |
-
-The client enforces no other response limits: there is no cap on the number of streamed
-messages, their total size, or idle time between them. Use `timeoutMs` or `signal` to bound a
-call.
-
-### Errors, cancellation and streams
-
-- Failed calls throw `TrevRpcError` with a `code` (`Code.NotFound`, ...), `statusMessage` and `metadata`. A deadline surfaces as `Code.DeadlineExceeded`, a cancelled call as `Code.Cancelled` (with the abort reason as `cause`), and a lost connection as `Code.Unavailable`.
-- Streaming responses end with the server's final status: iteration finishes after `OK` and throws the `TrevRpcError` otherwise. `stream.status` settles with the same outcome and carries trailing metadata. Leaving a `for await` loop early, or calling `close()`, cancels the call.
-- Response headers and trailing metadata are separate. Every call reports them to the `onResponseHeaders(headers)` and `onResponseMetadata(metadata)` callbacks of its options: the headers (empty when the server sent none) as soon as they, the first message or the final status arrive, and the trailing metadata of the final status when the call succeeds, before its result is returned or its stream ends. A failed call carries its metadata on the `TrevRpcError`, and a callback that throws fails the call. Server-streaming and bidirectional calls also have a `headers` promise that resolves as soon as the headers, the first message or the final status arrive, so headers are available before the first message, and rejects with the call's error if the call fails first.
-- Frames follow the [wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format): a type, a length and a payload, with messages sent as raw protobuf. The client skips frame types it does not know, and `maxFrameSize` limits every frame, unknown ones included. A response stream may carry one DATAGRAM_COUNT frame (type 7, one QUIC varint) right before the final status; any other known frame after it, a second one or a malformed payload fails the call with `Code.Internal`.
-- The server's response decides the outcome of a call, and a call reports it as soon as the final status arrives. If the server ends a call before the upload is done (client-streaming and bidirectional calls), the upload is cancelled and `send()` rejects at once, without waiting for the server to stop reading and whether or not the caller receives:
-  - with the server's `TrevRpcError` if its status is not OK, and the same error is the call's outcome (`closeAndRecv()`, `recv()`, `status`);
-  - with `Code.Cancelled` ("the server completed the call before the request stream ended") if its status is `OK`, for instance a server that answers after the first messages. The call itself succeeded: `closeAndRecv()` returns the response, and `recv()` and `status` end with `OK`;
-  - with the failure of the response stream, for instance `Code.Unavailable` for a lost connection, if the server stopped reading the request and the response then failed. A bare "stream closed" error from the transport is used only when the response gives no other explanation.
-
-  `send()` calls that are blocked on backpressure fail the same way, and so do all sends of a call that is cancelled or whose deadline expires. A deadline or abort that fires after the final status arrived does not change the outcome, even if the server has not finished the response stream yet.
-
-  `sendAll(requests)` sends every message of an iterable or async iterable and then closes the request stream. When the server ends the call first it stops and resolves, so `closeAndRecv()`, `recv()`, or `status` report the server's outcome instead of an upload error. Requests that throw cancel the call.
-
-- To find the final status while the caller only sends, a client-streaming or bidirectional call reads the response ahead of `recv()` while its request side is open: at most 32 frames or 1 MiB (plus one frame of at most `maxFrameSize`) are held; beyond that reading pauses and flow control applies until `recv()` takes messages. Responses read ahead are delivered in order, including before an error that ended the stream.
-
-### Rendering long streams
-
-Once response messages are buffered, `for await` hands them over without returning to the event loop: each `next()` resolves as a microtask, as with any async iterator over a `fetch` body. When the network delivers faster than the page consumes, which is always the case on localhost, a loop over a long stream runs to its end before the browser renders anything, timers fire, or input is handled. The client does not yield on its own, because a timer-based yield would slow streams in hidden tabs and add latency for consumers that do not render.
-
-A page that renders a stream should batch messages per animation frame and, after a time budget, yield with a timer so that frame can render:
-
-```js
-let batch = [];
-let frame;
-const flush = () => {
-  frame = undefined;
-  store.append(batch);
-  batch = [];
-};
-
-let sliceStart = performance.now();
-try {
-  for await (const row of stream) {
-    batch.push(row);
-    frame ??= requestAnimationFrame(flush);
-    if (performance.now() - sliceStart > 8) {
-      if (document.hidden) {
-        cancelAnimationFrame(frame);
-        flush();
-      } else {
-        await new Promise((resolve) => setTimeout(resolve));
-      }
-      sliceStart = performance.now();
-    }
-  }
-} finally {
-  if (frame !== undefined) {
-    cancelAnimationFrame(frame);
-    flush();
-  }
-}
-```
-
-- `scheduler.yield()` does not help: Chromium resumes its continuation before rendering, so every message still lands in one frame.
-- Hidden tabs run no animation frames and throttle timers to about one per second, so while `document.hidden` the loop applies the batch itself after each time budget instead of yielding. It holds at most one budget's worth of messages, and a stream in a background tab keeps its speed.
-- If the stream fails or the loop is left early, which cancels the call, the `finally` still applies the messages received before.
-
-### Connections
-
-`connect()` opens a session and resolves when it is ready; it rejects if no transport can establish one. After that the `Channel` re-establishes the session in the background with exponential backoff whenever it is lost. Calls fail fast with `Unavailable` while `channel.state` is `"reconnecting"` and are never replayed; use `await channel.waitUntilReady()` or the `onStateChange` option to follow the state. `channel.close()` stops reconnecting.
-
-`createChannel(url, options)` takes the same options but returns the channel right away, in the `"connecting"` state, so clients can be created before it is connected. Calls started while it connects wait for that first attempt, within their own deadline and signal; if it fails they fail with its error, and the channel goes on reconnecting with backoff like after a lost session. The `signal` option does not apply to it; close the channel to give up.
-
-```js
-const channel = await connect(url, {
-  signal: AbortSignal.timeout(10_000), // cancels the initial connection only
-  serverCertificateHashes: [{ algorithm: "sha-256", value: certificateSha256 }],
-  onStateChange: ({ state, attempt, error }) => console.log(state, attempt, error),
-});
-```
-
-`serverCertificateHashes` trusts a self-signed ECDSA certificate that is valid for at most 14 days by its SHA-256 hash, which is how development servers and the interop tests are reached. It applies to WebTransport only: the WebSocket fallback needs a certificate the browser trusts. `fetchServerCertificateHashes: true` fetches a development server's hashes from the server itself, at the channel URL followed by `/certificate-hashes`, which a Go or Rust server publishes when it has a development certificate (`ServerOptions.DevelopmentCertificate`, `with_development_certificate`) and answers with `Access-Control-Allow-Origin: *`, so the page needs no route or dev proxy of its own. Every WebTransport attempt fetches it, so reconnects follow a rotated certificate, and adds its hashes; a 404 adds none, so the same build works against a server with a trusted certificate. It is off by default, so enable it for development only. `serverCertificateHashesUrl` names another location instead (the two are mutually exclusive), such as a path the web server of the app serves from the `DevelopmentCertificate`. `fetchServerCertificateHashes(url)` returns the same hashes for code that builds its own options. See [Development certificates](https://trev.zip/llc/TrevRPC/wiki/WebTransport#development-certificates). `allowPooling`, `congestionControl` and `requireUnreliable` are passed to the `WebTransport` constructor.
-
-`connect()` always offers the WebTransport protocol `trevrpc-1` (wire version 1) through the `protocols` constructor option; it cannot be changed. If the server selects any other protocol, that connection attempt fails with `Code.FailedPrecondition` and the channel carries on as after any failed dial: the WebSocket fallback starts, or a reconnect is retried with backoff. An empty or missing selection means version 1, because older browsers cannot negotiate protocols.
-
-Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a client. A transport that wraps a `Channel` should forward its `createBidirectionalStreamWithSession()`, `compression`, `connectionMetadata`, `streamCompressionBudget` and `interceptors`; without them its calls carry no connection metadata, get a stream compression budget of their own, and skip the channel's interceptors. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which clients build from the service and method names.
-
-### Connection metadata
-
-Metadata every call of a channel carries, such as a bearer token, can be set once on the channel instead of on each call. The channel sends it in full on the first calls of each session, until the server confirms that it stored it for the session, and refers to it by ID after that, so it crosses the connection once. The server merges it into each call's metadata, and a call's own `metadata` wins over an entry with the same key.
-
-```js
-const channel = await connect(url, { connectionMetadata: bearerMetadata(token) });
-channel.setConnectionMetadata(bearerMetadata(refreshed)); // calls started from now on
-channel.setConnectionMetadata(); // removes it
-```
-
-`bearerMetadata(token)` returns `{ authorization: "Bearer <token>" }`, and throws a `TrevRpcError` with `Code.InvalidArgument` for a token that the servers' bearer token parsers would reject as malformed (anything but an RFC 6750 `b64token`), so that a client bug is not mistaken for an expired session. It works in a call's `metadata` too.
-
-A call carries the set that is current when it starts, once its interceptors have run, until it ends, like its own `metadata`: a change applies to calls that start after it, and a call still waiting for the channel to connect keeps the set it started with. A changed set is sent in full again on every session, and so is the set on a session after a reconnect. Keys follow the rules of call metadata. Other transports carry it when they forward a channel's `connectionMetadata`.
-
-### Interceptors
-
-Interceptors run around every call of a client, for what each call needs, such as reacting to an expired session. Set them on the channel, for every client created on it, or on a client, after the channel's:
-
-```js
-const channel = createChannel(url, {
-  interceptors: [
-    async (call) => {
-      // call.method, .service, .name, .kind, .descriptor, .timeoutMs and .signal describe the call.
-      Object.assign(call.metadata, bearerMetadata(await session.token()));
-      const started = session.id;
-      return ({ code }) => {
-        if (code === Code.Unauthenticated && session.id === started) {
-          session.clear();
-          location.assign("/sign-in");
-        }
-      };
-    },
-  ],
-});
-const client = createClient(Greeter, channel, { interceptors: [logCalls] });
-```
-
-- An interceptor runs before the call starts, in order with the others, and may wait. It may add, replace and delete entries of `call.metadata`, which is validated after the last interceptor. The call's deadline starts after the interceptors; an interceptor that waits can watch `call.signal`.
-- It may return a finish function, which is called once with `{ code, error }` when the call ends: when a unary call settles, and when a streaming call receives its final status or fails, including when it is cancelled, so nothing has to wrap a stream's iterator. `code` is `Code.Ok` on success. Finish functions run innermost first; one that throws is reported and does not affect the call. A streaming call that is neither read to its end nor closed does not end.
-- An interceptor that throws fails the call with what it threw before it starts; the finish functions of earlier interceptors still run.
-- A client-streaming call has a `status` promise too, like the other streaming calls.
-- `call.descriptor` is the method's protobuf-es `DescMethod`: an interceptor reads the options an application defines on its methods, such as a `public` option that marks the methods that need no session, with `getOption(call.descriptor, ext)` from `@bufbuild/protobuf`, instead of keeping a list of full method names.
-
-### Request validation
-
-The separate package [`@trevrpc/protovalidate`](protovalidate) checks request messages against their [`buf.validate`](https://buf.build/bufbuild/protovalidate) rules before they are sent, with [protovalidate](https://github.com/bufbuild/protovalidate-es):
-
-```js
-import { createRequestValidator } from "@trevrpc/protovalidate";
-
-const client = createClient(Greeter, channel, { validator: createRequestValidator() });
-```
-
-A request that breaks its rules fails with `Code.InvalidArgument` and a `buf.validate.Violations` detail, which `error.findDetails(ViolationsSchema)` decodes, as a Go or Rust server that validates requests reports it. The request of a unary or server-streaming call fails the call after its interceptors ran; a message passed to `send()` rejects that send, and the call goes on. Methods whose request type has no rules are not checked. The `validator` option takes any object with a `validateFunc(schema)` method that returns the check of that request type, or nothing to skip it; see `RequestValidator`.
-
-### Effect
-
-The separate package [`@trevrpc/effect`](effect) makes clients for [Effect](https://effect.website): `createEffectClient(Greeter, channel)` returns a client whose unary calls are effects, whose server-streaming calls are streams, and whose client-streaming and bidirectional calls take their requests as a stream. Interrupting an effect or stream cancels its call. `TrevRpcError` has a `_tag` of `"TrevRpcError"`, so `Effect.catchTag` matches it.
-
-### Compression
-
-Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). The codec lives in a separate entry point, `@trevrpc/trevrpc-js/zstd`, which loads libzstd as WebAssembly (about 85 KB gzipped), so applications without compression never load it:
-
-```js
-import { createCompression } from "@trevrpc/trevrpc-js/zstd";
-
-const compression = await createCompression({
-  dictionaries: [{ data: dictionaryBytes, messages: ["example.greeter.HelloRequest"] }],
-});
-const channel = await connect(url, { compression });
-```
-
-`compression` also takes the promise itself, so a channel created at module scope with `createChannel()` needs no top-level await, and the WebAssembly compiles while the first session is established:
-
-```js
-export const channel = createChannel(url, { compression: createCompression() });
-```
-
-The channel becomes ready once both are done, so calls started meanwhile wait and are compressed; `channel.compression` is undefined until then. If the promise rejects, the channel goes on without compression, as against a server that lacks the dictionaries, and reports the error as `compressionError` in its next state change to `"ready"`, or to `"closed"` if it closes first (or to `reportError()` without `onStateChange`, and once the channel is closed).
-
-Generated clients pick each message's dictionary by its protobuf type. The channel asks each new session's server which dictionaries it holds, so a message whose dictionary the server lacks travels uncompressed, and request messages are compressed once the answer arrives. A transport other than a `Channel` compresses when it has a `compression` property with these settings.
-
-Compression settings also enable stream compression, even without dictionaries (`createCompression()`): streaming methods marked `option (trevrpc.method) = {compression: COMPRESSION_STREAM}` compress each streamed direction with one zstd context per call, from its third message, so later messages compress against earlier ones. The contexts of a channel's calls may hold up to `streamCompressionMemory` bytes (64 MiB by default; 0 turns stream compression off).
-
-### WebSocket fallback
-
-`connect()` races two transports. WebTransport starts first; QMux over WebSocket (subprotocol `qmux-02.trevrpc-1`, served by Go and Rust on the server's TCP port) starts after `fallbackDelayMs` (default 300) or immediately if WebTransport fails or the browser has no `WebTransport` API. The first session to be ready wins and the other is closed. After the WebSocket wins, reconnects use it directly until `reprobeIntervalMs` (default 5 minutes) has passed since WebTransport was lost, then race again.
-
-```js
-const channel = await connect("https://example.com:4433/trevrpc", {
-  transports: ["webtransport", "websocket"], // default; the first is preferred, a single entry disables the race
-  webSocketUrl: "wss://example.com:4433/trevrpc", // default: `url` with the wss: scheme
-  fallbackDelayMs: 300,
-  reprobeIntervalMs: 5 * 60_000,
-  onStateChange: ({ state, transport }) => console.log(state, transport),
-});
-console.log(channel.transport); // "webtransport" or "websocket"
-```
-
-`channel.transport` and `ChannelStateChange.transport` (set when the channel becomes ready) report which one is in use. `WebSocket` replaces the global WebSocket constructor, like `WebTransport` does for WebTransport. The QMux client is in-tree (`src/qmux/`); WebSocket backpressure polls `bufferedAmount` against a 1 MiB limit.
-
-## Interop client
-
-`trevrpc-interop-browser` runs the cross-runtime interop scenarios from [`interop/README.md`](../interop/README.md) in a real browser over WebTransport, QMux over WebSocket, or the fallback between them. It is built from `interop/proto/interop.proto` with protoc-gen-es, so it also serves as a complete example of a client.
-
-```sh
-trevrpc-interop-browser --browser chromium|firefox|safari \
-  --url https://127.0.0.1:4433/trevrpc \
-  --cert-hash <hex sha256 of the server certificate DER> \
-  [--transport webtransport|websocket|auto] [--ws-url wss://127.0.0.1:4433/trevrpc] \
-  [--expect-transport webtransport|websocket] [--dictionary <file>]
-```
-
-It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. `--dictionary` makes the channel compress Echo messages with that zstd dictionary, the one the interop servers hold. `--scenarios <name,...>` runs only the scenarios it names, for a server that supports only some, and prints `skip <name>: <reason>` for the others. `trevrpc-interop-browser bench` runs the load benchmark in a browser instead (see [`bench/README.md`](../bench/README.md#browsers)). Chromium and Firefox are launched through Playwright from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM` and `TREVRPC_BROWSER_FIREFOX` when those name an executable, and ignore certificate errors because WSS cannot pin a certificate hash. Safari is driven through `safaridriver` (`TREVRPC_BROWSER_SAFARI` overrides its path), which needs `sudo safaridriver --enable` once; Safari cannot ignore certificate errors, so the server certificate must be trusted by the system, as `interop/run.py` does. The CLI serves the page from a loopback origin; the page fetches its input from there and posts each result back, so where the browser has no WebTransport at all every scenario fails with a clear reason. `--write-page <dir>` writes that page to a directory instead, and `--page-url <url> --cert <pem> --key <pem>` opens it from a TrevRPC server that serves the directory through its HTTP fallback; the page then reports to the CLI over HTTPS, at the origin in its `report` query parameter. `--page-protocol h2|h3` has the browser load that page over HTTP/2 or HTTP/3 and fails every scenario unless it did (`h3` in Chromium only).
+The [JavaScript guide](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide) covers generated messages and codecs, calls and streams, errors, interceptors, request validation, Effect, compression, channels, and the WebSocket fallback. The rest of the [wiki](https://trev.zip/llc/TrevRPC/wiki) covers the transports, the protocol, compression, and operations.
 
 ## Development
 
@@ -349,3 +66,21 @@ npm run interop -- --browser chromium --url ... --cert-hash ...
 `nix build .#trevrpc-js` runs the same checks and installs the library, `protoc-gen-trevrpc-js`, and the wrapped `trevrpc-interop-browser` with matching Playwright browsers. The pinned `playwright` version must equal nixpkgs' `playwright-driver`; `nix run .#sync-playwright` updates it.
 
 Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt` (frame bytes, and the frame reader against the shared byte streams), the QMux frames against `testdata/qmux-golden-vectors.txt`, framing, the `trevrpc.method` option, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.
+
+`zstd-wasm/` is a Rust crate that is not published: it builds libzstd as the WebAssembly module that `npm run build` embeds for the `@trevrpc/trevrpc-js/zstd` entry point. The Effect and protovalidate adapters and the plugin are packages of their own in `effect/`, `protovalidate/` and `protoc-gen-trevrpc-js/`.
+
+### Interop client
+
+`trevrpc-interop-browser` runs the cross-runtime interop scenarios from [`interop/README.md`](https://trev.zip/llc/TrevRPC/src/branch/main/interop/README.md) in a real browser over WebTransport, QMux over WebSocket, or the fallback between them. It is built from `interop/proto/interop.proto` with protoc-gen-es, so it also serves as a complete example of a client. `interop/run.py` runs it against every server; see [Interop Tests](https://trev.zip/llc/TrevRPC/wiki/Local-Development#interop-tests).
+
+```sh
+trevrpc-interop-browser --browser chromium|firefox|safari \
+  --url https://127.0.0.1:4433/trevrpc \
+  --cert-hash <hex sha256 of the server certificate DER> \
+  [--transport webtransport|websocket|auto] [--ws-url wss://127.0.0.1:4433/trevrpc] \
+  [--expect-transport webtransport|websocket] [--dictionary <file>]
+```
+
+It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. `--dictionary` makes the channel compress Echo messages with that zstd dictionary, the one the interop servers hold. `--scenarios <name,...>` runs only the scenarios it names, for a server that supports only some, and prints `skip <name>: <reason>` for the others. `trevrpc-interop-browser bench` runs the load benchmark in a browser instead (see [`bench/README.md`](https://trev.zip/llc/TrevRPC/src/branch/main/bench/README.md#browsers)). Chromium and Firefox are launched through Playwright from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM` and `TREVRPC_BROWSER_FIREFOX` when those name an executable, and ignore certificate errors because WSS cannot pin a certificate hash. Safari is driven through `safaridriver` (`TREVRPC_BROWSER_SAFARI` overrides its path), which needs `sudo safaridriver --enable` once; Safari cannot ignore certificate errors, so the server certificate must be trusted by the system, as `interop/run.py` does. The CLI serves the page from a loopback origin; the page fetches its input from there and posts each result back, so where the browser has no WebTransport at all every scenario fails with a clear reason. `--write-page <dir>` writes that page to a directory instead, and `--page-url <url> --cert <pem> --key <pem>` opens it from a TrevRPC server that serves the directory through its HTTP fallback; the page then reports to the CLI over HTTPS, at the origin in its `report` query parameter. `--page-protocol h2|h3` has the browser load that page over HTTP/2 or HTTP/3 and fails every scenario unless it did (`h3` in Chromium only).
+
+See [Local Development](https://trev.zip/llc/TrevRPC/wiki/Local-Development) for the repository-wide checks.

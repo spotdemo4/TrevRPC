@@ -18,7 +18,7 @@
 [![maven-central](https://shields.trev.zip/maven-central/v/zip.trev.trevrpc/core?strategy=highestVersion&logo=apachemaven&logoColor=%23bac2de&labelColor=%23313244&color=%237F52FF)](https://central.sonatype.com/search?namespace=zip.trev.trevrpc)
 [![crates.io](https://shields.trev.zip/crates/v/trevrpc?labelColor=%23313244&color=%23D34516)](https://crates.io/crates/trevrpc)
 
-Protobuf RPC over QUIC, HTTP/3 & WebTransport, with TCP fallbacks, for Go, Rust, JavaScript, and Kotlin
+Protobuf RPC over QUIC, HTTP/3 & WebTransport, with TCP fallbacks, for Go, Rust, JavaScript, Kotlin, and Erlang
 
 TrevRPC is an RPC framework like gRPC, but built on QUIC instead of HTTP/2. Write a protobuf service, generate
 typed clients and servers, and call it from native apps, browsers, and Android. Each RPC gets its own QUIC
@@ -27,8 +27,8 @@ messages as QUIC datagrams.
 
 > [!NOTE]
 > Every TrevRPC package shares one version, and packages of the same version are compatible with each other:
-> `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, and `trevrpc-kotlin` 1.12.0. Compatibility
-> across different versions isn't guaranteed yet; that's a milestone for 2.0. TrevRPC speaks its own protocol and is
+> `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, `trevrpc-kotlin` 1.12.0, and the Erlang
+> `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0. TrevRPC speaks its own protocol and is
 > not wire-compatible with gRPC, gRPC-Web, or Connect. See [current limitations](https://trev.zip/llc/TrevRPC/wiki/Current-Limitations).
 
 ## features
@@ -49,15 +49,13 @@ messages as QUIC datagrams.
   retried, and a handler never runs twice for one call
 - server limits, authorization hooks, interceptors, metrics, diagnostics, and graceful shutdown
 - a [rate-limit interceptor](https://trev.zip/llc/TrevRPC/wiki/Operations-Limits-and-Security#rate-limiting)
-  for Go ([`ratelimit`](trevrpc-go/ratelimit)) and Rust (`trevrpc::server::RateLimit`) servers, with IPv6
-  clients grouped by prefix, whose rejections carry a `google.rpc.RetryInfo` delay that every client reads
-- OpenTelemetry metrics and tracing for Go ([`oteltrevrpc`](trevrpc-go/oteltrevrpc)) and Rust
-  ([`trevrpc-opentelemetry`](trevrpc-rust/crates/trevrpc-opentelemetry))
-- [protovalidate](https://github.com/bufbuild/protovalidate) request validation for Go
-  ([`protovalidatetrevrpc`](trevrpc-go/protovalidatetrevrpc)) and Rust
-  ([`trevrpc-protovalidate`](trevrpc-rust/crates/trevrpc-protovalidate)) servers, with CEL rules, whose
-  violations every client reads from the status's details, and for browser clients
-  ([`@trevrpc/protovalidate`](trevrpc-js/protovalidate)), which check requests before sending them
+  for Go and Rust servers, with IPv6 clients grouped by prefix, whose rejections carry a `google.rpc.RetryInfo`
+  delay that every client reads
+- OpenTelemetry metrics and tracing for [Go](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#opentelemetry) and
+  [Rust](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#observability)
+- [protovalidate](https://github.com/bufbuild/protovalidate) request validation with CEL rules for Go and Rust
+  servers, whose violations every client reads from the status's details, and for Go, Rust and browser clients,
+  which check requests before sending them
 - built for deployment: certificates from ACME (TLS-ALPN-01 on the TCP port), PROXY protocol from TCP and UDP
   load balancers, QUIC address validation with Retry, and other HTTP content served from the same ports
 - development certificates that browsers trust by hash, so local WebTransport needs no trusted CA
@@ -66,15 +64,16 @@ messages as QUIC datagrams.
 
 ## support
 
-Servers are written in Go or Rust. Clients prefer QUIC and fall back to TCP for networks that block UDP and
-browsers without WebTransport.
+Servers are written in Go, Rust, or Erlang. Clients prefer QUIC and fall back to TCP for networks that block UDP
+and browsers without WebTransport.
 
-| runtime                            | server                                                    | client       | client fallback                     |
-| ---------------------------------- | --------------------------------------------------------- | ------------ | ----------------------------------- |
-| [Go](trevrpc-go)                   | native QUIC, HTTP/3, WebTransport, and every TCP fallback | native QUIC  | QMux over TLS                       |
-| [Rust](trevrpc-rust)               | native QUIC, HTTP/3, WebTransport, and every TCP fallback | native QUIC  | QMux over TLS                       |
-| [JavaScript](trevrpc-js) (browser) | —                                                         | WebTransport | QMux over WebSocket                 |
-| [Kotlin](trevrpc-kotlin) (Android) | —                                                         | HTTP/3       | HTTP/2 (Cronet's built-in fallback) |
+| runtime                                                       | server                                                    | client       | client fallback                     |
+| ------------------------------------------------------------- | --------------------------------------------------------- | ------------ | ----------------------------------- |
+| [Go](trevrpc-go)                                              | native QUIC, HTTP/3, WebTransport, and every TCP fallback | native QUIC  | QMux over TLS                       |
+| [Rust](trevrpc-rust)                                          | native QUIC, HTTP/3, WebTransport, and every TCP fallback | native QUIC  | QMux over TLS                       |
+| [JavaScript](trevrpc-js) (browser)                            | —                                                         | WebTransport | QMux over WebSocket                 |
+| [Kotlin](trevrpc-kotlin) (Android)                            | —                                                         | HTTP/3       | HTTP/2 (Cronet's built-in fallback) |
+| [Erlang](trevrpc-erlang) (in progress), with Gleam and Elixir | native QUIC, HTTP/3, WebTransport, and every TCP fallback | native QUIC  | QMux over TLS                       |
 
 The browser client is supported on Chromium, Firefox, and Safari with the Go, Rust, and Erlang servers. See
 [TCP fallback](https://trev.zip/llc/TrevRPC/wiki/TCP-Fallback) for how the fallbacks are served and chosen.
@@ -245,106 +244,24 @@ val reply = client.sayHello(HelloRequest.newBuilder().setName("TrevRPC").build()
 
 Runnable greeter servers and clients are in [`trevrpc-go/examples`](trevrpc-go/examples) and
 [`trevrpc-rust/examples`](trevrpc-rust/examples). [Getting started](https://trev.zip/llc/TrevRPC/wiki/Getting-Started)
-covers code generation, and the runtime guides cover streaming calls.
+covers code generation, and the runtime guides cover streaming calls and the Erlang, Gleam and Elixir APIs.
 
 ## using
 
-Each runtime has a library. Go, Rust, Kotlin, and Erlang also have a `protoc` plugin that generates code from your
-services; JavaScript uses the service descriptors that protobuf-es generates, and an optional plugin that
-generates faster message codecs.
+Each runtime has a library and a `protoc` plugin that generates code from your services. JavaScript uses the
+service descriptors that protobuf-es generates instead, and an optional plugin that generates faster message
+codecs.
 
-### go
+| runtime                                          | library                                                         | code generation                                                                      |
+| ------------------------------------------------ | --------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| [Go](trevrpc-go#packages)                        | `go get trev.zip/llc/trevrpc/trevrpc-go`                        | `protoc-gen-trevrpc-go`                                                              |
+| [Rust](trevrpc-rust#packages)                    | `cargo add trevrpc`                                             | `protoc-gen-trevrpc-rust`                                                            |
+| [JavaScript](trevrpc-js#packages)                | `npm install @trevrpc/trevrpc-js @bufbuild/protobuf`            | protobuf-es's `protoc-gen-es`, and optionally `@trevrpc/protoc-gen-trevrpc-js`       |
+| [Kotlin](trevrpc-kotlin#packages)                | `zip.trev.trevrpc:core` and `zip.trev.trevrpc:transport-cronet` | `protoc-gen-trevrpc-kotlin`                                                          |
+| [Erlang, Gleam, Elixir](trevrpc-erlang#packages) | `trevrpc` on Hex                                                | `protoc-gen-trevrpc-erlang`, `protoc-gen-trevrpc-gleam`, `protoc-gen-trevrpc-elixir` |
 
-```sh
-go get trev.zip/llc/trevrpc/trevrpc-go
-go install trev.zip/llc/trevrpc/trevrpc-go/cmd/protoc-gen-trevrpc-go@latest
-```
-
-### rust
-
-```sh
-cargo add trevrpc
-cargo install --git https://trev.zip/llc/TrevRPC.git protoc-gen-trevrpc-rust
-```
-
-### javascript
-
-the client takes the messages and service descriptors that [protobuf-es](https://github.com/bufbuild/protobuf-es) generates with `protoc-gen-es`:
-
-```sh
-npm install @trevrpc/trevrpc-js @bufbuild/protobuf
-npm install --save-dev @bufbuild/protoc-gen-es
-```
-
-[`@trevrpc/protoc-gen-trevrpc-js`](trevrpc-js/protoc-gen-trevrpc-js) runs after `protoc-gen-es` and generates a codec for each
-message, which encodes and decodes the same messages to the same bytes as protobuf-es, faster:
-
-```sh
-npm install --save-dev @trevrpc/protoc-gen-trevrpc-js
-```
-
-for [Effect](https://effect.website), [`@trevrpc/effect`](trevrpc-js/effect) makes clients whose calls are effects and streams:
-
-```sh
-npm install @trevrpc/effect effect
-```
-
-[`@trevrpc/protovalidate`](trevrpc-js/protovalidate) checks requests against their protovalidate rules before they are sent:
-
-```sh
-npm install @trevrpc/protovalidate @bufbuild/protovalidate
-```
-
-### kotlin
-
-```kotlin
-dependencies {
-    implementation("zip.trev.trevrpc:core:<version>")
-    implementation("zip.trev.trevrpc:transport-cronet:<version>")
-}
-```
-
-`protoc-gen-trevrpc-kotlin` is available from [nix](#nix), or from a checkout with
-`./gradlew :protoc-gen-trevrpc-kotlin:installDist` in `trevrpc-kotlin/`
-
-### erlang
-
-the Erlang runtime is in progress ([#477](https://trev.zip/llc/TrevRPC/issues/477)). Add the `trevrpc` Hex package to
-`rebar.config`:
-
-```erlang
-{deps, [trevrpc]}.
-```
-
-`protoc-gen-trevrpc-erlang` generates [gpb](https://github.com/tomas-abrahamsson/gpb) message modules and
-service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
-`trevrpc-erlang/protoc-gen-trevrpc-erlang/`. See [`trevrpc-erlang`](trevrpc-erlang#code-generation).
-
-### gleam
-
-the typed [Gleam binding](trevrpc-erlang#gleam) to the Erlang runtime is in progress too, in the same `trevrpc`
-package as the runtime:
-
-```sh
-gleam add trevrpc
-```
-
-`protoc-gen-trevrpc-gleam` generates Gleam types for messages, which gpb encodes and
-decodes, and service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
-`trevrpc-erlang/protoc-gen-trevrpc-gleam/`. See [`trevrpc-erlang`](trevrpc-erlang#gleam-code-generation).
-
-### elixir
-
-Elixir projects use the same `trevrpc` Hex package as Erlang ones, from `mix.exs`:
-
-```elixir
-defp deps, do: [{:trevrpc, "~> 1.12"}]
-```
-
-`protoc-gen-trevrpc-elixir` generates gpb message modules, whose messages are maps, and an Elixir module per
-service with its behaviour, routes and client functions; it is available from [nix](#nix), or from a checkout with
-`rebar3 escriptize` in `trevrpc-erlang/protoc-gen-trevrpc-elixir/`. See
-[`trevrpc-erlang`](trevrpc-erlang#elixir-code-generation).
+Each runtime's README lists every package it publishes, with how to install it, including the add-ons for
+OpenTelemetry, request validation, and Effect.
 
 ### nix
 
@@ -370,8 +287,9 @@ the [wiki](https://trev.zip/llc/TrevRPC/wiki) has the full documentation:
   a server and client
 - runtime guides: [Go](https://trev.zip/llc/TrevRPC/wiki/Go-Guide),
   [Rust](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide),
-  [JavaScript](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide), and
-  [Kotlin](https://trev.zip/llc/TrevRPC/wiki/Kotlin-Guide)
+  [JavaScript](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide),
+  [Kotlin](https://trev.zip/llc/TrevRPC/wiki/Kotlin-Guide), and
+  [Erlang, Gleam, and Elixir](https://trev.zip/llc/TrevRPC/wiki/Erlang-Guide)
 - transports: [HTTP/3 and HTTP/2](https://trev.zip/llc/TrevRPC/wiki/HTTP3),
   [WebTransport](https://trev.zip/llc/TrevRPC/wiki/WebTransport), and
   [TCP fallback](https://trev.zip/llc/TrevRPC/wiki/TCP-Fallback)
