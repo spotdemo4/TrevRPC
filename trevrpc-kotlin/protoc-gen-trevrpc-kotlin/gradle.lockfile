@@ -3,6 +3,7 @@
 # This file is expected to be part of source control.
 # To regenerate this file, run: ./gradlew :protoc-gen-trevrpc-kotlin:dependencies --write-locks
 com.google.protobuf:protobuf-java:4.36.2=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
+com.google.protobuf:protobuf-javalite:4.36.2=protobufLite
 org.apiguardian:apiguardian-api:1.1.2=testCompileClasspath
 org.bouncycastle:bcpg-jdk18on:1.84=kotlinBouncyCastleConfiguration
 org.bouncycastle:bcpkix-jdk18on:1.84=kotlinBouncyCastleConfiguration

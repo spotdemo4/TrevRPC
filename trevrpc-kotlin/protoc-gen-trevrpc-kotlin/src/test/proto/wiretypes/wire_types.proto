@@ -1,0 +1,66 @@
+// Every kind of field a message can declare, so the tests compare the wire types the generator
+// computes with protobuf-java's, and compile the codec with both protobuf runtimes. proto2, for
+// groups and extensions.
+syntax = "proto2";
+
+package generator.wiretypes;
+
+option java_multiple_files = true;
+option java_package = "generator.wiretypes";
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+}
+
+message Everything {
+  optional int32 int32_value = 1;
+  optional int64 int64_value = 2;
+  optional uint32 uint32_value = 3;
+  optional uint64 uint64_value = 4;
+  optional sint32 sint32_value = 5;
+  optional sint64 sint64_value = 6;
+  optional bool bool_value = 7;
+  optional Kind kind = 8;
+  optional fixed64 fixed64_value = 9;
+  optional sfixed64 sfixed64_value = 10;
+  optional double double_value = 11;
+  optional fixed32 fixed32_value = 12;
+  optional sfixed32 sfixed32_value = 13;
+  optional float float_value = 14;
+  optional string string_value = 15;
+  optional bytes bytes_value = 16;
+  optional Everything child = 17;
+  optional group Legacy = 18 {
+    optional int32 value = 1;
+  }
+  repeated int32 unpacked_ints = 19;
+  repeated sint64 packed_sints = 20 [packed = true];
+  repeated double doubles = 21;
+  repeated float floats = 22;
+  repeated Kind kinds = 23;
+  repeated bool flags = 24;
+  repeated string strings = 25;
+  repeated bytes blobs = 26;
+  repeated Everything children = 27;
+  repeated group Item = 28 {
+    optional string name = 1;
+  }
+  map<string, int32> counts = 29;
+  oneof choice {
+    string text = 30;
+    int64 number = 31;
+  }
+  // The lowest field number whose tags are negative Ints, and the highest field number.
+  optional int32 wraps = 268435456;
+  optional fixed32 highest = 536870911;
+
+  extensions 100 to 199;
+}
+
+extend Everything {
+  optional int32 extra = 100;
+}
+
+service WireTypes {
+  rpc Echo(Everything) returns (Everything);
+}

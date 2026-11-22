@@ -2,11 +2,13 @@ package zip.trev.trevrpc.generator
 
 import com.google.protobuf.DescriptorProtos.DescriptorProto
 import com.google.protobuf.DescriptorProtos.EnumDescriptorProto
+import com.google.protobuf.DescriptorProtos.FieldDescriptorProto
 import com.google.protobuf.DescriptorProtos.FileDescriptorProto
 import com.google.protobuf.DescriptorProtos.MethodDescriptorProto
 import com.google.protobuf.DescriptorProtos.ServiceDescriptorProto
 import com.google.protobuf.InvalidProtocolBufferException
 import com.google.protobuf.UnknownFieldSet
+import com.google.protobuf.WireFormat
 import com.google.protobuf.compiler.PluginProtos.CodeGeneratorRequest
 import com.google.protobuf.compiler.PluginProtos.CodeGeneratorResponse
 import java.io.InputStream
@@ -155,6 +157,25 @@ private class TypeIndex(
     }
 
     /**
+     * The tags the fields of [type] may arrive with, sorted as signed Ints: each field's number with
+     * the wire type of its declared type, and also with the length-delimited wire type when the field
+     * is a repeated scalar, which may be packed. Extensions are not listed, so they are not checked.
+     */
+    fun wireTags(type: TypeRef): List<Int> {
+        val message = checkNotNull(descriptors[type.protoName]) { "missing descriptor for ${type.protoName}" }
+        return message.fieldList
+            .flatMap { field ->
+                val wireType = wireType(field)
+                val packable = field.label == FieldDescriptorProto.Label.LABEL_REPEATED && wireType in PACKABLE_WIRE_TYPES
+                listOfNotNull(
+                    protobufTag(field.number, wireType),
+                    protobufTag(field.number, WireFormat.WIRETYPE_LENGTH_DELIMITED).takeIf { packable },
+                )
+            }.distinct()
+            .sorted()
+    }
+
+    /**
      * Whether messages of [type] contain a field marked `debug_redact`, directly or in a message
      * they contain, so that stream compression must leave them out. Recursive types are walked once.
      */
@@ -194,6 +215,51 @@ private class TypeIndex(
         }
     }
 }
+
+/** The tag protobuf encodes a field with; field numbers from 2^28 up wrap to negative Ints. */
+internal fun protobufTag(
+    fieldNumber: Int,
+    wireType: Int,
+): Int = (fieldNumber shl 3) or wireType
+
+/** The wire types of scalars that a repeated field may pack. */
+private val PACKABLE_WIRE_TYPES = setOf(WireFormat.WIRETYPE_VARINT, WireFormat.WIRETYPE_FIXED64, WireFormat.WIRETYPE_FIXED32)
+
+/**
+ * The wire type of [field]'s declared type. The plugin does not accept editions files, so a message
+ * field is a group only when its type says so.
+ */
+private fun wireType(field: FieldDescriptorProto): Int =
+    when (field.type) {
+        FieldDescriptorProto.Type.TYPE_INT32,
+        FieldDescriptorProto.Type.TYPE_INT64,
+        FieldDescriptorProto.Type.TYPE_UINT32,
+        FieldDescriptorProto.Type.TYPE_UINT64,
+        FieldDescriptorProto.Type.TYPE_SINT32,
+        FieldDescriptorProto.Type.TYPE_SINT64,
+        FieldDescriptorProto.Type.TYPE_BOOL,
+        FieldDescriptorProto.Type.TYPE_ENUM,
+        -> WireFormat.WIRETYPE_VARINT
+
+        FieldDescriptorProto.Type.TYPE_FIXED64,
+        FieldDescriptorProto.Type.TYPE_SFIXED64,
+        FieldDescriptorProto.Type.TYPE_DOUBLE,
+        -> WireFormat.WIRETYPE_FIXED64
+
+        FieldDescriptorProto.Type.TYPE_FIXED32,
+        FieldDescriptorProto.Type.TYPE_SFIXED32,
+        FieldDescriptorProto.Type.TYPE_FLOAT,
+        -> WireFormat.WIRETYPE_FIXED32
+
+        FieldDescriptorProto.Type.TYPE_STRING,
+        FieldDescriptorProto.Type.TYPE_BYTES,
+        FieldDescriptorProto.Type.TYPE_MESSAGE,
+        -> WireFormat.WIRETYPE_LENGTH_DELIMITED
+
+        FieldDescriptorProto.Type.TYPE_GROUP -> WireFormat.WIRETYPE_START_GROUP
+
+        null -> throw GeneratorException("field ${field.name.quote()} has no type")
+    }
 
 private data class DeclarationReservation(
     val key: String,
@@ -473,7 +539,7 @@ private fun generateFile(
             appendLine("import kotlinx.coroutines.flow.Flow")
             appendLine()
         }
-        codecs.values.forEach { type -> generateCodec(runtime, type, checkNotNull(codecNames[type.protoName])) }
+        codecs.values.forEach { type -> generateCodec(runtime, type, types.wireTags(type), checkNotNull(codecNames[type.protoName])) }
         services.forEachIndexed { index, service ->
             if (index > 0) appendLine()
             generateService(runtime, service, codecNames)
@@ -481,19 +547,22 @@ private fun generateFile(
     }
 }
 
+/**
+ * The codec of one message type. It takes the field tags the generator computed instead of the
+ * message's descriptor, which protobuf-javalite messages lack, so the same code serves both runtimes.
+ */
 private fun StringBuilder.generateCodec(
     runtime: String,
     type: TypeRef,
+    wireTags: List<Int>,
     name: String,
 ) {
     appendLine("private val $name: $runtime.MessageCodec<${type.kotlinType}> =")
-    appendLine("    $runtime.MessageCodec(")
-    appendLine("        encode = { message -> message.toByteArray() },")
-    appendLine(
-        "        decode = { body -> $runtime.decodeProtobuf(body, ${type.kotlinType}.getDescriptor(), ${type.kotlinType}::parseFrom) },",
-    )
+    appendLine("    $runtime.protobufCodec(")
     // The full protobuf name picks the type's compression dictionary.
     appendLine("        messageType = ${type.protoName.removePrefix(".").quote()},")
+    appendLine("        wireTypes = $runtime.ProtobufWireTypes(${wireTags.joinToString(", ")}),")
+    appendLine("        parse = ${type.kotlinType}::parseFrom,")
     appendLine("    )")
     appendLine()
 }

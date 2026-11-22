@@ -15,11 +15,14 @@ class StatusTest {
     fun `details decode only those of the requested type`() {
         val status =
             Status.invalidArgument("bad").withDetails(
-                listOf(StatusDetail("other.Type", byteArrayOf(1)), StatusDetail.of(StringValue.of("why"))),
+                listOf(
+                    StatusDetail("other.Type", byteArrayOf(1)),
+                    StatusDetail("google.protobuf.StringValue", StringValue.of("why").toByteArray()),
+                ),
             )
 
-        assertEquals(listOf("why"), status.findDetails(StringValue.getDefaultInstance()).map { it.value })
-        assertEquals(emptyList<Int32Value>(), status.findDetails(Int32Value.getDefaultInstance()))
+        assertEquals(listOf("why"), status.findDetails("google.protobuf.StringValue", StringValue.parser()).map { it.value })
+        assertEquals(emptyList<Int32Value>(), status.findDetails("google.protobuf.Int32Value", Int32Value.parser()))
         assertEquals(status, WireCodec.decodeStatus(WireCodec.encode(RpcStatus.fromStatus(status))).status)
     }
 

@@ -31,7 +31,16 @@ tasks.jar {
     manifest.attributes["Main-Class"] = application.mainClass.get()
 }
 
+// protobuf-javalite for the tests that compile generated code against it instead of protobuf-java.
+val protobufLite =
+    configurations.create("protobufLite") {
+        isCanBeConsumed = false
+        isCanBeResolved = true
+        isTransitive = false
+    }
+
 dependencies {
+    add(protobufLite.name, libs.protobuf.javalite)
     implementation(libs.protobuf.java)
 
     testImplementation(project(":core"))
@@ -86,6 +95,11 @@ extensions.configure<PublishingExtension> {
 tasks.test {
     dependsOn(tasks.installDist)
     useJUnitPlatform()
+    val protobufLiteFiles: FileCollection = protobufLite
+    inputs.files(protobufLiteFiles).withPropertyName("protobufLite").withNormalizer(ClasspathNormalizer::class)
+    jvmArgumentProviders.add(
+        CommandLineArgumentProvider { listOf("-Dtrevrpc.protobuf.lite=${protobufLiteFiles.singleFile}") },
+    )
     systemProperty(
         "trevrpc.interop.proto",
         rootProject.layout.projectDirectory

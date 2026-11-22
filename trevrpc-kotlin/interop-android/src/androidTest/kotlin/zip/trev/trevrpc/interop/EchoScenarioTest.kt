@@ -484,7 +484,7 @@ private suspend fun expectViolation(
     expect(failure.status.code == Code.INVALID_ARGUMENT) {
         "$what: expected INVALID_ARGUMENT, got ${failure.status.code} \"${failure.status.message}\""
     }
-    val violations = failure.status.findDetails(Violations.getDefaultInstance()).flatMap { it.violationsList }
+    val violations = failure.status.findDetails("buf.validate.Violations", Violations.parser()).flatMap { it.violationsList }
     expect(violations.size == 1) { "$what: expected one violation, got ${violations.size} in ${failure.status.details}" }
     val violation = violations.single()
     val path = violation.field.elementsList.joinToString(".") { it.fieldName }

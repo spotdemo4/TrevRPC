@@ -2,6 +2,7 @@ package zip.trev.trevrpc.generator
 
 import com.google.protobuf.ByteString
 import com.google.protobuf.CodedOutputStream
+import com.google.protobuf.DescriptorProtos
 import com.google.protobuf.DescriptorProtos.DescriptorProto
 import com.google.protobuf.DescriptorProtos.FieldDescriptorProto
 import com.google.protobuf.DescriptorProtos.FieldOptions
@@ -10,7 +11,9 @@ import com.google.protobuf.DescriptorProtos.FileOptions
 import com.google.protobuf.DescriptorProtos.MethodDescriptorProto
 import com.google.protobuf.DescriptorProtos.MethodOptions
 import com.google.protobuf.DescriptorProtos.ServiceDescriptorProto
+import com.google.protobuf.Descriptors
 import com.google.protobuf.UnknownFieldSet
+import com.google.protobuf.WireFormat
 import com.google.protobuf.compiler.PluginProtos.CodeGeneratorRequest
 import com.google.protobuf.compiler.PluginProtos.CodeGeneratorResponse
 import org.jetbrains.kotlin.cli.common.ExitCode
@@ -834,8 +837,14 @@ class GeneratorTest {
                         .newBuilder()
                         .setJavaPackage("example.generated")
                         .setJavaMultipleFiles(true),
-                ).addMessageType(message("HelloRequest"))
-                .addMessageType(message("HelloReply"))
+                ).addMessageType(
+                    message("HelloRequest")
+                        .toBuilder()
+                        .addField(scalarField("name", 1, FieldDescriptorProto.Type.TYPE_STRING))
+                        .addField(
+                            scalarField("ids", 2, FieldDescriptorProto.Type.TYPE_INT32, FieldDescriptorProto.Label.LABEL_REPEATED),
+                        ),
+                ).addMessageType(message("HelloReply"))
                 .addService(
                     ServiceDescriptorProto
                         .newBuilder()
@@ -941,6 +950,20 @@ class GeneratorTest {
 
     private fun message(name: String): DescriptorProto = DescriptorProto.newBuilder().setName(name).build()
 
+    private fun scalarField(
+        name: String,
+        number: Int,
+        type: FieldDescriptorProto.Type,
+        label: FieldDescriptorProto.Label = FieldDescriptorProto.Label.LABEL_OPTIONAL,
+    ): FieldDescriptorProto =
+        FieldDescriptorProto
+            .newBuilder()
+            .setName(name)
+            .setNumber(number)
+            .setType(type)
+            .setLabel(label)
+            .build()
+
     private fun method(
         name: String,
         input: String,
@@ -961,8 +984,10 @@ class GeneratorTest {
             listOf(
                 "package ",
                 "MessageCodec<",
-                "decodeProtobuf(",
+                "protobufCodec(",
                 "messageType = ",
+                "wireTypes = ",
+                "parse = ",
                 "invalidArgument(",
                 "const val ",
                 "suspend fun ",
@@ -984,54 +1009,10 @@ class GeneratedCodeCompilationTest {
      * directory, so a failure names the schema it comes from.
      */
     @Test
-    fun `protoc generated clients for every schema compile against core and protobuf`(
+    fun `protoc generated clients for every schema compile against core and protobuf-java`(
         @TempDir temp: Path,
     ) {
-        val interop = Path.of(checkNotNull(System.getProperty("trevrpc.interop.proto")))
-        check(interop.isRegularFile()) { "Interop schema not found at $interop" }
-        val testProtos = testProtoRoot()
-
-        compileSchemas(
-            temp,
-            listOf(
-                // The four-shape Echo client of the interop suite.
-                Schema(
-                    "interop",
-                    interop.parent,
-                    listOf(interop.fileName.toString()),
-                    mapOf("CompileFixture.kt" to COMPILE_FIXTURE),
-                ),
-                // Adversarial names, file facades and legal overloads.
-                Schema(
-                    "compat",
-                    testProtos.resolve("compat"),
-                    listOf(
-                        "naming/single_file.proto",
-                        "naming/multiple_files.proto",
-                        "naming/_mixed_CASE_file.proto",
-                        "naming/custom_extension.rpc",
-                        "naming/trailing_hash#.proto",
-                        "left/shared.proto",
-                        "right/shared.proto",
-                        "overloads.proto",
-                    ),
-                    mapOf(
-                        "NamingFixture.kt" to NAMING_FIXTURE,
-                        "DerivedFixture.kt" to DERIVED_FIXTURE,
-                        "SharedFixture.kt" to SHARED_FIXTURE,
-                        "OverloadsFixture.kt" to OVERLOADS_FIXTURE,
-                    ),
-                ),
-                // `(trevrpc.method)` options as protoc encodes them from trevrpc/options.proto.
-                Schema(
-                    "unreliable",
-                    testProtos,
-                    listOf("unreliable/unreliable.proto", "trevrpc/options.proto"),
-                    mapOf("UnreliableFixture.kt" to UNRELIABLE_FIXTURE),
-                    extraProtoRoots = listOf(optionsProtoRoot()),
-                ),
-            ),
-        )
+        compileSchemas(temp, schemas(), lite = false)
 
         val compat = temp.resolve("kotlin/compat")
         val leftFacade =
@@ -1071,6 +1052,114 @@ class GeneratedCodeCompilationTest {
         )
     }
 
+    /** The same schemas and fixtures compile with Java generated for protobuf-javalite and against it alone. */
+    @Test
+    fun `protoc generated clients for every schema compile against core and protobuf-javalite`(
+        @TempDir temp: Path,
+    ) {
+        compileSchemas(temp, schemas(), lite = true)
+    }
+
+    /**
+     * The tags a generated codec accepts are those protobuf-java's descriptors give for each field:
+     * the wire type of its type, and also the length-delimited one when it is packable.
+     */
+    @Test
+    fun `generated wire types match protobuf-java descriptors`(
+        @TempDir temp: Path,
+    ) {
+        val testProtos = testProtoRoot()
+        val descriptorSet = temp.resolve("wire_types.binpb")
+        runCommand(
+            listOf("protoc", "--proto_path=$testProtos", "--descriptor_set_out=$descriptorSet", "wiretypes/wire_types.proto"),
+            testProtos,
+            "schema wiretypes",
+        )
+        val file =
+            DescriptorProtos.FileDescriptorSet
+                .parseFrom(Files.readAllBytes(descriptorSet))
+                .fileList
+                .single()
+        val message = Descriptors.FileDescriptor.buildFrom(file, emptyArray()).findMessageTypeByName("Everything")
+        val expected =
+            message.fields
+                .flatMap { field ->
+                    listOfNotNull(
+                        protobufTag(field.number, field.liteType.wireType),
+                        protobufTag(field.number, WireFormat.WIRETYPE_LENGTH_DELIMITED)
+                            .takeIf { field.isRepeated && field.isPackable },
+                    )
+                }.sorted()
+        check(expected.any { it < 0 } && message.fields.any { it.isPackable }) { "fixture lost its edge cases" }
+
+        val response =
+            generate(
+                CodeGeneratorRequest
+                    .newBuilder()
+                    .addFileToGenerate(file.name)
+                    .addProtoFile(file)
+                    .build(),
+            )
+        assertEquals("", response.error)
+        val tags =
+            response.fileList
+                .single()
+                .content
+                .lines()
+                .single { "wireTypes = " in it }
+                .substringAfter("ProtobufWireTypes(")
+                .substringBefore(")")
+                .split(", ")
+                .map(String::toInt)
+        assertEquals(expected, tags)
+    }
+
+    private fun schemas(): List<Schema> {
+        val interop = Path.of(checkNotNull(System.getProperty("trevrpc.interop.proto")))
+        check(interop.isRegularFile()) { "Interop schema not found at $interop" }
+        val testProtos = testProtoRoot()
+        return listOf(
+            // The four-shape Echo client of the interop suite.
+            Schema(
+                "interop",
+                interop.parent,
+                listOf(interop.fileName.toString()),
+                mapOf("CompileFixture.kt" to COMPILE_FIXTURE),
+            ),
+            // Adversarial names, file facades and legal overloads.
+            Schema(
+                "compat",
+                testProtos.resolve("compat"),
+                listOf(
+                    "naming/single_file.proto",
+                    "naming/multiple_files.proto",
+                    "naming/_mixed_CASE_file.proto",
+                    "naming/custom_extension.rpc",
+                    "naming/trailing_hash#.proto",
+                    "left/shared.proto",
+                    "right/shared.proto",
+                    "overloads.proto",
+                ),
+                mapOf(
+                    "NamingFixture.kt" to NAMING_FIXTURE,
+                    "DerivedFixture.kt" to DERIVED_FIXTURE,
+                    "SharedFixture.kt" to SHARED_FIXTURE,
+                    "OverloadsFixture.kt" to OVERLOADS_FIXTURE,
+                ),
+            ),
+            // `(trevrpc.method)` options as protoc encodes them from trevrpc/options.proto.
+            Schema(
+                "unreliable",
+                testProtos,
+                listOf("unreliable/unreliable.proto", "trevrpc/options.proto"),
+                mapOf("UnreliableFixture.kt" to UNRELIABLE_FIXTURE),
+                extraProtoRoots = listOf(optionsProtoRoot()),
+            ),
+            // Every kind of field, for the codecs' wire types.
+            Schema("wiretypes", testProtos, listOf("wiretypes/wire_types.proto"), emptyMap()),
+        )
+    }
+
     /**
      * One schema to generate: [protoFiles] relative to [protoRoot], and the Kotlin [fixtures] that
      * use what they generate. [name] is the schema's output directory and how failures name it.
@@ -1102,9 +1191,14 @@ class GeneratedCodeCompilationTest {
             ?: error("generator fixtures not found from ${System.getProperty("user.dir")}")
     }
 
+    /**
+     * Generates and compiles [schemas]. With [lite], protoc generates Java for protobuf-javalite and
+     * both compilers see protobuf-javalite in place of protobuf-java.
+     */
     private fun compileSchemas(
         temp: Path,
         schemas: List<Schema>,
+        lite: Boolean,
     ) {
         val javaSources = temp.resolve("java")
         val kotlinSources = temp.resolve("kotlin")
@@ -1116,7 +1210,7 @@ class GeneratedCodeCompilationTest {
                 listOf("protoc", "--proto_path=${schema.protoRoot}") +
                     schema.extraProtoRoots.map { "--proto_path=$it" } +
                     listOf(
-                        "--java_out=$javaOut",
+                        "--java_out=${if (lite) "lite:" else ""}$javaOut",
                         "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
                         "--trevrpc-kotlin_out=$kotlinOut",
                     ) + schema.protoFiles,
@@ -1135,7 +1229,7 @@ class GeneratedCodeCompilationTest {
                 }.joinToString { it.name }
                 .ifEmpty { "no schema in particular" }
 
-        val classpath = System.getProperty("java.class.path")
+        val classpath = if (lite) liteClasspath() else System.getProperty("java.class.path")
         val javaClasses = temp.resolve("java-classes").createDirectories()
         compileJava(sourceFiles(javaSources, "java"), javaClasses, classpath, ::failing)
         val kotlinClasses = temp.resolve("kotlin-classes").createDirectories()
@@ -1145,6 +1239,16 @@ class GeneratedCodeCompilationTest {
             "$javaClasses${File.pathSeparator}$classpath",
             ::failing,
         )
+    }
+
+    /** The test classpath with protobuf-javalite in place of protobuf-java, which the generator uses. */
+    private fun liteClasspath(): String {
+        val lite = File(checkNotNull(System.getProperty("trevrpc.protobuf.lite")))
+        check(lite.isFile) { "protobuf-javalite not found at $lite" }
+        val entries = System.getProperty("java.class.path").split(File.pathSeparator)
+        val full = entries.filter { File(it).name.startsWith("protobuf-java-") }
+        check(full.size == 1) { "expected one protobuf-java on the test classpath, found $full" }
+        return (entries - full.toSet() + lite.path).joinToString(File.pathSeparator)
     }
 
     private fun runCommand(

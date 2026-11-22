@@ -19,13 +19,15 @@ Published to Maven Central under the group `zip.trev.trevrpc`.
 
 The plugin is an executable JAR with its dependencies that runs with `java -jar` on JDK 21+; `protoc` needs a small wrapper script that calls it. The `trevrpc-kotlin` Nix package also provides the plugin: `nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin`. From a checkout, `./gradlew :protoc-gen-trevrpc-kotlin:installDist` builds it under `protoc-gen-trevrpc-kotlin/build/install/protoc-gen-trevrpc-kotlin/bin/`.
 
+`core` compiles against the API that protobuf-javalite and protobuf-java share and depends on neither, since the two hold the same classes and clash on one classpath. The application adds the runtime its generated messages use: `com.google.protobuf:protobuf-javalite` on Android, or `com.google.protobuf:protobuf-java`, at the version TrevRPC is tested with in [`libs.versions.toml`](https://trev.zip/llc/TrevRPC/src/branch/main/trevrpc-kotlin/gradle/libs.versions.toml) or newer.
+
 ## Example
 
-Generate Java messages with `protoc` and the client with `protoc-gen-trevrpc-kotlin`:
+Generate Java messages for protobuf-javalite with `protoc` (drop `lite:` for protobuf-java) and the client with `protoc-gen-trevrpc-kotlin`:
 
 ```sh
 protoc \
-  --java_out=build/generated \
+  --java_out=lite:build/generated \
   --plugin=protoc-gen-trevrpc-kotlin=path/to/protoc-gen-trevrpc-kotlin \
   --trevrpc-kotlin_out=build/generated \
   greeter.proto

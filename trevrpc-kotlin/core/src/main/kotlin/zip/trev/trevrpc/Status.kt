@@ -2,7 +2,6 @@ package zip.trev.trevrpc
 
 import com.google.protobuf.CodedInputStream
 import com.google.protobuf.InvalidProtocolBufferException
-import com.google.protobuf.Message
 import com.google.protobuf.MessageLite
 import com.google.protobuf.Parser
 import com.google.protobuf.WireFormat
@@ -64,18 +63,14 @@ data class Status(
     val retryDelay: Duration?
         get() = details.firstNotNullOfOrNull { if (it.type == RETRY_INFO_TYPE) decodeRetryInfo(it.bytes) else null }
 
-    /** Decodes the details whose type is [typeName], a full name such as `buf.validate.Violations`. */
+    /**
+     * Decodes with [parser] the details whose type is [typeName], a full name such as
+     * `buf.validate.Violations`: `findDetails("buf.validate.Violations", Violations.parser())`.
+     */
     fun <T : MessageLite> findDetails(
         typeName: String,
         parser: Parser<T>,
-    ): List<T> = details.filter { it.type == typeName }.map { parser.parseFrom(it.value) }
-
-    /** Decodes the details of the message type of [defaultInstance]. */
-    fun <T : Message> findDetails(defaultInstance: T): List<T> {
-        @Suppress("UNCHECKED_CAST")
-        val parser = defaultInstance.parserForType as Parser<T>
-        return findDetails(defaultInstance.descriptorForType.fullName, parser)
-    }
+    ): List<T> = details.filter { it.type == typeName }.map { parser.parseFrom(it.bytes) }
 
     companion object {
         fun ok(metadata: Metadata = Metadata.EMPTY): Status = Status(Code.OK, metadata = metadata)
@@ -184,9 +179,4 @@ class StatusDetail(
     override fun hashCode(): Int = 31 * type.hashCode() + valueBytes.contentHashCode()
 
     override fun toString(): String = "StatusDetail(type=$type, value=${valueBytes.joinToString("") { "%02x".format(it) }})"
-
-    companion object {
-        /** Encodes [message] as a detail. */
-        fun of(message: Message): StatusDetail = StatusDetail(message.descriptorForType.fullName, message.toByteArray())
-    }
 }

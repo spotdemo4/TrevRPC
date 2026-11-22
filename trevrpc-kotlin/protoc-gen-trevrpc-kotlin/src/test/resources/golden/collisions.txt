@@ -1,13 +1,19 @@
 package example.`class`
 private val trevrpcCodec0: custom.rpc.MessageCodec<shared.`when`.Result> =
-        decode = { body -> custom.rpc.decodeProtobuf(body, shared.`when`.Result.getDescriptor(), shared.`when`.Result::parseFrom) },
+    custom.rpc.protobufCodec(
         messageType = "shared.Result",
+        wireTypes = custom.rpc.ProtobufWireTypes(),
+        parse = shared.`when`.Result::parseFrom,
 private val trevrpcCodec1: custom.rpc.MessageCodec<example.`class`.ApiTypes.Envelope.Result> =
-        decode = { body -> custom.rpc.decodeProtobuf(body, example.`class`.ApiTypes.Envelope.Result.getDescriptor(), example.`class`.ApiTypes.Envelope.Result::parseFrom) },
+    custom.rpc.protobufCodec(
         messageType = "api.Envelope.Result",
+        wireTypes = custom.rpc.ProtobufWireTypes(),
+        parse = example.`class`.ApiTypes.Envelope.Result::parseFrom,
 private val trevrpcCodec2: custom.rpc.MessageCodec<example.`class`.ApiTypes.Result> =
-        decode = { body -> custom.rpc.decodeProtobuf(body, example.`class`.ApiTypes.Result.getDescriptor(), example.`class`.ApiTypes.Result::parseFrom) },
+    custom.rpc.protobufCodec(
         messageType = "api.Result",
+        wireTypes = custom.rpc.ProtobufWireTypes(),
+        parse = example.`class`.ApiTypes.Result::parseFrom,
 public const val WHEN_WHEN_PATH: String = "/api.When/When"
 public const val WHEN_NESTED_PATH: String = "/api.When/Nested"
 public class WhenClient(

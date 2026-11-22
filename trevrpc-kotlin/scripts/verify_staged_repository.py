@@ -121,7 +121,6 @@ def verify_pom(
     path: pathlib.Path,
     module: str,
     version: str,
-    protobuf_version: str,
     minimum_kotlin_version: str,
 ) -> None:
     require(path.is_file(), f"missing POM {path}")
@@ -181,15 +180,8 @@ def verify_pom(
             "core coroutines must be compile scope",
         )
         require(
-            (
-                "com.google.protobuf",
-                "protobuf-java",
-                protobuf_version,
-                "compile",
-                None,
-            )
-            in rows,
-            "core protobuf must be compile scope",
+            not any(row[0] == "com.google.protobuf" for row in rows),
+            "core POM must leave the protobuf runtime, lite or full, to the application",
         )
     elif module == "transport-cronet":
         require(
@@ -232,16 +224,21 @@ def verify_module_metadata(path: pathlib.Path, module: str, expected_gradle_vers
         jvm_version = typing.cast(int, variant["attributes"]["org.gradle.jvm.version"])
         require(jvm_version == TARGET_JVM[module], f"wrong JVM attributes in {path}")
 
-    if module == "transport-cronet":
+    left_to_application = {
+        "core": ("com.google.protobuf", "the protobuf runtime, lite or full"),
+        "transport-cronet": ("org.chromium.net", "the Cronet library and provider"),
+    }
+    if module in left_to_application:
+        group, what = left_to_application[module]
         require(
             not any(
-                typing.cast(str, dependency.get("group")) == "org.chromium.net"
+                typing.cast(str, dependency.get("group")) == group
                 for variant in library_variants
                 for dependency in typing.cast(
                     list[dict[str, typing.Any]], variant.get("dependencies", [])
                 )
             ),
-            "Cronet Gradle metadata must leave the Cronet library and provider to the application",
+            f"{module} Gradle metadata must leave {what} to the application",
         )
 
 
@@ -347,7 +344,7 @@ def main() -> None:
                 f"/src/tag/trevrpc-kotlin/v{version}/trevrpc-kotlin/README.md" in page,
                 f"{javadoc_jar} does not point to the README of {version}",
             )
-        verify_pom(pom, module, version, protobuf_version, minimum_kotlin_version)
+        verify_pom(pom, module, version, minimum_kotlin_version)
         verify_module_metadata(module_metadata, module, gradle_version)
 
         version_directory = main_jar.parent

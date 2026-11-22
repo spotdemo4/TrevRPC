@@ -17,8 +17,9 @@ import javax.inject.Inject
  * them instead of keeping copies. The task is not cacheable because its output depends on the
  * `protoc` binary.
  *
- * `unreliable.proto` and `compressed.proto` import `trevrpc/options.proto`, which lives in its own
- * include root, so that file is compiled too: their generated Java refers to its descriptor class.
+ * The Java messages are generated for protobuf-javalite, the runtime Android apps use. Lite code does
+ * not refer to the files a schema imports only for their options, so `trevrpc/options.proto`, which
+ * `unreliable.proto` and `compressed.proto` import from its own include root, is not compiled.
  */
 abstract class GenerateInteropClient
     @Inject
@@ -30,12 +31,12 @@ abstract class GenerateInteropClient
         @get:PathSensitive(PathSensitivity.RELATIVE)
         abstract val schemaRoot: DirectoryProperty
 
-        /** Include root holding `trevrpc/options.proto`. */
+        /** Include root holding `trevrpc/options.proto`, which the schemas import. */
         @get:InputDirectory
         @get:PathSensitive(PathSensitivity.RELATIVE)
         abstract val optionsRoot: DirectoryProperty
 
-        /** Schema paths relative to [schemaRoot]; the options schema is added automatically. */
+        /** Schema paths relative to [schemaRoot]. */
         @get:Input
         abstract val schemas: ListProperty<String>
 
@@ -62,11 +63,10 @@ abstract class GenerateInteropClient
                     "protoc",
                     "--proto_path=${schemaRoot.get().asFile}",
                     "--proto_path=${optionsRoot.get().asFile}",
-                    "--java_out=${javaOutput.get().asFile}",
+                    "--java_out=lite:${javaOutput.get().asFile}",
                     "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
                     "--trevrpc-kotlin_out=${kotlinOutput.get().asFile}",
                     *schemas.get().toTypedArray(),
-                    "trevrpc/options.proto",
                 )
             }
         }
@@ -120,6 +120,8 @@ androidComponents.onVariants { variant ->
 
 dependencies {
     implementation(project(":transport-cronet"))
+    // The app adds the protobuf runtime its generated messages use; TrevRPC leaves it out.
+    implementation(libs.protobuf.javalite)
     implementation(libs.cronet.bundled)
     // The scenarios compress with the interop dictionary; Android takes zstd-jni's AAR.
     implementation(libs.zstd.jni) { artifact { type = "aar" } }
