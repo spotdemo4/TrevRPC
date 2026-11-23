@@ -100,6 +100,24 @@ jobs:
         working-directory: trevrpc-js/protoc-gen-trevrpc-js
         run: npm audit --audit-level moderate --omit=dev
 
+  python:
+    runs-on: ubuntu-26.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@de735751eb768b127a25bde1a8b776e3d3b0ec70 # v1.82.0
+        with:
+          shell: vulnerable
+
+      - name: Run uv audit
+        working-directory: trevrpc-py
+        run: uv audit --frozen --no-dev --preview-features audit-command
+
+      - name: Run uv audit on the protoc plugin
+        working-directory: trevrpc-py/protoc-gen-trevrpc-py
+        run: uv audit --frozen --no-dev --preview-features audit-command
+
   rust:
     runs-on: ubuntu-26.04
     permissions:

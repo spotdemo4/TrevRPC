@@ -213,6 +213,8 @@
               nodejs_26
               # kotlin
               osv-scanner
+              # python
+              uv
               # nix
               flake-checker
               # actions
