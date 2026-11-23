@@ -3718,8 +3718,8 @@ fn assert_webtransport_connect_rejected(
 ) -> TestResult {
     match error {
         web_transport_quinn::ClientError::HttpError(
-            web_transport_quinn::ConnectError::ErrorStatus(actual),
-        ) => ensure_eq!(actual, expected),
+            web_transport_quinn::ConnectError::ErrorStatus(response),
+        ) => ensure_eq!(response.status, expected),
         web_transport_quinn::ClientError::HttpError(
             web_transport_quinn::ConnectError::ProtoError(_),
         ) => {}

@@ -208,6 +208,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4372b9543397a4b86050cc5e7ee36953edf4bac9518e8a774c2da694977fb6e4"
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease 0.2.37",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 1.3.0",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -336,7 +356,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex",
+ "shlex 2.0.1",
 ]
 
 [[package]]
@@ -355,6 +375,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -390,6 +419,17 @@ dependencies = [
  "num-traits",
  "serde",
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "clang-sys"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading",
 ]
 
 [[package]]
@@ -466,12 +506,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core-models"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee3344d349528f449816cfa85e558c439bdca5a6d8a738cfb21e69f0b2b1952f"
+dependencies = [
+ "hax-lib 0.3.7",
+ "pastey",
+ "rand 0.10.4",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crabgrind"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "035c801dc4b418e1d857a6536dc88b4d1929c7a1fd163389766e18d322d34a84"
+dependencies = [
+ "bindgen",
+ "cc",
+ "pkg-config",
+ "rustversion",
 ]
 
 [[package]]
@@ -487,6 +550,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "curve25519-dalek"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "curve25519-dalek-derive",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+]
+
+[[package]]
+name = "curve25519-dalek-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -621,6 +709,12 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "fiat-crypto"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "find-msvc-tools"
@@ -838,6 +932,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -870,6 +970,79 @@ name = "hashbrown"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
+
+[[package]]
+name = "hax-lib"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a33cb227f97ee5c419064c31d7c55a7d895f28d8019ccdadc311cc036500c4"
+dependencies = [
+ "hax-lib-macros 0.3.7",
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
+name = "hax-lib"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb3bfcfc915e894c331662e4ac76706b777a5956535ea24535f4df30da04b1bf"
+dependencies = [
+ "hax-lib-macros 0.4.2",
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
+name = "hax-lib-macros"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28da835a5f153e9f3d0cc1f42ee605a1cfa9093c93348193793d60a1b0908b51"
+dependencies = [
+ "hax-lib-macros-types 0.3.7",
+ "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "hax-lib-macros"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e9010990fcba1d1494047fa433a433be0a5df23653a9784c739f7bba270272e"
+dependencies = [
+ "hax-lib-macros-types 0.4.2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "hax-lib-macros-types"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eed327e9a28d6ee018a4a9ba842d4ee27e378c8a591d2beb6f42f32b24a02fcb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "hax-lib-macros-types"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e053e3a5aeb92df47b07323180c5088edc488ca49883a234f6c73255c54cc520"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "uuid",
+]
 
 [[package]]
 name = "heck"
@@ -1116,6 +1289,15 @@ dependencies = [
 
 [[package]]
 name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
@@ -1220,6 +1402,107 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libcrux-aes"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd415025511a0bd8731cae34ae2d5e07c1b3f0443d5c12bd199c9e9b2f1fd4d5"
+dependencies = [
+ "libcrux-intrinsics",
+ "libcrux-platform",
+ "libcrux-secrets",
+ "libcrux-traits",
+]
+
+[[package]]
+name = "libcrux-hacl-rs"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27ce64ead37fc67c1039fdbcf1e8c97044e6a644cb3d1f79060b5c9ac8fdfe0a"
+dependencies = [
+ "libcrux-macros",
+]
+
+[[package]]
+name = "libcrux-intrinsics"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de82722c9c7419a311e84ee902e9643a15e39a6fcaade87f21e94f8d0f30fa70"
+dependencies = [
+ "core-models",
+ "hax-lib 0.4.2",
+]
+
+[[package]]
+name = "libcrux-macros"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2afdd4da30d6e23f76bd6f3ad61be5c773720349eef3e791f8b79cfea3fe1436"
+dependencies = [
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "libcrux-platform"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bf8bee8c35d34867a3762d6ee7b74e8523a882855c3cfce30484e9554342206"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "libcrux-poly1305"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d727ee28ee0d5d2661daa5f2f47965cd3489a0ac9130f3410e95632a98b12e49"
+dependencies = [
+ "libcrux-hacl-rs",
+ "libcrux-macros",
+]
+
+[[package]]
+name = "libcrux-secrets"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03c4ba47b3596f2771213ff162c792e9b93ddc0cdd178a2e407e00bb8ae4afcd"
+dependencies = [
+ "crabgrind",
+ "hax-lib 0.4.2",
+]
+
+[[package]]
+name = "libcrux-sha2"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86aa35d8fc9576a41df34af4d95d1f11186c1f65cd6c829329748915ea556d71"
+dependencies = [
+ "libcrux-hacl-rs",
+ "libcrux-macros",
+ "libcrux-traits",
+]
+
+[[package]]
+name = "libcrux-traits"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8958bb5c3780eb7c3355aeeb051629b830e47bfefd36befed93c81b53366bbc4"
+dependencies = [
+ "libcrux-secrets",
+ "rand 0.10.4",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link 0.2.1",
+]
 
 [[package]]
 name = "libm"
@@ -1663,6 +1946,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-error-attr2"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96de42df36bb9bba5542fe9f1a054b8cc87e172759a1868aa05c1f3acc89dfc5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "proc-macro-error2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
+dependencies = [
+ "proc-macro-error-attr2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1688,7 +1993,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6e4d69d0fa3e7f6f9cf6b53a0e83e4fc99ba3586f65ce166cff30bd13bb4ad2"
 dependencies = [
  "heck",
- "itertools",
+ "itertools 0.15.0",
  "log",
  "multimap",
  "petgraph",
@@ -1707,7 +2012,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.15.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1841,7 +2146,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "web-transport-proto",
+ "web-transport-proto 0.6.4",
  "web-transport-trait",
 ]
 
@@ -2070,6 +2375,35 @@ name = "regex-syntax"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
+
+[[package]]
+name = "rind"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e056ace5683dfa2e78b0c3b73cbb80ceb08496a3d537a4bfeeb6e16504270d5"
+dependencies = [
+ "cfg-if",
+ "curve25519-dalek",
+ "fiat-crypto",
+ "getrandom 0.4.3",
+ "libc",
+ "libcrux-aes",
+ "libcrux-hacl-rs",
+ "libcrux-macros",
+ "libcrux-poly1305",
+ "libcrux-sha2",
+ "libcrux-traits",
+]
+
+[[package]]
+name = "rind-rustls"
+version = "0.23.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91231b092d302751759d46e21a2a710371b6dddf9e9ec333ee795a2ce52dbddd"
+dependencies = [
+ "rind",
+ "rustls",
+]
 
 [[package]]
 name = "ring"
@@ -2352,6 +2686,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sfv"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ad2f82c45c83ee1bf0628f2d677a4fd6b08d755c25fad27a9f5600fb2e470b2"
+dependencies = [
+ "base64 0.23.1",
+ "indexmap",
+ "ref-cast",
+]
+
+[[package]]
 name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2370,6 +2715,12 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shlex"
@@ -3015,6 +3366,7 @@ version = "1.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]
@@ -3112,7 +3464,21 @@ checksum = "40d8e5dba9b14dbe25b116ac7e62ca82bf7c328d1c6072238bf0b9b47874c9d1"
 dependencies = [
  "bytes",
  "http",
- "sfv",
+ "sfv 0.15.0",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "web-transport-proto"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d3f14c18ab78af2cec790710b7f2d161a002722bc8282dfac7755da97a717c5"
+dependencies = [
+ "bytes",
+ "http",
+ "sfv 0.16.1",
  "thiserror 2.0.21",
  "tokio",
  "url",
@@ -3120,22 +3486,27 @@ dependencies = [
 
 [[package]]
 name = "web-transport-quinn"
-version = "0.13.6"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6492bb2fd9443243f4b5071cdd6840614c04d0ab2f0994c1df829e4b66201472"
+checksum = "d5695c048556ef0c918fb04044b49dfd4eb7dacf7ebd510bdb6df2a2cc03fb49"
 dependencies = [
  "bytes",
  "futures",
  "http",
+ "jni",
  "kio",
  "quinn",
+ "quinn-proto",
+ "rind",
+ "rind-rustls",
  "rustls",
- "rustls-native-certs",
+ "rustls-platform-verifier",
+ "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
- "web-transport-proto",
+ "web-transport-proto 0.7.0",
  "web-transport-trait",
 ]
 
