@@ -2,7 +2,7 @@
   benchstat,
   callPackage,
   cargo,
-  go,
+  go-latest,
   protobuf,
   rustc,
   stdenv,
@@ -11,7 +11,7 @@ callPackage ../interop/runner.nix {
   name = "trevrpc-bench-micro";
   script = "bench/micro.py";
   runtimeInputs = [
-    go
+    go-latest
     cargo
     rustc
     benchstat

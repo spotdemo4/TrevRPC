@@ -66,7 +66,7 @@
               cargo-audit
 
               # go
-              go
+              go-latest
               gopls
               gotools
               golangci-lint
@@ -163,7 +163,7 @@
               # when it verifies trevrpc-protovalidate
               protobuf
               # go
-              go
+              go-latest
               # javascript
               nodejs_26
               # kotlin
@@ -187,7 +187,7 @@
               rustc
               cargo
               # go
-              go
+              go-latest
               gomod2nix.packages.${system}.default
               # javascript
               nodejs_26
@@ -207,7 +207,7 @@
               # rust
               cargo-audit
               # go
-              go
+              go-latest
               govulncheck
               # javascript
               nodejs_26
@@ -227,7 +227,7 @@
         apps = pkgs.mkApps {
           update-go-deps = {
             packages = [
-              pkgs.go
+              pkgs.go-latest
               gomod2nix.packages.${system}.default
             ];
             script = ''
@@ -408,7 +408,7 @@
           runtimeInputs = with pkgs; [
             rustfmt
             golangci-lint
-            go
+            go-latest
             nixfmt
             oxfmt
             ktlint
