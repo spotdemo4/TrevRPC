@@ -4,9 +4,9 @@
 %%
 %% It runs every scenario and compression mode of the contract except what
 %% the runtime does not have yet: the validation scenarios (no
-%% `ValidationBench' bindings) and connection metadata, for which it exits
-%% with a usage error. It reports no `wire_bytes_per_msg': erlang_quic counts
-%% application bytes, not the UDP payload the other clients count.
+%% `ValidationBench' bindings), for which it exits with a usage error. It
+%% reports no `wire_bytes_per_msg': erlang_quic counts application bytes, not
+%% the UDP payload the other clients count.
 -module(trevrpc_interop_bench).
 
 -export([run/1, bench/1]).
@@ -188,8 +188,6 @@ validate(#config{scenario = Scenario} = Config) ->
         usage("the ~s scenario is not implemented: there are no ValidationBench bindings", [
             Scenario
         ]),
-    Config#config.metadata_scope =:= "connection" andalso
-        usage("--metadata-scope connection is not implemented: no connection metadata", []),
     ok.
 
 %% The scenarios each --compression mode runs. The stream modes call
@@ -251,16 +249,25 @@ usage(Format, Args) ->
 
 %%% Running
 
-%% One channel per --connections, each with its own connection.
-connect(#config{connections = Count, transport = Transport, flags = Flags}) ->
-    connect(Count, Transport, Flags, []).
+%% One channel per --connections, each with its own connection, and with the
+%% bench-pad entry as its connection metadata under --metadata-scope
+%% connection.
+connect(#config{connections = Count, transport = Transport, flags = Flags} = Config) ->
+    Opts =
+        case Config of
+            #config{metadata_scope = "connection", metadata = Size} when Size > 0 ->
+                #{connection_metadata => pad(Size)};
+            #config{} ->
+                #{}
+        end,
+    connect(Count, Transport, Flags, Opts, []).
 
-connect(0, _Transport, _Flags, Channels) ->
+connect(0, _Transport, _Flags, _Opts, Channels) ->
     {ok, lists:reverse(Channels)};
-connect(Count, Transport, Flags, Channels) ->
-    case trevrpc_interop_client:connect(Flags, Transport) of
+connect(Count, Transport, Flags, Opts, Channels) ->
+    case trevrpc_interop_client:connect(Flags, Transport, Opts) of
         {ok, Channel} ->
-            connect(Count - 1, Transport, Flags, [Channel | Channels]);
+            connect(Count - 1, Transport, Flags, Opts, [Channel | Channels]);
         {error, _} = Error ->
             lists:foreach(fun trevrpc_channel:close/1, Channels),
             Error
@@ -347,11 +354,17 @@ close(#{call := undefined}) -> ok;
 close(#{call := Call}) -> trevrpc_client:cancel(Call).
 
 %% The options every call carries: the deadline that ends what is left
-%% after the window, and the bench-pad entry.
+%% after the window, and the bench-pad entry, unless the channel carries it
+%% as connection metadata.
 options(#config{metadata = 0}, #window{deadline = Deadline}) ->
     #{deadline => Deadline};
+options(#config{metadata_scope = "connection"}, #window{deadline = Deadline}) ->
+    #{deadline => Deadline};
 options(#config{metadata = Size}, #window{deadline = Deadline}) ->
-    #{deadline => Deadline, metadata => #{?BENCH_PAD => binary:copy(<<"x">>, Size)}}.
+    #{deadline => Deadline, metadata => pad(Size)}.
+
+pad(Size) ->
+    #{?BENCH_PAD => binary:copy(<<"x">>, Size)}.
 
 %% The operation of each scenario of bench/README.md: a function of the
 %% worker's state that returns the application messages it carried and lost,

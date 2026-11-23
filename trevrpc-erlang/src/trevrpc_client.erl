@@ -130,6 +130,11 @@
     copy_reserved = 0 :: non_neg_integer(),
     %% The datagrams the server announced with DATAGRAM_COUNT, once read.
     datagram_count :: non_neg_integer() | undefined,
+    %% The channel's connection metadata set when the call started, which
+    %% it carries for its whole life, replays included, and whether its
+    %% REQUEST offered it, so that its ANSWER may confirm it.
+    connection_set :: {pos_integer(), trevrpc_metadata:metadata()} | undefined,
+    metadata_offered = false :: boolean(),
     %% Datagram messages: the call's flow while it reads response
     %% datagrams, the sender of its request datagrams, and the response
     %% datagram messages that arrived before the headers, which wait for
@@ -205,6 +210,8 @@ start(Channel, Method, Kind, Opts, Request) ->
             ),
         #{ref := Ref, max_frame_size := Max} = Info,
         #{compression := Compression, shared := Shared, generation := Generation} = Info,
+        ConnectionSet = maps:get(connection_metadata, Info),
+        {ConnectionMetadata, Offered} = connection_metadata(ConnectionSet, Info),
         Call = #client_call{
             ref = Ref,
             channel = Channel,
@@ -231,6 +238,7 @@ start(Channel, Method, Kind, Opts, Request) ->
             kind => Kind,
             accept_dictionaries => Accept,
             dictionary_query => Query,
+            connection_metadata => ConnectionMetadata,
             datagram_flow =>
                 case Flow of
                     undefined -> 0;
@@ -253,6 +261,8 @@ start(Channel, Method, Kind, Opts, Request) ->
                 end,
             datagram_sender = Sender,
             generation = Generation,
+            connection_set = ConnectionSet,
+            metadata_offered = Offered,
             max_frame_size = Max,
             request = Fields,
             modes = Modes,
@@ -283,6 +293,18 @@ start(Channel, Method, Kind, Opts, Request) ->
                 {error, Status}
         end
     end.
+
+%% The REQUEST's connection metadata for a call that carries set `Set', on
+%% the stream `Info' describes: a reference to it if the stream's connection
+%% confirmed it and it is still the channel's current set, since the server
+%% keeps only the newest few, otherwise an offer of it, which the call's
+%% ANSWER may confirm.
+connection_metadata(undefined, _Info) ->
+    {undefined, false};
+connection_metadata({Id, _}, #{connection_metadata := {Id, _}, metadata_confirmed := true}) ->
+    {#{id => Id, metadata => #{}}, false};
+connection_metadata({Id, Metadata}, _Info) ->
+    {#{id => Id, metadata => Metadata}, true}.
 
 new_stream(#{transport := Transport, id := Id, ref := Ref, max_frame_size := Max}, Channel) ->
     trevrpc_stream:new(Transport, Id, Ref, Channel, trevrpc_frame:reader(Max)).
@@ -666,9 +688,16 @@ replay(#client_call{channel = Channel, deadline = Deadline, kind = Kind} = Call,
     Closing = Fin orelse State#cstate.send_closed,
     case trevrpc_channel:open_stream(Channel, Deadline, undefined, Kind =/= unary) of
         {ok, Info} ->
+            %% The replay carries the call's own set, which it offers again
+            %% unless the new stream's connection confirmed it.
+            {ConnectionMetadata, MetadataOffered} = connection_metadata(
+                State#cstate.connection_set, Info
+            ),
             Base = State#cstate{
                 stream = new_stream(Info, Channel),
                 generation = maps:get(generation, Info),
+                request = (State#cstate.request)#{connection_metadata => ConnectionMetadata},
+                metadata_offered = MetadataOffered,
                 answered = false,
                 offer = none,
                 stream_decoder = undefined,
@@ -1084,12 +1113,29 @@ answer(Call, Payload, State) ->
     case trevrpc_wire:decode_answer(Payload) of
         {ok, #{stream_compression := false}} when State#cstate.deciding ->
             {error, <<"optimistic call answered without stream compression">>};
-        {ok, #{dictionaries := Dictionaries, stream_compression := Stream}} ->
+        {ok, #{
+            dictionaries := Dictionaries,
+            stream_compression := Stream,
+            connection_metadata := Confirmed
+        }} ->
+            confirm_metadata(Call, Confirmed, State),
             Learned = learn(Call, Dictionaries, State),
             {ok, enable_stream(Call, Stream, Learned#cstate{answered = true})};
         error ->
             {error, <<"malformed ANSWER">>}
     end.
+
+%% The server stored the connection metadata set the call offered: the
+%% connection's later calls refer to it.
+confirm_metadata(
+    #client_call{channel = Channel},
+    Id,
+    #cstate{metadata_offered = true, connection_set = {Id, _}, stream = Stream}
+) ->
+    Conn = trevrpc_transport:pid(trevrpc_stream:transport(Stream)),
+    trevrpc_channel:confirm_metadata(Channel, Conn, Id);
+confirm_metadata(_Call, _Confirmed, _State) ->
+    ok.
 
 learn(#client_call{channel = Channel}, Dictionaries, #cstate{learn = Learn} = State) when
     Learn =/= undefined

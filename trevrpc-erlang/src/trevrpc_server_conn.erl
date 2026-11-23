@@ -33,11 +33,19 @@
 %% ({@link finish/3}) before it writes its terminal STATUS, which settles
 %% the race between a call that finishes and a deadline or cancellation
 %% that ends it: exactly one of them writes the call's end.
+%%
+%% A native QUIC connection, a QMux session and a WebTransport session keep
+%% the connection metadata sets their client offered, at most four, in an
+%% ETS table this process creates with the first and alone writes, so that
+%% sets are dropped oldest first; call processes look up the sets their
+%% REQUESTs refer to in it without waiting on this process. The HTTP mapping
+%% keeps none.
 -module(trevrpc_server_conn).
 
 -behaviour(gen_server).
 
 -export([start/2, start_qmux/3, start_http/3, serve_h3/3, shutdown/1, admit/4, finish/3, reserve/4]).
+-export([store_connection_metadata/3, connection_metadata/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(entry, {
@@ -96,11 +104,19 @@
     flows :: trevrpc_datagram_flows:flows(),
     %% The connection processes of the WebTransport sessions of an HTTP/3
     %% connection, by their monitors.
-    sessions = #{} :: #{reference() => pid()}
+    sessions = #{} :: #{reference() => pid()},
+    %% The connection metadata sets the client stored, by their IDs, in a
+    %% table calls read, created with the first, and their IDs, oldest
+    %% first.
+    metadata_sets :: ets:tid() | undefined,
+    metadata_ids = [] :: [non_neg_integer()]
 }).
 
 -define(CANCELLED, 1).
 -define(H3_NO_ERROR, 16#100).
+%% How many connection metadata sets a connection keeps: the newest, and a
+%% few that the client's calls in flight may still refer to.
+-define(MAX_METADATA_SETS, 4).
 %% HTTP/2 windows are at most 2^31 - 1 bytes.
 -define(MAX_H2_WINDOW, 2147483647).
 
@@ -217,6 +233,36 @@ finish(Pid, Id, Ref) ->
         exit:_ -> cancelled
     end.
 
+%% @doc Stores the connection metadata set `Set', offered as set `Id', for
+%% the connection of `Pid', replacing one with the same ID and dropping the
+%% oldest beyond four. The calling call asks before it asks to be admitted,
+%% so the set is stored by the time its ANSWER confirms it.
+-spec store_connection_metadata(pid(), non_neg_integer(), trevrpc_metadata:metadata()) -> ok.
+store_connection_metadata(Pid, Id, Set) ->
+    gen_server:cast(Pid, {connection_metadata, Id, Set}).
+
+%% @doc The connection metadata set `Id' the connection stored: looked up in
+%% its table, or, for a call started before the connection had one, asked
+%% of its process. `none' is a connection that keeps no sets.
+-spec connection_metadata({pid(), ets:tid() | undefined} | none, non_neg_integer()) ->
+    {ok, trevrpc_metadata:metadata()} | error.
+connection_metadata(none, _Id) ->
+    error;
+connection_metadata({Pid, undefined}, Id) ->
+    try
+        gen_server:call(Pid, {connection_metadata, Id}, infinity)
+    catch
+        exit:_ -> error
+    end;
+connection_metadata({_Pid, Table}, Id) ->
+    try ets:lookup(Table, Id) of
+        [{Id, Set}] -> {ok, Set};
+        [] -> error
+    catch
+        %% The connection, and its table, are gone.
+        error:badarg -> error
+    end.
+
 %%% gen_server
 
 -spec init({trevrpc_transport:t() | undefined, trevrpc_server:config()}) -> {ok, #state{}}.
@@ -262,6 +308,13 @@ handle_call({reserve, Id, Ref, Cost}, _From, #state{streams = Streams, config = 
         _ ->
             {reply, false, State}
     end;
+handle_call({connection_metadata, Id}, _From, #state{metadata_sets = Table} = State) ->
+    Reply =
+        case Table =/= undefined andalso ets:lookup(Table, Id) of
+            [{Id, Set}] -> {ok, Set};
+            _ -> error
+        end,
+    {reply, Reply, State};
 handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #entry{state = Running, ref = Ref} = Entry} when
@@ -274,6 +327,8 @@ handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
     end.
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
+handle_cast({connection_metadata, Id, Set}, State) ->
+    {noreply, store_metadata(Id, Set, State)};
 handle_cast({qmux, Socket, Opts}, #state{config = Config} = State) ->
     case qmux:start({qmux_ssl, Socket}, server, self(), maps:merge(maps:get(qmux, Config), Opts)) of
         {ok, Session, Queue} ->
@@ -474,7 +529,12 @@ full(#state{active = Active, config = #{max_streams_per_connection := Max}}) ->
 open_stream(Id, #state{active = Active, config = Config} = State) ->
     Ref = make_ref(),
     {Pid, Monitor} = trevrpc_server_call:start(#{
-        transport => State#state.transport, id => Id, ref => Ref, router => self(), config => Config
+        transport => State#state.transport,
+        id => Id,
+        ref => Ref,
+        router => self(),
+        config => Config,
+        connection_metadata => State#state.metadata_sets
     }),
     Entry = #entry{ref = Ref, pid = Pid, monitor = Monitor},
     State#state{
@@ -482,6 +542,28 @@ open_stream(Id, #state{active = Active, config = Config} = State) ->
         monitors = (State#state.monitors)#{Monitor => Id},
         active = Active + 1
     }.
+
+%% Keeps the connection metadata set `Id' in the table calls read, which
+%% only this process writes, so that sets are dropped oldest first however
+%% many calls offer them at once.
+store_metadata(Id, Set, #state{metadata_sets = Table0, metadata_ids = Ids0} = State) ->
+    Table =
+        case Table0 of
+            undefined ->
+                ets:new(trevrpc_connection_metadata, [set, protected, {read_concurrency, true}]);
+            _ ->
+                Table0
+        end,
+    Ids =
+        case lists:delete(Id, Ids0) of
+            [Oldest | Rest] = Kept when length(Kept) >= ?MAX_METADATA_SETS ->
+                true = ets:delete(Table, Oldest),
+                Rest;
+            Kept ->
+                Kept
+        end,
+    true = ets:insert(Table, {Id, Set}),
+    State#state{metadata_sets = Table, metadata_ids = Ids ++ [Id]}.
 
 %%% HTTP requests
 

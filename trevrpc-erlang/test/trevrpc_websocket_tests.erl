@@ -96,6 +96,26 @@ session_test(#{port := Port}) ->
     ?assert(lists:member({message, <<"hello">>}, Frames)),
     [Status] = [Payload || {status, Payload} <- Frames],
     ?assertMatch({ok, #{code := ok}}, trevrpc_wire:decode_status(Status)),
+    %% The session keeps the connection metadata a call offers.
+    {ok, Offering} = qmux:open_stream(Session),
+    Offer = #{
+        method => ?UNARY, connection_metadata => #{id => 1, metadata => #{<<"x">> => <<"y">>}}
+    },
+    ok = qmux:send_data(
+        Session,
+        Queue,
+        Offering,
+        [
+            trevrpc_frame:encode(request, trevrpc_wire:encode_request(Offer)),
+            trevrpc_frame:encode(message, <<"hello">>)
+        ],
+        true
+    ),
+    Answers = [
+        trevrpc_wire:decode_answer(Answer)
+     || {answer, Answer} <- response(Session, Offering, trevrpc_frame:reader(1 bsl 22), [])
+    ],
+    ?assertMatch([{ok, #{connection_metadata := 1}}], Answers),
     qmux:close(Session, 0).
 
 %% The frames of a stream's response, up to its FIN.

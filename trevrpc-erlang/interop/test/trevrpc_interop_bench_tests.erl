@@ -32,6 +32,8 @@ bench_test_() ->
             [
                 {"records, stream compression, metadata, two channels and two QUIC connections each",
                     {timeout, 60, fun() -> options(Env) end}},
+                {"metadata as connection metadata",
+                    {timeout, 60, fun() -> connection_metadata(Env) end}},
                 {"what the runtime cannot do is a usage error", fun() -> refusals(Env) end}
             ]
     end}.
@@ -130,12 +132,28 @@ options(#{flags := Flags}) ->
      || Transport <- ["quic", "tcp"], Scenario <- ["unary", "client-stream", "bidi"]
     ].
 
+connection_metadata(#{flags := Flags}) ->
+    [
+        begin
+            {ok, Result} = trevrpc_interop_bench:bench(Flags#{
+                "transport" => Transport,
+                "scenario" => "unary",
+                "metadata-size" => "1024",
+                "metadata-scope" => "connection"
+            }),
+            ?assertMatch(
+                #{errors := 0, metadata_size := 1024, metadata_scope := <<"connection">>}, Result
+            ),
+            ?assert(maps:get(ops, Result) > 0)
+        end
+     || Transport <- ["quic", "tcp"]
+    ].
+
 refusals(#{flags := Flags}) ->
     Refused = fun(Extra) ->
         ?assertThrow({usage, _}, trevrpc_interop_bench:bench(maps:merge(Flags, Extra)))
     end,
     Refused(#{"scenario" => "validation-unary"}),
-    Refused(#{"scenario" => "unary", "metadata-size" => "8", "metadata-scope" => "connection"}),
     Refused(#{"scenario" => "server-stream", "compression" => "stream"}),
     Refused(#{"scenario" => "unary", "compression" => "dictionary"}),
     Refused(#{"scenario" => "nope"}).

@@ -187,6 +187,17 @@ fn with_channel(
   extra: List(server.Route),
   run: fn(channel.Channel) -> a,
 ) -> a {
+  with_configured_channel(transport, extra, fn(config) { config }, run)
+}
+
+/// As `with_channel`, with the channel's configuration changed by
+/// `configure`.
+fn with_configured_channel(
+  transport: channel.Transport,
+  extra: List(server.Route),
+  configure: fn(channel.Config) -> channel.Config,
+  run: fn(channel.Channel) -> a,
+) -> a {
   let #(cert, key, dir) = credentials()
   let routes = list.append(greeter_trevrpc.routes(handlers()), extra)
   let assert Ok(srv) = server.start(server.config(0, cert, key, routes))
@@ -200,7 +211,7 @@ fn with_channel(
       server_name: Some("localhost"),
       ca_file: Some(cert),
     )
-  let assert Ok(ch) = channel.connect(config, 10_000)
+  let assert Ok(ch) = channel.connect(configure(config), 10_000)
   let result = run(ch)
   channel.close(ch)
   server.stop(srv)
@@ -282,6 +293,39 @@ pub fn metadata_test() {
   let assert Ok(reply) = greeter_trevrpc.say_hello(ch, hello("bob"), options)
   metadata.get(reply.headers, "x-echo") |> should.equal(Ok("v"))
   metadata.get(reply.trailers, "x-trailer") |> should.equal(Ok("v"))
+}
+
+/// Connection metadata reaches every call, the call's own entries winning,
+/// until it is replaced or removed.
+pub fn connection_metadata_test() {
+  use transport <- list.each([channel.Quic, channel.Tcp])
+  use ch <- with_configured_channel(transport, [], fn(config) {
+    channel.Config(
+      ..config,
+      connection_metadata: metadata.from_list([#("x-echo", "c")]),
+    )
+  })
+  let echoed = fn(options) {
+    let assert Ok(reply) = greeter_trevrpc.say_hello(ch, hello("c"), options)
+    metadata.get(reply.headers, "x-echo")
+  }
+  echoed(client.options()) |> should.equal(Ok("c"))
+  echoed(client.options()) |> should.equal(Ok("c"))
+  echoed(
+    client.Options(
+      ..client.options(),
+      metadata: metadata.from_list([#("x-echo", "own")]),
+    ),
+  )
+  |> should.equal(Ok("own"))
+  let assert Ok(Nil) =
+    channel.set_connection_metadata(ch, metadata.from_list([#("x-echo", "d")]))
+  echoed(client.options()) |> should.equal(Ok("d"))
+  let assert Ok(Nil) = channel.set_connection_metadata(ch, metadata.new())
+  echoed(client.options()) |> should.equal(Error(Nil))
+  let assert Error(error) =
+    channel.set_connection_metadata(ch, metadata.from_list([#("Bad", "x")]))
+  error.code |> should.equal(status.InvalidArgument)
 }
 
 pub fn headers_test() {

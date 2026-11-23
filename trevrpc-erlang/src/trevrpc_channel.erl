@@ -59,10 +59,11 @@
     datagram_stats/1,
     subscribe/1,
     unsubscribe/1,
-    close/1
+    close/1,
+    set_connection_metadata/2
 ]).
 -export([open_stream/2, open_stream/3, open_stream/4]).
--export([stream_done/3, learn/3, reserve/4, release/4, optimism/3]).
+-export([stream_done/3, learn/3, reserve/4, release/4, optimism/3, confirm_metadata/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, stream_info/0, state/0]).
@@ -105,7 +106,10 @@
     %% How long a streaming call that finds its connection crowded waits for
     %% the connection the pool dials, in milliseconds (100 by default).
     quic_crowded_dial_wait => non_neg_integer(),
-    quic_connection_idle_timeout => pos_integer()
+    quic_connection_idle_timeout => pos_integer(),
+    %% Request metadata every call carries, sent once per connection; see
+    %% set_connection_metadata/2.
+    connection_metadata => trevrpc_metadata:metadata()
 }.
 
 %% What a calling process needs to use a stream it opened.
@@ -130,8 +134,16 @@
     %% pool's limits, and the counters callers read to open their own
     %% streams (see open_stream/3).
     pool := {non_neg_integer(), [{pos_integer(), trevrpc_transport:t()}], pool_limits()},
-    counters := trevrpc_quic_pool:counters()
+    counters := trevrpc_quic_pool:counters(),
+    %% The channel's connection metadata set, and whether the stream's
+    %% connection confirmed it.
+    connection_metadata := connection_set() | undefined,
+    metadata_confirmed := boolean()
 }.
+
+%% A version of the channel's connection metadata: its ID, which changes
+%% with it, and its entries.
+-type connection_set() :: {pos_integer(), trevrpc_metadata:metadata()}.
 
 %% The pool's limits, and how long a streaming call waits for a connection
 %% the pool dials.
@@ -288,7 +300,13 @@
     sampled_at :: integer() | undefined,
     sampled_bytes = #{} :: #{pid() => non_neg_integer()},
     %% Processes told of every change of state.
-    subscribers = #{} :: #{reference() => pid()}
+    subscribers = #{} :: #{reference() => pid()},
+    %% Connection metadata: the channel's current set, the ID of the last
+    %% one (numbered from 1), and the set the server confirmed on each
+    %% connection of the pool.
+    connection_metadata :: connection_set() | undefined,
+    metadata_ids = 0 :: non_neg_integer(),
+    confirmed = #{} :: #{pid() => pos_integer()}
 }).
 
 %% @doc Starts a channel linked to the caller. It connects in the
@@ -316,6 +334,8 @@ connect(Opts, Timeout) ->
                     {error, Status}
             end;
         {error, {compression, Message}} ->
+            {error, trevrpc_status:new(invalid_argument, Message)};
+        {error, {connection_metadata, Message}} ->
             {error, trevrpc_status:new(invalid_argument, Message)};
         {error, {invalid_option, Name}} ->
             {error,
@@ -369,6 +389,28 @@ close(Channel) ->
         gen_server:call(Channel, close, infinity)
     catch
         exit:_ -> ok
+    end.
+
+%% @doc Replaces the channel's connection metadata: request metadata that
+%% every call carries, such as a bearer token, which crosses each connection
+%% in its first calls instead of in every call. Calls that start afterwards
+%% carry the new metadata, and calls in flight keep theirs; each connection
+%% offers it until its server confirms it stored it, and refers to it by ID
+%% after that. The server merges it into each call's metadata before
+%% validation, the call's own entry winning for a key both have. Empty
+%% metadata removes it.
+-spec set_connection_metadata(pid(), trevrpc_metadata:metadata()) ->
+    ok | {error, trevrpc_status:status()}.
+set_connection_metadata(Channel, Metadata) ->
+    case trevrpc_metadata:validate(Metadata) of
+        ok ->
+            try
+                gen_server:call(Channel, {set_connection_metadata, Metadata}, infinity)
+            catch
+                exit:_ -> {error, closed_status()}
+            end;
+        {error, Message} ->
+            {error, trevrpc_status:new(invalid_argument, Message)}
     end.
 
 %% @private Opens a stream for the calling process, waiting until
@@ -496,6 +538,14 @@ register_stream(Channel, Generation, Conn, Id, Opener) ->
 learn(Channel, Generation, Shared) ->
     gen_server:cast(Channel, {learn, Generation, Shared}).
 
+%% @private A call that offered connection metadata set `Id' on connection
+%% `Conn' learned from its ANSWER that the server stored it: the
+%% connection's calls refer to it from now on, while it is the channel's
+%% current set.
+-spec confirm_metadata(pid(), pid(), pos_integer()) -> ok.
+confirm_metadata(Channel, Conn, Id) ->
+    gen_server:cast(Channel, {confirm_metadata, Conn, Id}).
+
 %% @private Reserves `Cost' bytes of the channel's stream compression
 %% memory for the calling process's stream `Id' (routed with `Ref'), held
 %% until the stream is done.
@@ -527,7 +577,9 @@ stream_done(Channel, Id, Ref) ->
 %%% gen_server
 
 %% Invalid settings fail the start without taking a linked caller down.
--spec init(options()) -> {ok, #state{}} | {error, {compression, binary()}}.
+-spec init(options()) ->
+    {ok, #state{}}
+    | {error, {compression | connection_metadata, binary()} | {invalid_option, atom()}}.
 init(Opts) ->
     maybe
         ok ?= trevrpc_socket:check_user_timeout(Opts),
@@ -536,7 +588,14 @@ init(Opts) ->
                 {error, Message} -> {error, {compression, Message}};
                 Config -> Config
             end,
-        init(Opts, Compression)
+        ConnectionMetadata = maps:get(connection_metadata, Opts, #{}),
+        ok ?=
+            case trevrpc_metadata:validate(ConnectionMetadata) of
+                ok -> ok;
+                {error, Invalid} -> {error, {connection_metadata, Invalid}}
+            end,
+        {ok, State} = init(Opts, Compression),
+        {ok, replace_metadata(ConnectionMetadata, State)}
     end.
 
 init(Opts, Compression) ->
@@ -732,6 +791,8 @@ handle_call({unsubscribe, Pid}, _From, #state{subscribers = Subscribers} = State
     {reply, ok, State#state{subscribers = maps:without(Gone, Subscribers)}};
 handle_call(close, _From, State) ->
     {stop, normal, ok, State};
+handle_call({set_connection_metadata, Metadata}, _From, State) ->
+    {reply, ok, replace_metadata(Metadata, State)};
 handle_call({open_stream, _Owner, _Deadline, _Counted}, _From, #state{status = connecting} = State) ->
     {reply, {error, trevrpc_status:new(unavailable, <<"channel is reconnecting">>)}, State};
 handle_call({open_stream, Owner, Deadline, false}, From, State) ->
@@ -800,6 +861,20 @@ handle_cast({optimism, Generation, Optimistic}, #state{generation = Generation} 
     {noreply, State#state{optimistic = Optimistic}};
 handle_cast({optimism, _Generation, _Optimistic}, State) ->
     {noreply, State};
+handle_cast({confirm_metadata, Conn, Id}, State) ->
+    case State#state.connection_metadata of
+        %% A confirmation of a set the channel replaced since makes no call
+        %% refer to the new one.
+        {Id, _} when State#state.status =:= ready ->
+            case slot(Conn, State) of
+                undefined ->
+                    {noreply, State};
+                _ ->
+                    {noreply, State#state{confirmed = (State#state.confirmed)#{Conn => Id}}}
+            end;
+        _ ->
+            {noreply, State}
+    end;
 handle_cast(grow, State) ->
     {noreply, grow_pool(State)};
 handle_cast(sample, State) ->
@@ -1485,7 +1560,13 @@ opened(Conn, Id, {Owner, Datagrams, Streaming}, State0) ->
         pool => {State#state.version, pool(State), {
             State#state.limits, State#state.crowded_dial_wait
         }},
-        counters => State#state.counters
+        counters => State#state.counters,
+        connection_metadata => State#state.connection_metadata,
+        metadata_confirmed =>
+            case State#state.connection_metadata of
+                {SetId, _} -> maps:get(Conn, State#state.confirmed, 0) =:= SetId;
+                undefined -> false
+            end
     },
     Loaded = add_load(Conn, 1, State#state{
         streams = (State#state.streams)#{Key => {Owner, Ref, Monitor}},
@@ -1651,10 +1732,24 @@ add_load(Conn, N, #state{loads = Loads, counters = Counters} = State) ->
             State#state{loads = Loads#{Conn => Load}}
     end.
 
-%% Publishes that the pool changed: callers that remember it ask again.
-bump(#state{version = Version, counters = Counters} = State) ->
+%% Publishes that the pool changed: callers that remember it ask again. A
+%% connection that left the pool forgets the set its server confirmed: a new
+%% one starts with nothing confirmed.
+bump(#state{version = Version, counters = Counters, confirmed = Confirmed} = State) ->
     trevrpc_quic_pool:set_version(Counters, Version + 1),
-    State#state{version = Version + 1}.
+    State#state{
+        version = Version + 1,
+        confirmed = maps:filter(fun(Conn, _) -> slot(Conn, State) =/= undefined end, Confirmed)
+    }.
+
+%% Makes `Metadata' the channel's connection metadata, as a set with a new
+%% ID, which no connection confirmed yet; empty metadata removes it. IDs
+%% wrap after 2^32 - 1 sets, past 0, which means none.
+replace_metadata(Metadata, State) when map_size(Metadata) =:= 0 ->
+    State#state{connection_metadata = undefined, confirmed = #{}};
+replace_metadata(Metadata, #state{metadata_ids = Ids} = State) ->
+    Id = Ids rem 16#FFFFFFFF + 1,
+    State#state{connection_metadata = {Id, Metadata}, metadata_ids = Id, confirmed = #{}}.
 
 %% A generation starts with its own connection alone, and over native QUIC
 %% dials the extras of its minimum, and measures its round trip.

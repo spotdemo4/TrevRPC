@@ -30,7 +30,7 @@ start(Spec) ->
     {Pid, Monitor} = spawn_opt(fun() -> run(Spec) end, [link, monitor]),
     {Pid, Monitor}.
 
-run(#{transport := Transport, id := Id, ref := Ref, router := Router, config := Config}) ->
+run(#{transport := Transport, id := Id, ref := Ref, router := Router, config := Config} = Spec) ->
     #{
         max_frame_size := MaxFrame,
         max_stream_body_size := MaxBody,
@@ -39,9 +39,10 @@ run(#{transport := Transport, id := Id, ref := Ref, router := Router, config := 
     Stream = trevrpc_stream:new(
         Transport, Id, Ref, Router, trevrpc_frame:reader(MaxFrame, #{max_bytes => MaxBody})
     ),
-    case request(Stream, deadline(Initial), Config) of
-        {ok, Request, Route, Metadata, Timeout, Next} ->
-            admit(Request, Route, Metadata, Timeout, Next, Router, Config);
+    Sets = connection_sets(Transport, Router, maps:get(connection_metadata, Spec, undefined)),
+    case request(Stream, deadline(Initial), Config, Sets) of
+        {ok, Checked, Next} ->
+            admit(Checked, Next, Router, Config);
         {error, Status, Next} ->
             case trevrpc_server_conn:finish(Router, Id, Ref) of
                 ok -> lone_status(Status, Next, MaxFrame);
@@ -54,17 +55,26 @@ run(#{transport := Transport, id := Id, ref := Ref, router := Router, config := 
 deadline(infinity) -> infinity;
 deadline(Timeout) -> erlang:monotonic_time(millisecond) + Timeout.
 
+%% Where the call finds the connection metadata sets of its connection:
+%% native QUIC connections, QMux sessions and WebTransport sessions keep
+%% them, in a table their connection process owns once it stored one, which
+%% calls read without going through that process; the HTTP mapping keeps
+%% none, since a proxy may share one connection between clients.
+connection_sets(Transport, Router, Table) ->
+    case trevrpc_transport:kind(Transport) of
+        Kind when Kind =:= quic; Kind =:= qmux; Kind =:= wt -> {Router, Table};
+        _ -> none
+    end.
+
 %% The stream's REQUEST, checked, within the initial request timeout. A
 %% stream the peer reset, or whose connection closed, is gone: the
 %% connection ends the call itself.
-request(Stream, Deadline, Config) ->
+request(Stream, Deadline, Config, Sets) ->
     case trevrpc_stream:next_frame(Stream, Deadline) of
         {ok, {request, Payload}, Next} ->
-            case check_request(Payload, Config) of
-                {ok, Request, Route, Metadata, Timeout} ->
-                    {ok, Request, Route, Metadata, Timeout, Next};
-                {error, Status} ->
-                    {error, Status, Next}
+            case check_request(Payload, Config, Sets) of
+                {ok, Checked} -> {ok, Checked, Next};
+                {error, Status} -> {error, Status, Next}
             end;
         {ok, {Type, _}, Next} ->
             {error,
@@ -78,7 +88,7 @@ request(Stream, Deadline, Config) ->
                 Next};
         {datagram, _Messages, Next} ->
             %% Datagrams are read only once the call took its flow.
-            request(Next, Deadline, Config);
+            request(Next, Deadline, Config, Sets);
         {eof, Next} ->
             {error, invalid_status(<<"request stream ended before REQUEST">>), Next};
         {error, truncated, Next} ->
@@ -114,18 +124,24 @@ request(Stream, Deadline, Config) ->
 
 %% Checks a REQUEST in the order the Go and Rust servers do, with their
 %% messages.
-check_request(Payload, #{routes := Routes}) ->
+check_request(Payload, #{routes := Routes}, Sets) ->
     maybe
         {ok, Request} ?= decode_request(Payload),
         #{method := Method, kind := Kind, stream_compression := Compression} = Request,
         ok ?= check_method(Method),
         ok ?= check_kind(Kind),
         ok ?= check_stream_compression(Compression),
-        {ok, Metadata} ?= merge_metadata(Request),
+        {ok, Metadata, Confirmed} ?= merge_metadata(Request, Sets),
         ok ?= validate_metadata(Metadata),
         {ok, Timeout} ?= timeout(Request),
         {ok, Route} ?= route(Method, Kind, Routes),
-        {ok, Request, Route, Metadata, Timeout}
+        {ok, #{
+            request => Request,
+            route => Route,
+            metadata => Metadata,
+            timeout => Timeout,
+            connection_metadata => Confirmed
+        }}
     end.
 
 decode_request(Payload) ->
@@ -160,15 +176,36 @@ check_stream_compression({unknown, Value}) ->
 check_stream_compression(_) ->
     ok.
 
-%% This server stores no connection metadata sets yet. An offer serves its
-%% own call and is never confirmed, as on the ordinary HTTP mapping, so the
-%% client keeps offering; a reference names a set it does not hold.
-merge_metadata(#{metadata := Own, connection_metadata := undefined}) ->
-    {ok, Own};
-merge_metadata(#{metadata := Own, connection_metadata := #{id := Id, metadata := Set}}) ->
-    case map_size(Set) of
-        0 -> invalid(iolist_to_binary(io_lib:format("unknown connection metadata set ~b", [Id])));
-        _ -> {ok, trevrpc_metadata:merge(Set, Own)}
+%% Merges the connection metadata set the REQUEST offers or refers to into
+%% its metadata, the call's own entries winning, and returns the ID of an
+%% offered set the connection stored, which the call's ANSWER confirms, or
+%% 0. The connection process stores the set: this process asks it to before
+%% it is admitted, through the same process, so the set is stored before
+%% the ANSWER can confirm it. An offer on a connection that keeps no sets
+%% serves its own call, and every reference there is unknown.
+merge_metadata(#{metadata := Own, connection_metadata := undefined}, _Sets) ->
+    {ok, Own, 0};
+merge_metadata(#{metadata := Own, connection_metadata := #{id := Id, metadata := Set}}, Sets) when
+    map_size(Set) > 0
+->
+    maybe
+        ok ?= validate_metadata(Set),
+        Confirmed =
+            case Sets of
+                none ->
+                    0;
+                {Router, _Table} ->
+                    trevrpc_server_conn:store_connection_metadata(Router, Id, Set),
+                    Id
+            end,
+        {ok, trevrpc_metadata:merge(Set, Own), Confirmed}
+    end;
+merge_metadata(#{metadata := Own, connection_metadata := #{id := Id}}, Sets) ->
+    case trevrpc_server_conn:connection_metadata(Sets, Id) of
+        {ok, Set} ->
+            {ok, trevrpc_metadata:merge(Set, Own), 0};
+        error ->
+            invalid(iolist_to_binary(io_lib:format("unknown connection metadata set ~b", [Id])))
     end.
 
 validate_metadata(Metadata) ->
@@ -215,7 +252,8 @@ invalid_status(Message) ->
 
 %% Asks the connection to admit the call, then serves it; the connection
 %% may refuse it, and then it ends with the lone STATUS of that refusal.
-admit(Request, Route, Metadata, Timeout, Stream, Router, Config) ->
+admit(Checked, Stream, Router, Config) ->
+    #{request := Request, route := Route, timeout := Timeout} = Checked,
     #{kind := Kind, stream_compression := Offer} = Request,
     {Requests, _} = trevrpc_zstd:directions(maps:get(compression, Route, none)),
     Admission = #{
@@ -233,12 +271,9 @@ admit(Request, Route, Metadata, Timeout, Stream, Router, Config) ->
     ),
     case trevrpc_server_conn:admit(Router, Id, trevrpc_stream:ref(Stream), Admission) of
         {ok, #{flow := Flow, stream_requests := Decode}} ->
-            serve(#{
+            serve(Checked#{
                 stream => Stream,
                 router => Router,
-                request => Request,
-                route => Route,
-                metadata => Metadata,
                 deadline => deadline(Timeout),
                 config => Config,
                 flow => Flow,
@@ -307,7 +342,7 @@ serve(#{stream := Stream0, router := Router, route := Route, config := Config} =
         max_messages = MaxMessages,
         compression = Compression,
         response_dict = ResponseDict,
-        answer = answer_frame(Answer, StreamRequests),
+        answer = answer_frame(Answer, StreamRequests, maps:get(connection_metadata, Spec)),
         stream_decoder =
             case StreamRequests of
                 true -> trevrpc_zstd_stream:decoder(Compression, all);
@@ -349,18 +384,20 @@ flow({Flow, Credit}, Kind, Route, Stream) ->
         false -> {Stream, undefined, Sender}
     end.
 
-%% The ANSWER the call owes: to a dictionary query, and that it decodes
-%% stream-compressed requests.
-answer_frame(undefined, false) ->
+%% The ANSWER the call owes: to a dictionary query, that it decodes
+%% stream-compressed requests, and that the connection stored the
+%% connection metadata set the REQUEST offered.
+answer_frame(undefined, false, 0) ->
     [];
-answer_frame(Dictionaries, StreamRequests) ->
+answer_frame(Dictionaries, StreamRequests, Confirmed) ->
     Answer = #{
         dictionaries =>
             case Dictionaries of
                 undefined -> [];
                 _ -> Dictionaries
             end,
-        stream_compression => StreamRequests
+        stream_compression => StreamRequests,
+        connection_metadata => Confirmed
     },
     trevrpc_frame:encode(answer, trevrpc_wire:encode_answer(Answer)).
 

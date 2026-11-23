@@ -32,6 +32,7 @@ webtransport_test_() ->
                 {"other paths get 404", fun not_found_test/1},
                 {"the admission decides", fun admission_test/1},
                 {"concurrent calls share a session", fun concurrent_test/1},
+                {"a session keeps connection metadata", fun connection_metadata_test/1},
                 {"a full-duplex call that writes as it reads finishes", fun duplex_test/1},
                 {"a slow reader holds its stream back, not the session forever",
                     fun slow_reader_test/1},
@@ -196,6 +197,23 @@ concurrent_test(#{port := Port}) ->
     %% process, which hands each to the call of its stream.
     Results = route(Session, Pids, #{}),
     ?assertEqual([{ok, [M, M]} || M <- Messages], [maps:get(Pid, Results) || Pid <- Pids]),
+    close(Session).
+
+connection_metadata_test(#{port := Port}) ->
+    Session = connect(Port, #{}),
+    Call = fun(Set) ->
+        call_frames(Session, #{method => ?UNARY, connection_metadata => Set}, [<<"a">>])
+    end,
+    Offered = Call(#{id => 1, metadata => #{<<"x">> => <<"y">>}}),
+    ?assertMatch(
+        [{ok, #{connection_metadata := 1}}],
+        [trevrpc_wire:decode_answer(Answer) || {answer, Answer} <- Offered]
+    ),
+    ?assertMatch(#{code := ok}, status(Call(#{id => 1}))),
+    ?assertMatch(
+        #{code := invalid_argument, message := <<"unknown connection metadata set 2">>},
+        status(Call(#{id => 2}))
+    ),
     close(Session).
 
 %% erlang-webtransport's advice of a handler that waits for its worker
@@ -558,20 +576,22 @@ close(Session) ->
 %% events come to the calling process: the session's owner, or the process
 %% `route/3' hands them to.
 call(Session, Method, Messages) ->
-    {ok, Stream} = webtransport:open_stream(Session, bidi),
-    register_stream(Session, Stream),
-    Request = [
-        trevrpc_frame:encode(
-            request, trevrpc_wire:encode_request(#{method => Method, kind => kind(Method)})
-        )
-        | [trevrpc_frame:encode(message, M) || M <- Messages]
-    ],
-    ok = send(Session, Stream, Request, fin),
-    Frames = response(Session, Stream, trevrpc_frame:reader(?MAX_FRAME), []),
+    Frames = call_frames(Session, #{method => Method}, Messages),
     case status(Frames) of
         #{code := ok} -> {ok, [M || {message, M} <- Frames]};
         Status -> {error, Status}
     end.
+
+%% The frames of the response to a call whose REQUEST has `Fields'.
+call_frames(Session, #{method := Method} = Fields, Messages) ->
+    {ok, Stream} = webtransport:open_stream(Session, bidi),
+    register_stream(Session, Stream),
+    Request = [
+        trevrpc_frame:encode(request, trevrpc_wire:encode_request(Fields#{kind => kind(Method)}))
+        | [trevrpc_frame:encode(message, M) || M <- Messages]
+    ],
+    ok = send(Session, Stream, Request, fin),
+    response(Session, Stream, trevrpc_frame:reader(?MAX_FRAME), []).
 
 %% The status a response ended with.
 status(Frames) ->

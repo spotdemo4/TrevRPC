@@ -51,10 +51,8 @@ class Table:
 
 def refused(cell: Cell) -> bool:
     """The cells a client refuses, which no table runs: the Erlang client has no validation
-    scenarios and no connection metadata yet (see README.md)."""
-    return cell.client == "erlang" and (
-        cell.validation is not None or cell.metadata_scope == "connection"
-    )
+    scenarios yet (see README.md)."""
+    return cell.client == "erlang" and cell.validation is not None
 
 
 def own_server(cell: Cell) -> bool:

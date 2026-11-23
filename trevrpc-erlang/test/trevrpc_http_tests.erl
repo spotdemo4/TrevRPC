@@ -26,6 +26,7 @@ http_test_() ->
          || Version <- [h3, h2],
             {Name, Test} <- [
                 {"a unary call", fun unary_test/1},
+                {"connection metadata is not kept", fun connection_metadata_test/1},
                 {"a bidirectional call", fun bidi_test/1},
                 {"other paths get 404", fun not_found_test/1},
                 {"other methods get 405", fun method_test/1},
@@ -116,7 +117,13 @@ start_server(#{cert := Cert, key := Key}, Opts) ->
 
 routes() ->
     #{
-        ?UNARY => #{kind => unary, handler => fun(Request, _Call) -> {ok, Request} end},
+        ?UNARY => #{
+            kind => unary,
+            handler => fun(Request, Call) ->
+                Suffix = maps:get(<<"interop-suffix">>, trevrpc_call:metadata(Call), <<>>),
+                {ok, <<Request/binary, Suffix/binary>>}
+            end
+        },
         ?BIDI => #{kind => bidirectional_streaming, handler => fun echo/1},
         %% Reports its start, then reads nothing.
         ?SINK => #{
@@ -200,6 +207,28 @@ unary_test(Env) ->
     Frames = frames(Body),
     ?assertEqual([<<"hello">>], [M || {message, M} <- Frames]),
     ?assertMatch(#{code := ok}, status(Frames)),
+    close(Client).
+
+%% A proxy may carry many clients' requests on one HTTP connection, so an
+%% offer serves its own call, unconfirmed, and nothing is stored to refer to.
+connection_metadata_test(Env) ->
+    Client = connect(Env),
+    Request = fun(Set) ->
+        Fields = #{method => ?UNARY, kind => unary, connection_metadata => Set},
+        Body = [
+            trevrpc_frame:encode(request, trevrpc_wire:encode_request(Fields)),
+            trevrpc_frame:encode(message, <<"a">>)
+        ],
+        {200, _, Response} = exchange(Client, post(?MEDIA_TYPE), iolist_to_binary(Body)),
+        frames(Response)
+    end,
+    Offered = Request(#{id => 1, metadata => #{<<"interop-suffix">> => <<"!">>}}),
+    ?assertEqual([], [Answer || {answer, Answer} <- Offered]),
+    ?assertEqual([<<"a!">>], [M || {message, M} <- Offered]),
+    ?assertMatch(
+        #{code := invalid_argument, message := <<"unknown connection metadata set 1">>},
+        status(Request(#{id => 1}))
+    ),
     close(Client).
 
 bidi_test(Env) ->

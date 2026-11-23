@@ -3,7 +3,7 @@
 %% (`none' or `{some, X}') to and from the runtime's maps.
 -module(trevrpc_gleam_ffi).
 
--export([connect/2, close/1]).
+-export([connect/2, close/1, set_connection_metadata/2]).
 -export([unary/4, server_stream/4, client_stream/3, bidi/3]).
 -export([send/2, close_send/1, recv/1, recv_within/2, close_and_recv/1, headers/1, cancel/1]).
 -export([route/3, start/1, port/1, tcp_port/1, stop/1]).
@@ -26,7 +26,8 @@
 -type channel_config() ::
     {config, binary(), inet:port_number(), option(inet:port_number()), auto | quic | tcp,
         option(binary()), option(binary()), boolean(), option(pos_integer()), option(pos_integer()),
-        option(pos_integer()), option(pos_integer()), option(pos_integer())}.
+        option(pos_integer()), option(pos_integer()), option(pos_integer()),
+        trevrpc_metadata:metadata()}.
 -type kind() :: unary | server_streaming | client_streaming | bidirectional_streaming.
 -type server_config() ::
     {config, inet:port_number(), binary(), binary(), [{binary(), trevrpc_server:route()}],
@@ -39,11 +40,17 @@
 -spec connect(channel_config(), timeout()) -> result(pid()).
 connect(
     {config, Host, Port, TcpPort, Transport, ServerName, CaFile, Verify, MaxFrame, ConnectTimeout,
-        IdleTimeout, MinQuic, MaxQuic},
+        IdleTimeout, MinQuic, MaxQuic, ConnectionMetadata},
     Timeout
 ) ->
     Opts = options(
-        #{host => Host, port => Port, transport => Transport, verify => Verify},
+        #{
+            host => Host,
+            port => Port,
+            transport => Transport,
+            verify => Verify,
+            connection_metadata => ConnectionMetadata
+        },
         [
             {tcp_port, TcpPort},
             {server_name, map_option(ServerName, fun binary_to_list/1)},
@@ -56,6 +63,10 @@ connect(
         ]
     ),
     result(trevrpc_channel:connect(Opts, Timeout)).
+
+-spec set_connection_metadata(pid(), trevrpc_metadata:metadata()) -> result(nil).
+set_connection_metadata(Channel, Metadata) ->
+    done(trevrpc_channel:set_connection_metadata(Channel, Metadata)).
 
 -spec close(pid()) -> nil.
 close(Channel) ->

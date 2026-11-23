@@ -502,11 +502,10 @@ class TableTest(unittest.TestCase):
                 for transport in run.NATIVE_TRANSPORTS
             }
 
-        # It runs the tables of its own server like the other runtimes, without validation and
-        # with call metadata only.
+        # It runs the tables of its own server like the other runtimes, without validation.
         self.assertEqual({"quic": 12, "tcp": 12}, cells("comparison"))
         self.assertEqual({"quic": 0, "tcp": 0}, cells("validation"))
-        self.assertEqual({"quic": 8, "tcp": 8}, cells("metadata"))
+        self.assertEqual({"quic": 12, "tcp": 12}, cells("metadata"))
 
     def test_explicit_flags_override_the_table(self) -> None:
         args = run.parse_args(

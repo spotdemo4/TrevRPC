@@ -128,10 +128,15 @@ client_stream(Call) ->
 
 client_stream(Call, Acc, Count) ->
     case trevrpc_call:recv(Call) of
-        {ok, <<"fail">>} -> {error, trevrpc_status:new(aborted, <<"abort">>)};
-        {ok, Message} -> client_stream(Call, <<Acc/binary, Message/binary>>, Count + 1);
-        eof -> {ok, <<Acc/binary, ":", (integer_to_binary(Count))/binary>>};
-        {error, Status} -> {error, Status}
+        {ok, <<"fail">>} ->
+            {error, trevrpc_status:new(aborted, <<"abort">>)};
+        {ok, Message} ->
+            client_stream(Call, <<Acc/binary, Message/binary>>, Count + 1);
+        eof ->
+            Suffix = maps:get(<<"interop-suffix">>, trevrpc_call:metadata(Call), <<>>),
+            {ok, <<Acc/binary, ":", (integer_to_binary(Count))/binary, Suffix/binary>>};
+        {error, Status} ->
+            {error, Status}
     end.
 
 %% "<count>:<message>[:fail]"
@@ -276,7 +281,6 @@ e2e(Transport) ->
                 {"datagram counts on request streams", fun datagram_count_request_test/1},
                 {"datagram counts on response streams", fun datagram_count_response_test/1},
                 {"optimistic stream compression is refused", fun optimistic_test/1},
-                {"connection metadata", fun connection_metadata_test/1},
                 {"compression without a dictionary", fun plain_test/1},
                 {"many concurrent calls", fun concurrent_test/1},
                 {"the connection process calls no transport for calls", fun conn_calls_test/1},
@@ -947,25 +951,6 @@ optimistic_test(#{channel := Channel}) ->
         )
     ).
 
-connection_metadata_test(#{channel := Channel}) ->
-    Offer = request(#{
-        method => ?UNARY,
-        metadata => #{<<"interop-suffix">> => <<"?">>},
-        connection_metadata => #{
-            id => 1, metadata => #{<<"interop-suffix">> => <<"!">>, <<"x">> => <<"y">>}
-        }
-    }),
-    %% The call's own entry wins; the set is merged but not stored.
-    ?assertMatch(
-        {message, <<"d?">>, #{code := ok}},
-        raw(Channel, [Offer, trevrpc_frame:encode(message, <<"d">>)], true)
-    ),
-    Reference = request(#{method => ?UNARY, connection_metadata => #{id => 1}}),
-    ?assertMatch(
-        #{code := invalid_argument, message := <<"unknown connection metadata set 1">>},
-        raw(Channel, [Reference, trevrpc_frame:encode(message, <<"e">>)], true)
-    ).
-
 plain_test(#{credentials := Credentials, server := Server}) ->
     %% A channel of its own, whose first call queries.
     Channel = connect(Credentials, Server),
@@ -1026,6 +1011,293 @@ collect_frames(Stream, Deadline, Acc) ->
         Other ->
             lists:reverse(Acc, [Other])
     end.
+
+%%% Connection metadata
+
+connection_metadata_test_() ->
+    [{atom_to_list(Transport), connection_metadata(Transport)} || Transport <- [quic, tcp]].
+
+connection_metadata(Transport) ->
+    {setup,
+        fun() ->
+            {ok, _} = application:ensure_all_started(quic),
+            logger:set_primary_config(level, none),
+            Credentials = (trevrpc_test_tls:credentials())#{transport => Transport},
+            #{credentials => Credentials, server => start_server(Credentials, #{})}
+        end,
+        fun(#{server := Server}) ->
+            trevrpc_server:stop(Server),
+            logger:set_primary_config(level, notice)
+        end,
+        fun(Env) ->
+            [
+                {Name, {timeout, 30, fun() -> Test(Env) end}}
+             || {Name, Test} <- [
+                    {"the server stores, confirms and merges sets", fun stored_sets_test/1},
+                    {"the server keeps the newest four sets", fun eviction_test/1},
+                    {"the server checks offers and references", fun checked_sets_test/1},
+                    {"a channel offers its set until confirmed", fun channel_sets_test/1},
+                    {"a replay offers the call's replaced set", fun replaced_set_test/1},
+                    {"a new connection offers again", fun metadata_reconnect_test/1},
+                    {"invalid connection metadata", fun invalid_connection_metadata_test/1}
+                ]
+            ]
+        end}.
+
+%% A channel of its own, so that its connection holds no sets yet.
+metadata_channel(#{credentials := Credentials, server := Server}, Opts) ->
+    {ok, Channel} = trevrpc_channel:start(
+        maps:merge(
+            (ports(Server))#{
+                host => {127, 0, 0, 1},
+                transport => maps:get(transport, Credentials),
+                server_name => "localhost",
+                cacerts => maps:get(cacerts, Credentials),
+                max_quic_connections => 1
+            },
+            Opts
+        )
+    ),
+    ok = trevrpc_channel:wait_until_ready(Channel, 30000),
+    Channel.
+
+offer(Id, Suffix) ->
+    #{id => Id, metadata => #{<<"interop-suffix">> => Suffix}}.
+
+%% A unary call written by hand, with the connection metadata `Set' and the
+%% call's own `Metadata'.
+raw_unary(Channel, Message, Set, Metadata) ->
+    raw_frames(Channel, [
+        request(#{method => ?UNARY, metadata => Metadata, connection_metadata => Set}),
+        trevrpc_frame:encode(message, Message)
+    ]).
+
+stored_sets_test(Env) ->
+    Channel = metadata_channel(Env, #{}),
+    %% An offer is merged, stored and confirmed.
+    ?assertMatch(
+        [{answer, #{connection_metadata := 7}}, {message, <<"a!">>}, {status, #{code := ok}}],
+        raw_unary(Channel, <<"a">>, offer(7, <<"!">>), #{})
+    ),
+    %% A reference uses the stored set, and needs no ANSWER.
+    ?assertMatch(
+        [{message, <<"b!">>}, {status, #{code := ok}}],
+        raw_unary(Channel, <<"b">>, #{id => 7}, #{})
+    ),
+    %% The call's own entry wins.
+    ?assertMatch(
+        [{message, <<"c?">>}, {status, #{code := ok}}],
+        raw_unary(Channel, <<"c">>, #{id => 7}, #{<<"interop-suffix">> => <<"?">>})
+    ),
+    %% A call that fails in its handler still confirms its offer.
+    ?assertMatch(
+        [{answer, #{connection_metadata := 8}}, {status, #{code := resource_exhausted}}],
+        raw_unary(Channel, <<"fail">>, offer(8, <<"#">>), #{})
+    ),
+    ?assertMatch(
+        [{message, <<"d#">>}, {status, #{code := ok}}],
+        raw_unary(Channel, <<"d">>, #{id => 8}, #{})
+    ),
+    trevrpc_channel:close(Channel).
+
+eviction_test(Env) ->
+    Channel = metadata_channel(Env, #{}),
+    Offer = fun(Id, Suffix) ->
+        ?assertMatch(
+            [{answer, #{connection_metadata := Id}}, {message, _}, {status, #{code := ok}}],
+            raw_unary(Channel, <<"x">>, offer(Id, Suffix), #{})
+        )
+    end,
+    Refer = fun(Id) ->
+        case raw_unary(Channel, <<"x">>, #{id => Id}, #{}) of
+            [{message, <<"x", Suffix/binary>>}, {status, #{code := ok}}] -> Suffix;
+            [{status, #{code := invalid_argument, message := Message}}] -> Message
+        end
+    end,
+    Unknown = fun(Id) ->
+        iolist_to_binary(io_lib:format("unknown connection metadata set ~b", [Id]))
+    end,
+    [Offer(Id, integer_to_binary(Id)) || Id <- lists:seq(1, 5)],
+    %% The fifth dropped the oldest.
+    ?assertEqual(Unknown(1), Refer(1)),
+    ?assertEqual([<<"2">>, <<"3">>, <<"4">>, <<"5">>], [Refer(Id) || Id <- lists:seq(2, 5)]),
+    %% Storing an ID it holds replaces that set, which becomes the newest.
+    Offer(2, <<"two">>),
+    ?assertEqual(<<"two">>, Refer(2)),
+    Offer(6, <<"6">>),
+    ?assertEqual(Unknown(3), Refer(3)),
+    ?assertEqual([<<"two">>, <<"4">>, <<"5">>, <<"6">>], [Refer(Id) || Id <- [2, 4, 5, 6]]),
+    trevrpc_channel:close(Channel).
+
+checked_sets_test(Env) ->
+    Channel = metadata_channel(Env, #{}),
+    ?assertMatch(
+        [{status, #{code := invalid_argument, message := <<"unknown connection metadata set 1">>}}],
+        raw_unary(Channel, <<"a">>, #{id => 1}, #{})
+    ),
+    %% An offer is checked like request metadata, and an invalid one is not
+    %% stored.
+    ?assertMatch(
+        [{status, #{code := invalid_argument}}],
+        raw_unary(Channel, <<"a">>, #{id => 1, metadata => #{<<"Bad Key">> => <<>>}}, #{})
+    ),
+    ?assertMatch(
+        [{status, #{code := invalid_argument, message := <<"unknown connection metadata set 1">>}}],
+        raw_unary(Channel, <<"a">>, #{id => 1}, #{})
+    ),
+    %% The limits apply to the merged map.
+    Half = fun(Prefix) ->
+        maps:from_list([
+            {<<Prefix/binary, (integer_to_binary(I))/binary>>, <<>>}
+         || I <- lists:seq(1, 40)
+        ])
+    end,
+    ?assertMatch(
+        [{status, #{code := invalid_argument, message := <<"metadata has 80 entries", _/binary>>}}],
+        raw_unary(Channel, <<"a">>, #{id => 2, metadata => Half(<<"set-">>)}, Half(<<"own-">>))
+    ),
+    trevrpc_channel:close(Channel).
+
+%% The connection metadata of the REQUESTs `Fun' encodes: an offer of a set,
+%% a reference to one, or none.
+traced_requests(Fun) ->
+    Self = self(),
+    Worker = spawn(fun() ->
+        receive
+            go ->
+                Result =
+                    try
+                        Fun()
+                    catch
+                        Class:Reason:Stack -> {Class, Reason, Stack}
+                    end,
+                Self ! {done, self(), Result}
+        end
+    end),
+    1 = erlang:trace(Worker, true, [call]),
+    _ = erlang:trace_pattern({trevrpc_wire, encode_request, 1}, true, []),
+    Worker ! go,
+    Result =
+        receive
+            {done, Worker, Done} -> Done
+        after 20000 -> timeout
+        end,
+    _ = erlang:trace_pattern({trevrpc_wire, encode_request, 1}, false, []),
+    ?assertEqual(ok, Result),
+    Delivered = erlang:trace_delivered(Worker),
+    receive
+        {trace_delivered, Worker, Delivered} -> ok
+    end,
+    connection_sets(Worker).
+
+connection_sets(Pid) ->
+    receive
+        {trace, Pid, call, {trevrpc_wire, encode_request, [Fields]}} ->
+            Set =
+                case maps:get(connection_metadata, Fields, undefined) of
+                    undefined -> none;
+                    #{id := Id, metadata := Metadata} when map_size(Metadata) =:= 0 -> {refer, Id};
+                    #{id := Id} -> {offer, Id}
+                end,
+            [Set | connection_sets(Pid)]
+    after 0 -> []
+    end.
+
+suffixed(Channel, Message, Opts) ->
+    {ok, Reply, _} = trevrpc_client:unary(Channel, ?UNARY, Message, Opts#{timeout => 5000}),
+    Reply.
+
+channel_sets_test(Env) ->
+    Channel = metadata_channel(Env, #{connection_metadata => #{<<"interop-suffix">> => <<"!">>}}),
+    Sets = traced_requests(fun() ->
+        ?assertEqual(<<"a!">>, suffixed(Channel, <<"a">>, #{})),
+        ?assertEqual(<<"b!">>, suffixed(Channel, <<"b">>, #{})),
+        %% The call's own entry wins.
+        Own = #{metadata => #{<<"interop-suffix">> => <<"?">>}},
+        ?assertEqual(<<"c?">>, suffixed(Channel, <<"c">>, Own)),
+        %% A new set has a new ID, which is offered again.
+        ok = trevrpc_channel:set_connection_metadata(Channel, #{<<"interop-suffix">> => <<"#">>}),
+        ?assertEqual(<<"d#">>, suffixed(Channel, <<"d">>, #{})),
+        ?assertEqual(<<"e#">>, suffixed(Channel, <<"e">>, #{})),
+        ok = trevrpc_channel:set_connection_metadata(Channel, #{}),
+        ?assertEqual(<<"f">>, suffixed(Channel, <<"f">>, #{})),
+        ok
+    end),
+    ?assertEqual([{offer, 1}, {refer, 1}, {refer, 1}, {offer, 2}, {refer, 2}, none], Sets),
+    trevrpc_channel:close(Channel).
+
+replaced_set_test(Env) ->
+    Channel = metadata_channel(Env, #{connection_metadata => #{<<"interop-suffix">> => <<"!">>}}),
+    Sets = traced_requests(fun() ->
+        ?assertEqual(<<"a!">>, suffixed(Channel, <<"a">>, #{})),
+        %% The server refuses the optimistic upload, which carries the set
+        %% that was current when it started.
+        {ok, Call} = trevrpc_client:client_stream(Channel, ?CLIENT_STREAM, #{
+            compression => stream, timeout => 5000
+        }),
+        ok = trevrpc_channel:set_connection_metadata(Channel, #{<<"interop-suffix">> => <<"#">>}),
+        %% The replay still carries it, offered in full, since the server
+        %% may have dropped a set the channel replaced.
+        ok = trevrpc_client:send(Call, <<"x">>),
+        ?assertMatch({ok, <<"x:1!">>}, trevrpc_client:close_and_recv(Call)),
+        %% That offer's confirmation does not make calls refer to the new
+        %% set.
+        ?assertEqual(<<"b#">>, suffixed(Channel, <<"b">>, #{})),
+        ?assertEqual(<<"c#">>, suffixed(Channel, <<"c">>, #{})),
+        ok
+    end),
+    ?assertEqual([{offer, 1}, {refer, 1}, {offer, 1}, {offer, 2}, {refer, 2}], Sets),
+    trevrpc_channel:close(Channel).
+
+metadata_reconnect_test(#{credentials := Credentials}) ->
+    Server = start_server(Credentials, #{graceful_shutdown_timeout => 0}),
+    Env = #{credentials => Credentials, server => Server},
+    Channel = metadata_channel(Env, #{connection_metadata => #{<<"interop-suffix">> => <<"!">>}}),
+    Ports = ports(Server),
+    Before = traced_requests(fun() ->
+        ?assertEqual(<<"a!">>, suffixed(Channel, <<"a">>, #{})),
+        ?assertEqual(<<"b!">>, suffixed(Channel, <<"b">>, #{})),
+        ok
+    end),
+    ?assertEqual([{offer, 1}, {refer, 1}], Before),
+    ok = trevrpc_channel:subscribe(Channel),
+    ok = trevrpc_server:stop(Server),
+    await_state(Channel, connecting),
+    Server2 = start_server(Credentials, Ports),
+    try
+        await_state(Channel, {ready, 2}),
+        %% The new connection holds no sets, so a reference would fail.
+        After = traced_requests(fun() ->
+            ?assertEqual(<<"c!">>, suffixed(Channel, <<"c">>, #{})),
+            ?assertEqual(<<"d!">>, suffixed(Channel, <<"d">>, #{})),
+            ok
+        end),
+        ?assertEqual([{offer, 1}, {refer, 1}], After)
+    after
+        trevrpc_server:stop(Server2),
+        trevrpc_channel:close(Channel)
+    end.
+
+invalid_connection_metadata_test(#{credentials := Credentials, server := Server}) ->
+    ?assertMatch(
+        {error, #{code := invalid_argument}},
+        trevrpc_channel:connect(
+            (ports(Server))#{
+                host => {127, 0, 0, 1},
+                transport => maps:get(transport, Credentials),
+                server_name => "localhost",
+                cacerts => maps:get(cacerts, Credentials),
+                connection_metadata => #{<<"Bad Key">> => <<>>}
+            },
+            5000
+        )
+    ),
+    Channel = metadata_channel(#{credentials => Credentials, server => Server}, #{}),
+    ?assertMatch(
+        {error, #{code := invalid_argument}},
+        trevrpc_channel:set_connection_metadata(Channel, #{<<"trevrpc-x">> => <<>>})
+    ),
+    trevrpc_channel:close(Channel).
 
 %%% Dictionaries
 

@@ -3,7 +3,7 @@
 %% `skip <name>: <reason>' for each.
 -module(trevrpc_interop_client).
 
--export([run/1, connect/2]).
+-export([run/1, connect/2, connect/3]).
 
 -define(ECHO, trevrpc_interop_v1_echo).
 -define(COMPRESSED_ECHO, trevrpc_interop_v1_compressed_echo).
@@ -24,6 +24,8 @@
     "\"Wireless earbuds\",\"price\":39.99},{\"id\":\"p-1003\",\"title\":"
     "\"Wireless headphones pro\",\"price\":129.99}]}"
 >>).
+
+-define(SUFFIX, <<"interop-suffix">>).
 
 %% Every scenario of interop/README.md, in order; those this client cannot
 %% run yet name why.
@@ -46,7 +48,7 @@ scenarios() ->
         {<<"compressed-stream">>, fun compressed_stream/1},
         {<<"refused-stream">>, fun refused_stream/1},
         {<<"compressed-plain">>, fun compressed_plain/1},
-        {<<"connection-metadata">>, {unsupported, <<"connection metadata is not implemented">>}},
+        {<<"connection-metadata">>, {new_channel, fun connection_metadata/1}},
         {<<"validation">>, {unsupported, <<"buf.validate.Violations details are not decoded">>}}
     ].
 
@@ -62,7 +64,8 @@ run(Flags) ->
             Passed =
                 case Expected =:= any orelse Connected =:= Expected of
                     true ->
-                        run_scenarios(Channel, Selected);
+                        Connect = fun(Opts) -> connect(Flags, Transport, Opts) end,
+                        run_scenarios(Channel, Connect, Selected);
                     false ->
                         io:format(
                             standard_error, "client: connected over ~s, expected ~s~n", [
@@ -123,7 +126,14 @@ selection(#{}) ->
 %% channel's).
 -spec connect(#{string() => string()}, quic | tcp | auto) ->
     {ok, pid()} | {error, trevrpc_status:status()}.
-connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
+connect(Flags, Transport) ->
+    connect(Flags, Transport, #{}).
+
+%% @doc Connects a channel as {@link connect/2} does, with the channel
+%% options `Opts' on top.
+-spec connect(#{string() => string()}, quic | tcp | auto, map()) ->
+    {ok, pid()} | {error, trevrpc_status:status()}.
+connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport, Opts) ->
     {Host, Port} = host_port(Addr),
     {TcpHost, TcpPort} = host_port(maps:get("tcp-addr", Flags, Addr)),
     Max =
@@ -134,7 +144,7 @@ connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
                 #{}
         end,
     trevrpc_channel:connect(
-        Max#{
+        (maps:merge(Max, Opts))#{
             host => Host,
             port => Port,
             tcp_host => TcpHost,
@@ -147,7 +157,7 @@ connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
         },
         ?DEADLINE
     );
-connect(_Flags, _Transport) ->
+connect(_Flags, _Transport, _Opts) ->
     throw({usage, "client: --addr and --ca are required"}).
 
 host_port(Addr) ->
@@ -160,13 +170,16 @@ host_port(Addr) ->
         end,
     {Parsed, list_to_integer(Port)}.
 
-run_scenarios(Channel, Selected) ->
+%% A scenario runs on the channel, or, for `{new_channel, Fun}', connects
+%% channels of its own with `Connect'.
+run_scenarios(Channel, Connect, Selected) ->
     lists:foldl(
         fun({Name, Scenario}, Passed) ->
             Line =
                 case {selected(Name, Selected), Scenario} of
                     {false, _} -> {skip, <<"not in --scenarios">>};
                     {true, {unsupported, Why}} -> {skip, Why};
+                    {true, {new_channel, Fun}} -> run_scenario(Fun, Connect);
                     {true, Fun} -> run_scenario(Fun, Channel)
                 end,
             report(Name, Line),
@@ -181,8 +194,8 @@ selected(Name, Selected) -> lists:member(Name, Selected).
 
 %% Each scenario runs in a process of its own, so a call it leaves behind is
 %% cancelled when it ends.
-run_scenario(Fun, Channel) ->
-    {Pid, Monitor} = spawn_monitor(fun() -> exit({done, Fun(Channel)}) end),
+run_scenario(Fun, Arg) ->
+    {Pid, Monitor} = spawn_monitor(fun() -> exit({done, Fun(Arg)}) end),
     receive
         {'DOWN', Monitor, process, Pid, {done, ok}} ->
             {ok, <<>>};
@@ -576,6 +589,38 @@ record(Latency) ->
         integer_to_binary(Latency),
         <<"}">>
     ]).
+
+%% On a channel of its own: the server merges the connection metadata into
+%% every call, the later ones referring to the set it confirmed, and the
+%% call's own entry wins.
+connection_metadata(Connect) ->
+    case Connect(#{connection_metadata => #{?SUFFIX => <<"!">>}}) of
+        {ok, Channel} ->
+            Result = connection_metadata_calls(Channel),
+            trevrpc_channel:close(Channel),
+            Result;
+        Error ->
+            describe(Error)
+    end.
+
+connection_metadata_calls(Channel) ->
+    Call = fun(Message, Metadata) ->
+        expect_unary(
+            call_unary(Channel, #{message => Message}, opts(Metadata)),
+            <<Message/binary, (maps:get(?SUFFIX, Metadata, <<"!">>))/binary>>,
+            0
+        )
+    end,
+    maybe
+        ok ?= Call(<<"a">>, #{}),
+        ok ?= Call(<<"b">>, #{}),
+        ok ?= Call(<<"c">>, #{}),
+        ok ?= Call(<<"d">>, #{?SUFFIX => <<"?">>}),
+        ok ?= trevrpc_channel:set_connection_metadata(Channel, #{?SUFFIX => <<"#">>}),
+        expect_unary(call_unary(Channel, #{message => <<"e">>}, opts()), <<"e#">>, 0)
+    else
+        Error -> describe(Error)
+    end.
 
 %%% Helpers
 
