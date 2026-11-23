@@ -5,7 +5,7 @@
 }:
 callPackage ../module.nix { } {
   pname = "trevrpc-go-qmux";
-  version = "1.12.0";
+  version = "1.13.0";
 
   directory = ./.;
   # The module itself, the shared QMux golden vectors its tests read, and the

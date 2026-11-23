@@ -3,7 +3,7 @@
 }:
 callPackage ../module.nix { } {
   pname = "trevrpc-go-otel";
-  version = "1.12.0";
+  version = "1.13.0";
 
   directory = ./.;
   # The module itself plus the TrevRPC module its go.mod replaces with ../.

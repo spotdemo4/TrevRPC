@@ -1,6 +1,6 @@
 {
   "name": "@trevrpc/qmux",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "description": "QMux over WebSocket, shaped like WebTransport: QUIC streams, flow control and datagrams where UDP is blocked",
   "keywords": [
     "polyfill",

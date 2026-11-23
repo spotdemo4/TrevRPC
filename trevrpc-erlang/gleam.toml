@@ -5,7 +5,7 @@
 # Renovate updates; sync-erlang-deps (erlang_deps.py) copies them into
 # rebar.config and rebar.lock, with which rebar3 builds the runtime.
 name = "trevrpc"
-version = "1.12.0"
+version = "1.13.0"
 description = "Protobuf over QUIC, HTTP/3 & WebTransport"
 licences = ["MIT"]
 target = "erlang"

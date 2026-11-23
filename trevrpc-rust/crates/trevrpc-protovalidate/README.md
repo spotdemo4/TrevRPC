@@ -11,7 +11,7 @@ Generate the services with `protoc-gen-trevrpc-rust`'s `validate=true` option, w
 
 ```toml
 [dependencies]
-trevrpc-protovalidate = "1.12.0"
+trevrpc-protovalidate = "1.13.0"
 ```
 
 - The generated registration checks each request message of the methods whose request type carries rules, directly or in a message it holds. The other methods are generated as without the option and cost nothing.

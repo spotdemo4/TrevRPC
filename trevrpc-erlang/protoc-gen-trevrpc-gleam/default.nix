@@ -15,7 +15,7 @@ let
 in
 stdenv.mkDerivation (final: {
   pname = "protoc-gen-trevrpc-gleam";
-  version = "1.12.0";
+  version = "1.13.0";
 
   # The plugin, protoc-gen-trevrpc-erlang, and trevrpc/options.proto, which the tests' protos
   # import.

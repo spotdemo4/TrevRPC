@@ -13,7 +13,7 @@ packages = [
   { name = "gleeunit", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleeunit", source = "hex", outer_checksum = "EC31ABA74256AEA531EDF8169931D775BBB384FED0A8A1BDC4DD9354E3E21826" },
   { name = "h2", version = "0.18.3", build_tools = ["rebar3"], requirements = [], otp_app = "h2", source = "hex", outer_checksum = "CC53D7A6CB67DCCA975DBAAA0B41C190677E77808A6748D11810CC1D76320E0F" },
   { name = "idna", version = "8.0.0", build_tools = ["rebar3"], requirements = [], otp_app = "idna", source = "hex", outer_checksum = "E0C5CE7846F14515AF66142A55B8097D5F46D10DF9235E781F168BEF5622BCF9" },
-  { name = "qmux", version = "1.12.0", build_tools = ["gleam"], requirements = [], source = "local", path = "qmux" },
+  { name = "qmux", version = "1.13.0", build_tools = ["gleam"], requirements = [], source = "local", path = "qmux" },
   { name = "quic", version = "3.3.0", build_tools = ["rebar3"], requirements = ["idna"], otp_app = "quic", source = "hex", outer_checksum = "8BE3AF3C8FE9B11A60C7443C6173019264DD2147DA62759BC772CD9233E16BEC" },
   { name = "webtransport", version = "0.5.13", build_tools = ["rebar3"], requirements = ["h2", "quic"], otp_app = "webtransport", source = "hex", outer_checksum = "97C89AB850110DF2EDC000C37E880FEDC629954E12E2A3BEED7EF804B55A165B" },
 ]

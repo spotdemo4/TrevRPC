@@ -5,8 +5,8 @@ The BEAM runtime for [TrevRPC](https://trev.zip/llc/TrevRPC), an RPC framework l
 > **Status:** early work in progress. Progress is tracked in [#477](https://trev.zip/llc/TrevRPC/issues/477).
 
 > **Compatibility:** the TrevRPC runtimes and code generators share one version, and runtimes of the same version
-> are compatible with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0,
-> `trevrpc-kotlin` 1.12.0, and the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed
+> are compatible with each other: `trevrpc-rust` 1.13.0 works with `trevrpc-go` 1.13.0, `trevrpc-js` 1.13.0,
+> `trevrpc-kotlin` 1.13.0, and the Erlang `trevrpc` 1.13.0. Compatibility across different versions isn't guaranteed
 > yet; that's a milestone for 2.0. The QMux packages and the integrations have versions of their own.
 
 ## Packages

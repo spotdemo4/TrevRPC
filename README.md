@@ -29,8 +29,8 @@ messages as QUIC datagrams.
 
 > [!NOTE]
 > The TrevRPC runtimes and code generators share one version, and runtimes of the same version are compatible with
-> each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, `trevrpc-kotlin` 1.12.0, the
-> Erlang `trevrpc` 1.12.0, and the Python `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> each other: `trevrpc-rust` 1.13.0 works with `trevrpc-go` 1.13.0, `trevrpc-js` 1.13.0, `trevrpc-kotlin` 1.13.0, the
+> Erlang `trevrpc` 1.13.0, and the Python `trevrpc` 1.13.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 > The QMux packages and the integrations (OpenTelemetry, protovalidate, Effect) have versions of their own. TrevRPC
 > speaks its own protocol and is not wire-compatible with gRPC, gRPC-Web, or Connect. See [current limitations](https://trev.zip/llc/TrevRPC/wiki/Current-Limitations).
 

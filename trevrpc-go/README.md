@@ -3,8 +3,8 @@
 The Go runtime for [TrevRPC](https://trev.zip/llc/TrevRPC), an RPC framework like gRPC built on QUIC instead of HTTP/2: servers that serve native QUIC, HTTP/3 and WebTransport on one UDP port and every TCP fallback on one TCP port, and native QUIC clients that fall back to QMux over TLS when UDP is blocked. It is pure Go, built on [quic-go](https://github.com/quic-go/quic-go), [webtransport-go](https://github.com/quic-go/webtransport-go) and [coder/websocket](https://github.com/coder/websocket), with an in-tree QMux implementation, the [`qmux`](qmux) module, which is published on its own for applications other than TrevRPC.
 
 > **Compatibility:** the TrevRPC runtimes and code generators share one version, and runtimes of the same version
-> are compatible with each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0,
-> `trevrpc-kotlin` 1.12.0, and the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed
+> are compatible with each other: `trevrpc-rust` 1.13.0 works with `trevrpc-go` 1.13.0, `trevrpc-js` 1.13.0,
+> `trevrpc-kotlin` 1.13.0, and the Erlang `trevrpc` 1.13.0. Compatibility across different versions isn't guaranteed
 > yet; that's a milestone for 2.0. The QMux packages and the integrations have versions of their own.
 
 ## Packages

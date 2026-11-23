@@ -1,6 +1,6 @@
 [project]
 name = "trevrpc"
-version = "1.12.0"
+version = "1.13.0"
 description = "A client for TrevRPC, a protobuf RPC framework over QUIC"
 readme = "README.md"
 license = "MIT"

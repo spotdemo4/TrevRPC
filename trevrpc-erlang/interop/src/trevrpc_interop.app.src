@@ -1,6 +1,6 @@
 {application, trevrpc_interop, [
     {description, "TrevRPC cross-runtime interop executable"},
-    {vsn, "1.12.0"},
+    {vsn, "1.13.0"},
     {registered, []},
     {applications, [kernel, stdlib, trevrpc]},
     {env, []},

@@ -1,6 +1,6 @@
 {application, qmux, [
     {description, "QMux: QUIC streams and datagrams over TLS or WebSocket"},
-    {vsn, "1.12.0"},
+    {vsn, "1.13.0"},
     {registered, []},
     %% ssl only for qmux_ssl.
     {applications, [kernel, stdlib, ssl]},

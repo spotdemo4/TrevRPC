@@ -9,7 +9,7 @@
 }:
 callPackage ./module.nix { } rec {
   pname = "trevrpc-go";
-  version = "1.12.0";
+  version = "1.13.0";
 
   directory = ./.;
   # The module itself, including the QMux module its go.mod replaces with

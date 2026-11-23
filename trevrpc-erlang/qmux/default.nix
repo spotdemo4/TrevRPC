@@ -10,7 +10,7 @@ let
 in
 buildRebar3 (final: {
   name = "qmux";
-  version = "1.12.0";
+  version = "1.13.0";
 
   src = lib.fileset.toSource {
     root = ../../.;

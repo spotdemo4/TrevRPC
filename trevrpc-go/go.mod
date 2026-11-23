@@ -12,7 +12,7 @@ require (
 	golang.org/x/net v0.63.0
 	golang.org/x/sys v0.50.0
 	google.golang.org/protobuf v1.36.12
-	trev.zip/llc/trevrpc/trevrpc-go/qmux v1.12.0
+	trev.zip/llc/trevrpc/trevrpc-go/qmux v1.13.0
 )
 
 require (

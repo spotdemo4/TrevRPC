@@ -62,7 +62,7 @@ val minimumKotlinVersion =
     libs.versions.minimum.kotlin
         .get()
 
-version = "1.12.0"
+version = "1.13.0"
 providers.gradleProperty("trevrpcVersion").orNull?.let { version = it }
 providers.environmentVariable("TREVRPC_VERSION").orNull?.let { version = it }
 

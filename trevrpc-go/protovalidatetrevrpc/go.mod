@@ -6,7 +6,7 @@ require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2
 	buf.build/go/protovalidate v1.4.1
 	google.golang.org/protobuf v1.36.12
-	trev.zip/llc/trevrpc/trevrpc-go v1.12.0
+	trev.zip/llc/trevrpc/trevrpc-go v1.13.0
 )
 
 require (
@@ -28,7 +28,7 @@ require (
 	golang.org/x/text v0.44.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
-	trev.zip/llc/trevrpc/trevrpc-go/qmux v1.12.0 // indirect
+	trev.zip/llc/trevrpc/trevrpc-go/qmux v1.13.0 // indirect
 )
 
 replace (

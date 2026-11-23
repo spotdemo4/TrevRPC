@@ -10,7 +10,7 @@ let
 
   app = buildRebar3 {
     name = "trevrpc_interop";
-    version = "1.12.0";
+    version = "1.13.0";
     # Without _checkouts, which links the runtime for local builds.
     src = lib.fileset.toSource {
       root = ./.;
