@@ -7,7 +7,15 @@ QMux over TLS on the server's TCP listener where UDP is blocked, on messages gen
 [protobuf-py](https://github.com/bufbuild/protobuf-py). It is a client only, asyncio only, and requires
 Python 3.14.
 
-This package is an early work in progress; see [#666](https://trev.zip/llc/TrevRPC/issues/666).
+See the [Python Guide](https://trev.zip/llc/TrevRPC/wiki/Python-Guide) for the whole API, and
+[#666](https://trev.zip/llc/TrevRPC/issues/666) for what is still in progress.
+
+## Installing
+
+```sh
+pip install trevrpc                              # or: uv add trevrpc
+pip install protoc-gen-py protoc-gen-trevrpc-py  # the protoc plugins, for generating code
+```
 
 ## Generating a client
 

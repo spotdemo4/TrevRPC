@@ -170,6 +170,8 @@
               jdk25
               gradle_9
               python3
+              # python: flake-release builds and uploads the distributions with uv
+              uv
               # erlang and gleam: gleam publishes trevrpc on the runtime's Erlang/OTP 29, builds its
               # rebar3 dependencies with rebar3, and runs escript
               beamMinimal29Packages.erlang
@@ -194,6 +196,9 @@
               gradle_9
               # gleam: the gleam manager updates trevrpc-erlang/manifest.toml with it
               gleam
+              # python: the pep621 manager updates the uv.lock files with uv
+              uv
+              python314
             ];
           };
 

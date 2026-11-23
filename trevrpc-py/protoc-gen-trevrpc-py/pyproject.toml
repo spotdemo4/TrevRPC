@@ -10,11 +10,24 @@ dependencies = [
   # Pre-1.0: the plugin framework and the code it generates follow protobuf-py's minor version.
   "protobuf-py>=0.7,<0.8",
 ]
-classifiers = ["Programming Language :: Python :: 3", "Programming Language :: Python :: 3.14"]
+keywords = ["rpc", "quic", "protobuf", "protoc", "code generation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Code Generators",
+]
 
 [project.urls]
 Homepage = "https://trev.zip/llc/TrevRPC"
-Documentation = "https://trev.zip/llc/TrevRPC/wiki"
+Documentation = "https://trev.zip/llc/TrevRPC/wiki/Python-Guide"
+Repository = "https://trev.zip/llc/TrevRPC"
+Issues = "https://trev.zip/llc/TrevRPC/issues"
+Changelog = "https://trev.zip/llc/TrevRPC/releases"
 
 [project.scripts]
 protoc-gen-trevrpc-py = "protoc_gen_trevrpc_py:main"

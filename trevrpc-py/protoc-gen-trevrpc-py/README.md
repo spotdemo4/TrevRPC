@@ -22,3 +22,6 @@ call object at once. See the [trevrpc](https://pypi.org/project/trevrpc) package
 
 `src/protoc_gen_trevrpc_py/_options_pb.py` is what protoc-gen-py generates from
 `proto/trevrpc/options.proto`, so the plugin reads the options without other generated code.
+
+See the [Python Guide](https://trev.zip/llc/TrevRPC/wiki/Python-Guide) for the generated clients and the
+`trevrpc` runtime they call.

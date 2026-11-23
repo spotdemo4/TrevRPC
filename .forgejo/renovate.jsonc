@@ -135,6 +135,10 @@
       "matchManagers": ["gleam"],
       "addLabels": ["gleam"]
     },
+    {
+      "matchManagers": ["pep621"],
+      "addLabels": ["python"]
+    },
 
     // sync playwright from nix to npm
     {
@@ -194,6 +198,15 @@
         ],
         "executionMode": "branch"
       }
+    },
+
+    // update python deps: the pep621 manager raises the ranges in each pyproject.toml and updates
+    // its uv.lock with uv, which the Nix packages build from, so no hash needs updating. The runtime's
+    // aioquic range stays one minor version wide (its flow-control internals): a new minor release
+    // replaces it, and test_quic's slow-reader test fails it if those internals changed.
+    {
+      "matchManagers": ["pep621"],
+      "rangeStrategy": "replace"
     },
 
     // update npm deps

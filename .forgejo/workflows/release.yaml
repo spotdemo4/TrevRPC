@@ -136,6 +136,35 @@ jobs:
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-kotlin
 
+  python:
+    # zizmor: ignore[excessive-permissions]
+    name: trevrpc-py
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@de735751eb768b127a25bde1a8b776e3d3b0ec70 # v1.82.0
+        with:
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          fetch_depth: 0
+          shell: release
+
+      # flake-release builds each package's sdist and wheel with uv from the package's source, as
+      # the trevrpc-py-release check does, and publishes them. Without PYPI_TOKEN it publishes to the
+      # Forgejo registry only. The interop client is not released.
+      - name: Release to Forgejo and pypi.org
+        run: flake-release
+        env:
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: |
+            packages.x86_64-linux.trevrpc-py
+            packages.x86_64-linux.trevrpc-py-protoc-gen
+
   rust:
     # zizmor: ignore[excessive-permissions]
     name: trevrpc-rust

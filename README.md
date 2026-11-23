@@ -10,15 +10,17 @@
 [![go](<https://shields.trev.zip/badge/dynamic/regex?url=https://trev.zip/llc/TrevRPC/raw/branch/main/trevrpc-go/go.mod&search=go%20(.*)&replace=%3E%3D%241&logo=go&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%2300ADD8>)](https://go.dev/doc/devel/release)
 [![javascript](https://shields.trev.zip/badge/dynamic/json?url=https://trev.zip/llc/TrevRPC/raw/branch/main/trevrpc-js/package.json&query=%24.engines.node&logo=javascript&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%23F7DF1E)](https://nodejs.org/en/about/previous-releases)
 [![kotlin](https://shields.trev.zip/badge/dynamic/toml?url=https%3A%2F%2Ftrev.zip%2Fllc%2FTrevRPC%2Fraw%2Fbranch%2Fmain%2Ftrevrpc-kotlin%2Fgradle%2Flibs.versions.toml&query=%24.versions.minimum-kotlin&prefix=%3E%3D&logo=kotlin&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%237F52FF)](https://kotlinlang.org/docs/releases.html)
+[![python](https://shields.trev.zip/badge/dynamic/toml?url=https%3A%2F%2Ftrev.zip%2Fllc%2FTrevRPC%2Fraw%2Fbranch%2Fmain%2Ftrevrpc-py%2Fpyproject.toml&query=%24.project.requires-python&logo=python&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%233776AB)](https://devguide.python.org/versions/)
 [![rust](https://shields.trev.zip/badge/dynamic/toml?url=https%3A%2F%2Ftrev.zip%2Fllc%2FTrevRPC%2Fraw%2Fbranch%2Fmain%2Ftrevrpc-rust%2FCargo.toml&query=%24.package.rust-version&prefix=%3E%3D&logo=rust&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%23D34516)](https://releases.rs/)
 
 [![hex.pm](https://shields.trev.zip/hexpm/v/trevrpc?logo=erlang&logoColor=%23bac2de&labelColor=%23313244&color=%23A90533)](https://hex.pm/packages/trevrpc)
 [![pkg.go.dev](https://shields.trev.zip/badge/dynamic/json?url=https%3A%2F%2Fpkg.go.dev%2Fv1beta%2Fpackage%2Ftrev.zip%2Fllc%2Ftrevrpc%2Ftrevrpc-go&query=%24.version&logo=go&logoColor=%23bac2de&label=pkg.go.dev&labelColor=%23313244&color=%2300ADD8)](https://pkg.go.dev/trev.zip/llc/trevrpc/trevrpc-go)
 [![npm](https://shields.trev.zip/npm/v/%40trevrpc%2Ftrevrpc-js?logo=npm&logoColor=%23bac2de&labelColor=%23313244&color=%23F7DF1E)](https://www.npmjs.com/package/@trevrpc/trevrpc-js)
 [![maven-central](https://shields.trev.zip/maven-central/v/zip.trev.trevrpc/core?strategy=highestVersion&logo=apachemaven&logoColor=%23bac2de&labelColor=%23313244&color=%237F52FF)](https://central.sonatype.com/search?namespace=zip.trev.trevrpc)
+[![pypi](https://shields.trev.zip/pypi/v/trevrpc?logo=pypi&logoColor=%23bac2de&labelColor=%23313244&color=%233776AB)](https://pypi.org/project/trevrpc/)
 [![crates.io](https://shields.trev.zip/crates/v/trevrpc?labelColor=%23313244&color=%23D34516)](https://crates.io/crates/trevrpc)
 
-Protobuf RPC over QUIC, HTTP/3 & WebTransport, with TCP fallbacks, for Go, Rust, JavaScript, Kotlin, and Erlang
+Protobuf RPC over QUIC, HTTP/3 & WebTransport, with TCP fallbacks, for Go, Rust, JavaScript, Kotlin, Erlang, and Python
 
 TrevRPC is an RPC framework like gRPC, but built on QUIC instead of HTTP/2. Write a protobuf service, generate
 typed clients and servers, and call it from native apps, browsers, and Android. Each RPC gets its own QUIC
@@ -27,8 +29,8 @@ messages as QUIC datagrams.
 
 > [!NOTE]
 > The TrevRPC runtimes and code generators share one version, and runtimes of the same version are compatible with
-> each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, `trevrpc-kotlin` 1.12.0, and
-> the Erlang `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> each other: `trevrpc-rust` 1.12.0 works with `trevrpc-go` 1.12.0, `trevrpc-js` 1.12.0, `trevrpc-kotlin` 1.12.0, the
+> Erlang `trevrpc` 1.12.0, and the Python `trevrpc` 1.12.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 > The QMux packages and the integrations (OpenTelemetry, protovalidate, Effect) have versions of their own. TrevRPC
 > speaks its own protocol and is not wire-compatible with gRPC, gRPC-Web, or Connect. See [current limitations](https://trev.zip/llc/TrevRPC/wiki/Current-Limitations).
 
@@ -75,6 +77,7 @@ and browsers without WebTransport.
 | [JavaScript](trevrpc-js) (browser)                            | —                                                         | WebTransport | QMux over WebSocket                 |
 | [Kotlin](trevrpc-kotlin) (Android)                            | —                                                         | HTTP/3       | HTTP/2 (Cronet's built-in fallback) |
 | [Erlang](trevrpc-erlang) (in progress), with Gleam and Elixir | native QUIC, HTTP/3, WebTransport, and every TCP fallback | native QUIC  | QMux over TLS                       |
+| [Python](trevrpc-py) (asyncio)                                | —                                                         | native QUIC  | QMux over TLS                       |
 
 The browser client is supported on Chromium, Firefox, and Safari with the Go, Rust, and Erlang servers. See
 [TCP fallback](https://trev.zip/llc/TrevRPC/wiki/TCP-Fallback) for how the fallbacks are served and chosen.
@@ -260,6 +263,7 @@ codecs.
 | [JavaScript](trevrpc-js#packages)                | `npm install @trevrpc/trevrpc-js @bufbuild/protobuf`            | protobuf-es's `protoc-gen-es`, and optionally `@trevrpc/protoc-gen-trevrpc-js`       |
 | [Kotlin](trevrpc-kotlin#packages)                | `zip.trev.trevrpc:core` and `zip.trev.trevrpc:transport-cronet` | `protoc-gen-trevrpc-kotlin`                                                          |
 | [Erlang, Gleam, Elixir](trevrpc-erlang#packages) | `trevrpc` on Hex                                                | `protoc-gen-trevrpc-erlang`, `protoc-gen-trevrpc-gleam`, `protoc-gen-trevrpc-elixir` |
+| [Python](trevrpc-py#installing)                  | `pip install trevrpc`                                           | protobuf-py's `protoc-gen-py`, and `protoc-gen-trevrpc-py`                           |
 
 Each runtime's README lists every package it publishes, with how to install it, including the add-ons for
 OpenTelemetry, request validation, and Effect.
@@ -274,6 +278,7 @@ nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-erlang   # protoc-gen-trevrpc-erlang, -gleam and -elixir
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-py-protoc-gen
 ```
 
 ### download
@@ -289,8 +294,9 @@ the [wiki](https://trev.zip/llc/TrevRPC/wiki) has the full documentation:
 - runtime guides: [Go](https://trev.zip/llc/TrevRPC/wiki/Go-Guide),
   [Rust](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide),
   [JavaScript](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide),
-  [Kotlin](https://trev.zip/llc/TrevRPC/wiki/Kotlin-Guide), and
-  [Erlang, Gleam, and Elixir](https://trev.zip/llc/TrevRPC/wiki/Erlang-Guide)
+  [Kotlin](https://trev.zip/llc/TrevRPC/wiki/Kotlin-Guide),
+  [Erlang, Gleam, and Elixir](https://trev.zip/llc/TrevRPC/wiki/Erlang-Guide), and
+  [Python](https://trev.zip/llc/TrevRPC/wiki/Python-Guide)
 - transports: [HTTP/3 and HTTP/2](https://trev.zip/llc/TrevRPC/wiki/HTTP3),
   [WebTransport](https://trev.zip/llc/TrevRPC/wiki/WebTransport), and
   [TCP fallback](https://trev.zip/llc/TrevRPC/wiki/TCP-Fallback)

@@ -12,16 +12,26 @@ dependencies = [
   # Pre-1.0: code protoc-gen-py generates must match the runtime's minor version.
   "protobuf-py>=0.7,<0.8",
 ]
+keywords = ["rpc", "quic", "protobuf", "qmux", "asyncio"]
 classifiers = [
+  "Development Status :: 3 - Alpha",
   "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.14",
+  "Topic :: Internet",
+  "Topic :: System :: Networking",
   "Typing :: Typed",
 ]
 
 [project.urls]
 Homepage = "https://trev.zip/llc/TrevRPC"
-Documentation = "https://trev.zip/llc/TrevRPC/wiki"
+Documentation = "https://trev.zip/llc/TrevRPC/wiki/Python-Guide"
+Repository = "https://trev.zip/llc/TrevRPC"
+Issues = "https://trev.zip/llc/TrevRPC/issues"
+Changelog = "https://trev.zip/llc/TrevRPC/releases"
 
 [dependency-groups]
 dev = ["pytest>=9"]
