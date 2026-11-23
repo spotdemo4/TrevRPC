@@ -20,8 +20,12 @@ jobs:
           niks3_url: https://niks3.trev.zip
           shell: vulnerable
 
+      # zizmor's online audits read Forgejo's URL-form action references
+      # (https://host/owner/repo@ref) as a GitHub repository named "https:/"
+      # and abort, so files with one are left to the offline audits in the
+      # actions-fj flake checks.
       - name: Run zizmor
-        run: zizmor $(find .forgejo/workflows .forgejo/actions -name "*.yaml")
+        run: zizmor $(find .forgejo/workflows .forgejo/actions -name "*.yaml" -exec grep -LE "uses:\s*['\"]?https?://" {} +)
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
