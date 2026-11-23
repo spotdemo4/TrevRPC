@@ -241,7 +241,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.14.4"
-qmux = { version = "=0.6.6", default-features = false, features = ["tcp", "ws"] }
+qmux = { version = "=0.7.0", default-features = false, features = ["tcp", "ws"] }
 quinn = "0.11.8"
 # The congestion controller trait's RTT estimate, which quinn does not re-export.
 quinn-proto = { version = "0.11.19", default-features = false }

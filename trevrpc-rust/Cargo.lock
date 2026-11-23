@@ -2135,9 +2135,9 @@ dependencies = [
 
 [[package]]
 name = "qmux"
-version = "0.6.6"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deb005145a7b6ba9e6a51431bc409626559cd117a83d62566fe1e5b822684eda"
+checksum = "9c987c32ebb7d7d2a18b6c43bd97356f1fd68aadb5b3eab2552a37399487b03b"
 dependencies = [
  "bytes",
  "futures",
@@ -2146,7 +2146,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "web-transport-proto 0.6.4",
+ "web-transport-proto",
  "web-transport-trait",
 ]
 
@@ -2672,17 +2672,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "sfv"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "890ef0e5532daf21fdaa3dbaf991417187f3a87ab69231fe69be942495746480"
-dependencies = [
- "base64 0.22.1",
- "indexmap",
- "ref-cast",
 ]
 
 [[package]]
@@ -3458,27 +3447,13 @@ dependencies = [
 
 [[package]]
 name = "web-transport-proto"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40d8e5dba9b14dbe25b116ac7e62ca82bf7c328d1c6072238bf0b9b47874c9d1"
-dependencies = [
- "bytes",
- "http",
- "sfv 0.15.0",
- "thiserror 2.0.21",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "web-transport-proto"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d3f14c18ab78af2cec790710b7f2d161a002722bc8282dfac7755da97a717c5"
 dependencies = [
  "bytes",
  "http",
- "sfv 0.16.1",
+ "sfv",
  "thiserror 2.0.21",
  "tokio",
  "url",
@@ -3506,7 +3481,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "web-transport-proto 0.7.0",
+ "web-transport-proto",
  "web-transport-trait",
 ]
 

@@ -414,28 +414,67 @@ over_each_wire!(
     })
 );
 
+/// Uploads to the route that ends the call without reading, until a send fails, and checks that
+/// the call fails as the route ended it.
+async fn rejected_upload(transport: &dyn StreamingRpcTransport) -> TestResult {
+    let call =
+        trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply, _>(
+            transport,
+            &support::greeter_path(REJECT),
+            long_options(),
+            trevrpc::codec::Prost,
+        )
+        .await?;
+    send_until_failure(|| call.send(large_message())).await?;
+    let error = call
+        .close_and_recv()
+        .await
+        .err()
+        .ok_or("call should fail")?;
+    ensure_eq!(error.into_status().code(), Code::PermissionDenied);
+    Ok(())
+}
+
 over_each_wire!(
     multi_thread,
     client_streaming_upload_fails_when_the_handler_returns_early,
     [quic, qmux],
     |wire| run(wire, ServerOptions::new(), |transport| async move {
-        let call =
-            trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply, _>(
-                transport.as_ref(),
-                &support::greeter_path(REJECT),
-                long_options(),
-                trevrpc::codec::Prost,
-            )
+        rejected_upload(transport.as_ref()).await
+    })
+);
+
+/// How many uploads [`uploads_the_server_stops_give_back_their_connection_credit`] has rejected
+/// before its last call. Each can leave up to a stream window of request bytes unread, and the
+/// connection window holds two.
+const REJECTED_UPLOADS: usize = 8;
+
+/// The bytes a server discards from a request stream it stopped, buffered or arriving later,
+/// count as read for the connection's flow control: rejected uploads do not wedge the connection
+/// they came on.
+async fn uploads_the_server_stops_give_back_their_connection_credit(wire: Wire) -> TestResult {
+    // Windows small enough that the rejected uploads would use up the connection's many times
+    // over if their bytes were never credited back.
+    let options = ServerOptions::new()
+        .with_max_frame_size(64 * 1024)
+        .with_max_concurrent_streams_per_connection(Some(2));
+    run(wire, options, |transport| async move {
+        for _ in 0..REJECTED_UPLOADS {
+            rejected_upload(transport.as_ref()).await?;
+        }
+        let reply = greeter::GreeterClient::new(transport)
+            .say_hello(&name(1))
             .await?;
-        send_until_failure(|| call.send(large_message())).await?;
-        let error = call
-            .close_and_recv()
-            .await
-            .err()
-            .ok_or("call should fail")?;
-        ensure_eq!(error.into_status().code(), Code::PermissionDenied);
+        ensure_eq!(reply.message, "1");
         Ok(())
     })
+    .await
+}
+
+over_each_wire!(
+    multi_thread,
+    uploads_the_server_stops_give_back_their_connection_credit,
+    [quic, qmux]
 );
 
 over_each_wire!(
@@ -1002,11 +1041,8 @@ async fn a_client_that_stops_reading_loses_its_slot_at_the_deadline(wire: Wire) 
     )??;
     expect_finish(&mut reports, &[Code::DeadlineExceeded]).await?;
     // The only request slot is free again: another connection gets its call through. It has to be
-    // another one: over QMux, dropping a response stream that holds unread bytes does not give
-    // the connection back the flow-control credit of those bytes (qmux 0.6.6 only counts bytes
-    // the application reads), so the client's first connection stays wedged by the flood it
-    // never read, though the server ended the call and freed its slot. Reading the response to
-    // its reset frees the connection.
+    // another one: a client's connection window holds one frame, and the flood's unread bytes in
+    // the held response fill it.
     let (other_endpoint, other, close_other) = connect(wire, &server).await?;
     let reply = within!(
         TEST_TIMEOUT,
@@ -1018,6 +1054,43 @@ async fn a_client_that_stops_reading_loses_its_slot_at_the_deadline(wire: Wire) 
     close_other();
     close();
     for endpoint in [endpoint, other_endpoint].into_iter().flatten() {
+        endpoint.close(0_u32.into(), b"done");
+    }
+    server.stop(TEST_TIMEOUT).await
+}
+
+/// How many responses [`abandoned_responses_give_back_their_connection_credit`] drops unread
+/// before its last call.
+const ABANDONED_RESPONSES: usize = 3;
+
+/// Dropping a response that holds unread bytes gives their flow-control credit back to the
+/// connection: a client can abandon one response after another and keep using the connection.
+async fn abandoned_responses_give_back_their_connection_credit(wire: Wire) -> TestResult {
+    let (report, mut reports) = mpsc::unbounded_channel();
+    let recording = RecordingInterceptor { finished: report };
+    let server = spawn_server_with(ServerOptions::new(), |server| {
+        server.add_interceptor(recording);
+    })
+    .await?;
+    let (endpoint, transport, close) = connect(wire, &server).await?;
+
+    for _ in 0..ABANDONED_RESPONSES {
+        let held = within!(
+            TEST_TIMEOUT,
+            stalled_flood(transport.as_ref(), Duration::from_millis(250))
+        )??;
+        // By its deadline the flood has filled the connection's window with bytes nobody read.
+        expect_finish(&mut reports, &[Code::DeadlineExceeded]).await?;
+        drop(held);
+    }
+    let reply = within!(
+        TEST_TIMEOUT,
+        greeter::GreeterClient::new(transport).say_hello(&name(1))
+    )??;
+    ensure_eq!(reply.message, "1");
+
+    close();
+    if let Some(endpoint) = endpoint {
         endpoint.close(0_u32.into(), b"done");
     }
     server.stop(TEST_TIMEOUT).await
@@ -1051,6 +1124,11 @@ async fn shutdown_ends_a_call_whose_client_stopped_reading(wire: Wire) -> TestRe
 over_each_wire!(
     multi_thread,
     a_client_that_stops_reading_loses_its_slot_at_the_deadline,
+    [quic, qmux]
+);
+over_each_wire!(
+    multi_thread,
+    abandoned_responses_give_back_their_connection_credit,
     [quic, qmux]
 );
 over_each_wire!(
