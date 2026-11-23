@@ -617,28 +617,74 @@ silent_peer(Credentials) ->
 %% A session that only sends stays open while its peer reads and sends
 %% nothing back: as draft-02 section 7.1 defines the idle timeout, the sends
 %% restart it.
+%%
+%% A loaded machine can stall the sender for a whole idle timeout, and the
+%% session, idle in fact, then closes for `idle_timeout' as it should. Such
+%% a run proves nothing, so it runs again; any other close, or an idle one
+%% while no gap between sends reached the idle timeout, fails at once.
 one_way_sender(Credentials) ->
-    {Session, Socket} = connected(
-        Credentials, maps:merge(?PARAMETERS, #{max_idle_timeout => 1000}), #{}
+    one_way_sender(Credentials, 3).
+
+one_way_sender(Credentials, Attempts) ->
+    Idle = 1000,
+    {Session, {Module, Raw} = Socket} = connected(
+        Credentials, maps:merge(?PARAMETERS, #{max_idle_timeout => Idle}), #{}
     ),
     {ok, Id} = qmux:open_stream(Session),
     Queue = get({send_queue, Session}),
+    Self = self(),
     %% A byte every 100 ms for four idle timeouts, well within the stream
     %% window, so the peer owes no MAX_STREAM_DATA.
-    spawn_link(fun() ->
-        lists:foreach(
-            fun(_) ->
-                ok = qmux:send_data(Session, Queue, Id, <<1>>, false),
-                timer:sleep(100)
-            end,
-            lists:seq(1, 40)
-        )
-    end),
-    drain_stream_bytes(Socket, 40),
-    receive
-        {qmux, Session, {closed, Reason}} -> error({closed, Reason})
-    after 0 -> ok
+    Sender = spawn_link(fun() -> Self ! {self(), send_bytes(Session, Queue, Id, 40, 100, [])} end),
+    Outcome =
+        receive
+            {Sender, {ok, Times}} ->
+                drain_stream_bytes(Socket, 40),
+                receive
+                    {qmux, Session, {closed, Late}} ->
+                        {closed, Late, longest_gap([now_ms() | Times])}
+                after 0 -> ok
+                end;
+            {Sender, {closed, Times}} ->
+                {closed, Early} = await_closed(Session),
+                {closed, Early, longest_gap(Times)}
+        after 20000 -> error(sender_stuck)
+        end,
+    ok = Module:close(Raw),
+    erase(Socket),
+    case Outcome of
+        ok ->
+            ok;
+        {closed, idle_timeout, Gap} when Gap >= Idle, Attempts > 1 ->
+            one_way_sender(Credentials, Attempts - 1);
+        {closed, Reason, Gap} ->
+            error({closed, Reason, #{longest_gap => Gap, idle_timeout => Idle}})
     end.
+
+%% Writes a byte every Interval ms, Count times or until the session ends,
+%% and returns the time of every write tried, the latest first.
+send_bytes(_Session, _Queue, _Id, 0, _Interval, Times) ->
+    {ok, Times};
+send_bytes(Session, Queue, Id, Count, Interval, Times) ->
+    Now = now_ms(),
+    case qmux:send_data(Session, Queue, Id, <<1>>, false) of
+        ok ->
+            timer:sleep(Interval),
+            send_bytes(Session, Queue, Id, Count - 1, Interval, [Now | Times]);
+        {error, closed} ->
+            {closed, [Now | Times]}
+    end.
+
+%% The longest time between two of Times, the latest first.
+longest_gap([Latest | Earlier]) ->
+    {Gap, _} = lists:foldl(
+        fun(Time, {Longest, Later}) -> {max(Longest, Later - Time), Time} end,
+        {0, Latest},
+        Earlier
+    ),
+    Gap.
+
+now_ms() -> erlang:monotonic_time(millisecond).
 
 %% A session idle in both directions closes once the idle timeout passes.
 idle_timeout(Credentials) ->
