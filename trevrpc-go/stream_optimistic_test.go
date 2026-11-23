@@ -487,7 +487,7 @@ func TestOptimisticUploadWaitsForRoom(t *testing.T) {
 		client := newStreamClient(nil, DefaultMaxFrameSize)
 		client.streams = budget
 		request := requestFor("Upload", RPCKindClientStreaming)
-		return newOptimisticUpload(ctx, client, nil, request, nil, newStreamCompressor(budget, nil)), budget
+		return newOptimisticUpload(ctx, client, nil, request, nil, nil, newStreamCompressor(budget, nil)), budget
 	}
 	encodeAsync := func(u *optimisticUpload) <-chan error {
 		result := make(chan error, 1)
@@ -608,4 +608,106 @@ func recordedRequestBytes(t *testing.T, data []byte) *wireRequest {
 		t.Fatalf("sent %#v, want a REQUEST first", frames)
 	}
 	return frames[0].Request
+}
+
+// firstReadOpener runs beforeRead once, when the first stream it opened is
+// first read: after that call's REQUEST was prepared, before its response is.
+type firstReadOpener struct {
+	inner      streamOpener
+	opened     atomic.Bool
+	beforeRead func()
+}
+
+type firstReadStream struct {
+	clientStream
+	once       sync.Once
+	beforeRead func()
+}
+
+func (o *firstReadOpener) openStream(ctx context.Context) (clientStream, error) {
+	stream, err := o.inner.openStream(ctx)
+	if err != nil || o.opened.Swap(true) {
+		return stream, err
+	}
+	return &firstReadStream{clientStream: stream, beforeRead: o.beforeRead}, nil
+}
+
+func (s *firstReadStream) Read(p []byte) (int, error) {
+	s.once.Do(s.beforeRead)
+	return s.clientStream.Read(p)
+}
+
+// TestAReplayOffersAConnectionMetadataSetReplacedSinceTheFirstRequest checks
+// that the replay of a refused optimistic call that referred to its
+// connection metadata set offers the set in full once the channel replaced
+// it, since the server may have dropped it, and that the call still gets the
+// set it started with.
+func TestAReplayOffersAConnectionMetadataSetReplacedSinceTheFirstRequest(t *testing.T) {
+	pki := newTestPKI(t)
+	listener := startTestListenerWith(t, pki, nil, func(server *Server) {
+		// A route without stream compression refuses optimistic calls.
+		RegisterClientStreaming(server, testPath("SuffixUpload"), newStringValue, func(ctx context.Context, requests MessageStream[*wrapperspb.StringValue]) (*wrapperspb.StringValue, error) {
+			joined, err := joinUpload(ctx, requests)
+			if err != nil {
+				return nil, err
+			}
+			return wrapperspb.String(joined.GetValue() + string(RequestMetadataFromContext(ctx)["suffix"])), nil
+		})
+	})
+	for _, tc := range []struct {
+		name   string
+		policy TransportPolicy
+	}{
+		{"quic", TransportQUICOnly},
+		{"qmux", TransportTCPOnly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			channel, err := testDial(t.Context(), listener.Addr().String(), DialOptions{
+				TLSConfig:          pki.client,
+				Transport:          tc.policy,
+				TCPAddr:            listener.TCPAddr().String(),
+				ConnectionMetadata: Metadata{"suffix": []byte("!")},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = channel.Close() }()
+			client := newOptimisticTestClient(t, channel)
+
+			// A first call has the server confirm set 1.
+			if got, err := uploadSamples(t.Context(), t, channel, "SuffixUpload", nil); err != nil || got.GetValue() != joinedSamples()+"!" {
+				t.Fatalf("first upload = %q, %v", got.GetValue(), err)
+			}
+			if got := confirmedConnectionMetadata(t, channel); got != 1 {
+				t.Fatalf("confirmed set = %d, want 1", got)
+			}
+
+			// The next call refers to set 1, which is replaced before the
+			// refusal arrives.
+			client.reset()
+			opener := client.client.opener
+			client.client.opener = &firstReadOpener{inner: opener, beforeRead: func() {
+				if err := channel.SetConnectionMetadata(Metadata{"suffix": []byte("#")}); err != nil {
+					t.Error(err)
+				}
+			}}
+			defer func() { client.client.opener = opener }()
+			got, err := uploadSamples(t.Context(), t, channel, "SuffixUpload", nil)
+			if err != nil || got.GetValue() != joinedSamples()+"!" {
+				t.Fatalf("upload = %q, %v; want set 1 merged", got.GetValue(), err)
+			}
+			checkReplayed(t, client, streamTestMessages)
+			streams := client.streams()
+			if info := recordedRequest(t, streams[0]).ConnectionMetadata; info == nil || info.ID != 1 || len(info.Metadata) != 0 {
+				t.Fatalf("refused REQUEST carried %+v, want a reference to set 1", info)
+			}
+			if info := recordedRequest(t, streams[1]).ConnectionMetadata; info == nil || info.ID != 1 || string(info.Metadata["suffix"]) != "!" {
+				t.Fatalf("replayed REQUEST carried %+v, want set 1 in full", info)
+			}
+			// Its confirmation of a replaced set is ignored.
+			if got := confirmedConnectionMetadata(t, channel); got != 1 {
+				t.Fatalf("confirmed set = %d, want 1", got)
+			}
+		})
+	}
 }

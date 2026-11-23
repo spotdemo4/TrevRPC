@@ -305,11 +305,11 @@ func TestALateConfirmationOfAReplacedSetIsIgnored(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := newClientConnectionMetadata(source)
-	first := client.prepare(newWireRequest("/svc/m"))
+	first := client.prepare(newWireRequest("/svc/m"), client.current())
 	if err := source.set(Metadata{"k": []byte("2")}); err != nil {
 		t.Fatal(err)
 	}
-	second := client.prepare(newWireRequest("/svc/m"))
+	second := client.prepare(newWireRequest("/svc/m"), client.current())
 	client.learn(second, wireAnswer{ConnectionMetadata: second})
 	// The first call's ANSWER arrives last.
 	client.learn(first, wireAnswer{ConnectionMetadata: first})

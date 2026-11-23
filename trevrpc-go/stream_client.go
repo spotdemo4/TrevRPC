@@ -66,7 +66,7 @@ func (c *streamClient) call(
 ) (frameStream, error) {
 	protoMessage := protoMessageV2(message)
 	accept, queried := c.compression.prepare(request)
-	offered := c.connectionMetadata.prepare(request)
+	offered := c.connectionMetadata.prepare(request, c.connectionMetadata.current())
 	// A server-streaming call may stream-compress its responses.
 	streams := c.prepareStreams(request, accept)
 	// A message that may be compressed is encoded on its own; any other is
@@ -170,7 +170,8 @@ func (c *streamClient) streamingCall(
 	requests encodedStream,
 ) (frameStream, error) {
 	accept, queried := c.compression.prepare(request)
-	offered := c.connectionMetadata.prepare(request)
+	connectionSet := c.connectionMetadata.current()
+	offered := c.connectionMetadata.prepare(request, connectionSet)
 	streams := c.prepareStreams(request, accept)
 	setter, _ := requests.(compressorSetter)
 	if setter != nil {
@@ -209,7 +210,7 @@ func (c *streamClient) streamingCall(
 	var upload *optimisticUpload
 	stopCancel := cancelStreamOnContext
 	if optimistic {
-		upload = newOptimisticUpload(streamCtx, c, stream, request, accept, streams.requests)
+		upload = newOptimisticUpload(streamCtx, c, stream, request, connectionSet, accept, streams.requests)
 		setter.setUpload(upload)
 		sink = upload
 		stopCancel = func(ctx context.Context, _ clientStream) func() { return watchContextCancellation(ctx, upload.cancel) }
@@ -429,6 +430,8 @@ type transportResponseStream struct {
 	queried     bool
 	// connection is the connection's connection metadata state, and offered
 	// the set the request offered, which the ANSWER of the response confirms.
+	// A replay sets offered in the pump before delivering any frame, so Recv
+	// reads the replay's.
 	connection *clientConnectionMetadata
 	offered    uint32
 	// answerClosed is set once a frame other than ANSWER was delivered: the
@@ -584,10 +587,12 @@ func (s *transportResponseStream) pump() {
 func (s *transportResponseStream) replayRefused(upload *optimisticUpload) error {
 	upload.decide(true)
 	s.pessimistic.Store(true)
-	stream, err := upload.replay()
+	stream, offered, err := upload.replay()
 	if err != nil {
 		return err
 	}
+	// The refusal carried no ANSWER: the replay's answers its own REQUEST.
+	s.offered = offered
 	s.reader = newResponseFrameReader(stream, s.maxFrameSize, upload.accept, s.streams.responseInflater())
 	return nil
 }

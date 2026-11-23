@@ -82,18 +82,28 @@ func newClientConnectionMetadata(source *connectionMetadataSource) *clientConnec
 	return &clientConnectionMetadata{source: source}
 }
 
-// prepare sets the connection metadata of request: a reference to the current
-// set once the connection confirmed it, an offer of it otherwise. It returns
-// the ID it offered, which learn checks the ANSWER against, or zero.
-func (c *clientConnectionMetadata) prepare(request *wireRequest) uint32 {
+// current returns the set a call that starts now carries for its whole life,
+// the replay of a refused optimistic call included: the channel's current
+// one, or nil.
+func (c *clientConnectionMetadata) current() *connectionMetadataSet {
 	if c == nil {
+		return nil
+	}
+	return c.source.current.Load()
+}
+
+// prepare sets the connection metadata of request, whose call carries set
+// (see current): a reference to it once the connection confirmed it while it
+// is still the channel's current set, an offer of it otherwise. The server
+// keeps only the newest few sets a connection offered, so one replaced since
+// the call started may be gone. It returns the ID it offered, which learn
+// checks the ANSWER against, or zero.
+func (c *clientConnectionMetadata) prepare(request *wireRequest, set *connectionMetadataSet) uint32 {
+	if c == nil || set == nil {
+		request.ConnectionMetadata = nil
 		return 0
 	}
-	set := c.source.current.Load()
-	if set == nil {
-		return 0
-	}
-	if c.confirmed.Load() == set.id {
+	if c.confirmed.Load() == set.id && c.source.current.Load() == set {
 		request.ConnectionMetadata = &connectionMetadataInfo{ID: set.id}
 		return 0
 	}

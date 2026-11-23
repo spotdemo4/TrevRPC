@@ -43,12 +43,14 @@ type keptRequest struct {
 type optimisticUpload struct {
 	client *streamClient
 	ctx    context.Context
-	// request is the optimistic REQUEST, and accept the dictionaries the call
+	// request is the optimistic REQUEST, connectionSet the connection
+	// metadata set the call carries, and accept the dictionaries the call
 	// accepts on its responses, for the replay.
-	request    *wireRequest
-	accept     *dictSet
-	compressor *streamCompressor
-	per        *messageCompressor
+	request       *wireRequest
+	connectionSet *connectionMetadataSet
+	accept        *dictSet
+	compressor    *streamCompressor
+	per           *messageCompressor
 
 	current    atomic.Pointer[streamRef]
 	generation atomic.Uint32
@@ -83,18 +85,19 @@ type optimisticUpload struct {
 // streamRef holds a clientStream for an atomic.Pointer.
 type streamRef struct{ clientStream }
 
-func newOptimisticUpload(ctx context.Context, client *streamClient, stream clientStream, request *wireRequest, accept *dictSet, compressor *streamCompressor) *optimisticUpload {
+func newOptimisticUpload(ctx context.Context, client *streamClient, stream clientStream, request *wireRequest, connectionSet *connectionMetadataSet, accept *dictSet, compressor *streamCompressor) *optimisticUpload {
 	u := &optimisticUpload{
-		client:     client,
-		ctx:        ctx,
-		request:    request,
-		accept:     accept,
-		compressor: compressor,
-		per:        client.compression.requestCompressor(request.plainCompression.Requests),
-		keeping:    true,
-		settled:    make(chan struct{}),
-		decided:    make(chan struct{}),
-		replayed:   make(chan struct{}),
+		client:        client,
+		ctx:           ctx,
+		request:       request,
+		connectionSet: connectionSet,
+		accept:        accept,
+		compressor:    compressor,
+		per:           client.compression.requestCompressor(request.plainCompression.Requests),
+		keeping:       true,
+		settled:       make(chan struct{}),
+		decided:       make(chan struct{}),
+		replayed:      make(chan struct{}),
 	}
 	u.current.Store(&streamRef{stream})
 	u.generation.Store(optimisticGeneration)
@@ -283,8 +286,11 @@ func (u *optimisticUpload) end() {
 // replay replaces the refused call with a new one on a new stream: the same
 // REQUEST, no longer optimistic, with the time that remains, then the kept
 // requests per message, then, from the writer, the rest. The writer is held
-// off while it happens, and the old stream is aborted.
-func (u *optimisticUpload) replay() (stream clientStream, err error) {
+// off while it happens, and the old stream is aborted. The REQUEST carries the
+// call's connection metadata set afresh, since the channel may have replaced
+// it since the refused one referred to it; replay returns the ID it offered,
+// which the replay's ANSWER confirms.
+func (u *optimisticUpload) replay() (stream clientStream, offered uint32, err error) {
 	defer func() {
 		u.replayErr = err
 		close(u.replayed)
@@ -311,35 +317,36 @@ func (u *optimisticUpload) replay() (stream clientStream, err error) {
 
 	request := *u.request
 	request.StreamCompression = streamCompressionEnabled
+	offered = u.client.connectionMetadata.prepare(&request, u.connectionSet)
 	if deadline, ok := u.ctx.Deadline(); ok {
 		request.TimeoutNanos = deadlineTimeoutNanos(clientDeadline{at: deadline, set: true}, time.Now)
 	}
 	frames, err := appendRequestFrame(nil, &request, u.client.maxFrameSize)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for _, message := range kept {
 		frames = append(frames, encodePayload(message.payload, message.dict).frame...)
 	}
 
 	if stream, err = u.client.opener.openStream(u.ctx); err != nil {
-		return nil, callStatus(u.ctx, err)
+		return nil, 0, callStatus(u.ctx, err)
 	}
 	u.current.Store(&streamRef{stream})
 	if u.ended.Load() {
 		// The call ended while the stream was opened.
 		u.cancel()
-		return nil, statusFromContextError(context.Canceled)
+		return nil, 0, statusFromContextError(context.Canceled)
 	}
 	if _, err := stream.Write(frames); err != nil {
-		return nil, callStatus(u.ctx, err)
+		return nil, 0, callStatus(u.ctx, err)
 	}
 	if u.closed {
 		if err := stream.Close(); err != nil {
-			return nil, callStatus(u.ctx, err)
+			return nil, 0, callStatus(u.ctx, err)
 		}
 	}
-	return stream, nil
+	return stream, offered, nil
 }
 
 // requestSink is where a call's requests are written: its stream, or the
