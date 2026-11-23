@@ -278,7 +278,7 @@ nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-erlang   # protoc-gen-trevrpc-erlang, -gleam and -elixir
-nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-py-protoc-gen
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-py
 ```
 
 ### download

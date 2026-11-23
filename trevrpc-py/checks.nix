@@ -59,7 +59,7 @@ in
     script = ''
       export HOME="$TMPDIR" UV_NO_CACHE=1 UV_OFFLINE=1 UV_PYTHON_DOWNLOADS=never
       dist="$TMPDIR/dist"
-      for source in ${packages.trevrpc-py.src} ${packages.trevrpc-py-protoc-gen.src}; do
+      for source in ${packages.trevrpc-py.src} ${packages.trevrpc-py.protocGen.src}; do
         staged=$(mktemp -d)
         cp -R "$source"/. "$staged"
         chmod -R u+w "$staged"
@@ -69,7 +69,7 @@ in
 
       # Both packages release at the runtimes' shared version.
       version=${packages.trevrpc-py.version}
-      [ "${packages.trevrpc-py-protoc-gen.version}" = "$version" ]
+      [ "${packages.trevrpc-py.protocGen.version}" = "$version" ]
       for name in trevrpc-$version-py3-none-any.whl trevrpc-$version.tar.gz \
         protoc_gen_trevrpc_py-$version-py3-none-any.whl protoc_gen_trevrpc_py-$version.tar.gz; do
         [ -f "$dist/$name" ] || { echo "missing $name" >&2; ls "$dist" >&2; exit 1; }
@@ -104,7 +104,7 @@ in
     ];
     packages = [
       protobuf
-      packages.trevrpc-py-protoc-gen
+      packages.trevrpc-py
       pluginEnv
     ];
     script = ''

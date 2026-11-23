@@ -172,7 +172,6 @@ nix build .#trevrpc-erlang
 nix build .#trevrpc-erlang-interop
 nix build .#trevrpc-erlang.gleam
 nix build .#trevrpc-py
-nix build .#trevrpc-py-protoc-gen
 nix build .#trevrpc-py-interop
 ```
 

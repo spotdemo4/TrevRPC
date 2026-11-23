@@ -163,7 +163,7 @@ jobs:
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: |
             packages.x86_64-linux.trevrpc-py
-            packages.x86_64-linux.trevrpc-py-protoc-gen
+            packages.x86_64-linux.trevrpc-py.protocGen
 
   rust:
     # zizmor: ignore[excessive-permissions]
