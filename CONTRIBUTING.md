@@ -144,6 +144,9 @@ the Python interop client runs on bindings generated from `interop/proto` with `
 trevrpc-py/interop/generate.sh
 ```
 
+it also refreshes the plugin's `_options_pb.py`, and leaves the plugins' versions out of the headers so that a
+release or a `protoc-gen-py` update doesn't make the bindings stale; the `trevrpc-py-generated` check compares both
+
 the release builds the PyPI distributions from each Python package's Nix source, not from its build output. The
 `trevrpc-py-release` check builds them the same way and checks what PyPI gets: `twine check --strict`, the shared
 version, `py.typed` in the `trevrpc` wheel, the plugin's entry point, and no tests. Run it after changing a package's

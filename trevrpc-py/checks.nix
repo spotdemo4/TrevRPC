@@ -90,9 +90,9 @@ in
     '';
   };
 
-  # The interop bindings are what protoc-gen-py and protoc-gen-trevrpc-py generate from
-  # interop/proto, and the plugin's _options_pb.py what protoc-gen-py generates from
-  # trevrpc/options.proto.
+  # The interop bindings are what interop/generate.sh generates from interop/proto with
+  # protoc-gen-py and protoc-gen-trevrpc-py, and the plugin's _options_pb.py its
+  # trevrpc/options_pb.py.
   generated = {
     root = ../.;
     files = [
@@ -110,11 +110,8 @@ in
     script = ''
       bash trevrpc-py/interop/generate.sh "$TMPDIR/gen"
       diff -ru trevrpc-py/interop/gen "$TMPDIR/gen"
-
-      mkdir "$TMPDIR/options"
-      protoc -I proto --py_out="$TMPDIR/options" trevrpc/options.proto
       diff -u trevrpc-py/protoc-gen-trevrpc-py/src/protoc_gen_trevrpc_py/_options_pb.py \
-        "$TMPDIR/options/trevrpc/options_pb.py"
+        "$TMPDIR/gen/trevrpc/options_pb.py"
     '';
   };
 }
