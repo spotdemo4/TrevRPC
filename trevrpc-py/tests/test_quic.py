@@ -315,15 +315,21 @@ class FlowControlTest(QuicTest):
             self.assertIsNotNone(await stream.recv())
             # Stop reading: the server is held at the read-ahead queue plus the stream window.
             call = await self.server.call()
-            await self.server.changed.wait_until(lambda: call.blocked_at is not None)
-            sent = call.blocked_at
-            assert sent is not None
+            protocol = self.server.connections[0]
             limit = 1024 * 1024 + 2 * FLOOD_MESSAGE + trevrpc.DEFAULT_MAX_FRAME_SIZE + 64
+            # Over 5 MiB has to pass first, which a loaded machine can take well over WAIT to
+            # move: wait as long as it moves, and stop once it passes the limit.
+            await self.server.changed.wait_while_progressing(
+                lambda: call.blocked_at is not None or protocol.sent(call.stream_id) >= limit,
+                lambda: protocol.sent(call.stream_id),
+            )
+            sent = call.blocked_at
+            self.assertIsNotNone(sent, f"the server sent {protocol.sent(call.stream_id)} bytes")
+            assert sent is not None
             self.assertLess(sent, limit)
             # Reading again releases it.
             for _ in range(64):
                 await stream.recv()
-            protocol = self.server.connections[0]
             await self.server.changed.wait_until(lambda: protocol.sent(call.stream_id) > sent)
 
 

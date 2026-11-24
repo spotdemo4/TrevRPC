@@ -147,6 +147,23 @@ class Signal:
                 self._waiters.append(waiter)
                 await waiter
 
+    async def wait_while_progressing(
+        self, condition: Callable[[], bool], progress: Callable[[], int], timeout: float = WAIT
+    ) -> None:
+        """Waits until `condition()` holds, failing only once `progress()` has not grown for
+        `timeout`: for waits on data moving through aioquic, which handles every packet in Python
+        and so takes as long as the machine's load makes it."""
+        loop = asyncio.get_running_loop()
+        async with asyncio.timeout(timeout) as deadline:
+            last = progress()
+            while not condition():
+                waiter = loop.create_future()
+                self._waiters.append(waiter)
+                await waiter
+                if (current := progress()) > last:
+                    last = current
+                    deadline.reschedule(loop.time() + timeout)
+
 
 def _status_frame(
     code: int = 0,
