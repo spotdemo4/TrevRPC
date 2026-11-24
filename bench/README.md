@@ -72,7 +72,9 @@ reads, with that table's options (scenarios, sizes, concurrency, payload,
 compression modes, netem profiles, messages, duration) as defaults; explicit
 flags still override them. The tables are in [`tables.py`](tables.py):
 `comparison`, `compression`, `link`, `lossy`, `metadata`, `datagrams`,
-`validation`, `browser`, `browser-compression`, and `browser-lossy`. They refer to the packaged servers and clients
+`validation`, `browser`, `browser-compression`, and `browser-lossy`, plus
+`access`, a prototype of access-network profiles that is not on the page yet
+(#734). They refer to the packaged servers and clients
 by name (`go`, `rust`, the baseline's `grpc` and `connect`, and `chromium`) and
 run each native TrevRPC client against its own runtime's server only. Nothing in CI gates on these numbers: the flake
 check runs a very short matrix only to keep the tool working.
@@ -161,6 +163,23 @@ one table per profile, and each JSON record carries the profile as `netem`.
 - netem's queue holds 1,000,000 packets, so delay alone never drops any. A
   `limit` in the profile overrides it, which matters with `rate`: a queue
   that deep in front of a slow rate adds seconds of delay.
+- Both directions share one queue, so a `rate` caps what they carry
+  together, as on Wi-Fi, where they share the medium. A profile splits them
+  with sections that add arguments for one direction, after the shared ones:
+  `delay 30ms up rate 5mbit limit 450 down rate 20mbit limit 1700` is a
+  60 ms round trip with 5 Mbit/s from client to server and 20 Mbit/s back,
+  each behind its own queue, as on a cellular link. netem takes the last of a
+  repeated option, so a section can also override a shared one. Packets the
+  servers send go to the `down` queue by their source port, and the
+  namespace reserves the servers' ports so that no client sends from one.
+- `outage DURATION every PERIOD`, anywhere in a profile, drops every packet
+  in both directions for `DURATION` out of each `PERIOD`, the first starting
+  half a period after the client does, as when a phone hands over between
+  cells or a laptop roams between access points: `outage 170ms every 5s`.
+  Outages that would end after the measured window are left out.
+- The `access` table runs profiles of Wi-Fi, roaming Wi-Fi, LTE and 5G on the
+  move ([`tables.py`](tables.py) cites the measurements behind each), with the
+  same cells as `lossy`.
 - Size streaming operations to the link. Only operations that finish inside
   the measured window count, and with loss one connection carries far less:
   at a 20 ms round trip and 1% loss, roughly 1 MB/s. The default 100

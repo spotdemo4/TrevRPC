@@ -14,6 +14,7 @@ grpc-go and connect-go baselines and the browsers' lanes; see README.md.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import itertools
 import json
@@ -458,13 +459,16 @@ class Runner:
     failures: list[Failure]
     # The server the cells run against, whose log a failed cell repeats.
     server: Server | None
+    # The emulated link, with --netem.
+    link: netem.Link | None
 
-    def __init__(self, matrix: Matrix, out: Path) -> None:
+    def __init__(self, matrix: Matrix, out: Path, link: netem.Link | None = None) -> None:
         self.matrix = matrix
         self.out = out
         self.results = []
         self.failures = []
         self.server = None
+        self.link = link
 
     def run_matrix(
         self,
@@ -577,7 +581,7 @@ class Runner:
         """Runs the cell once, logging to NAME.log, and says how it went."""
         log = self.out / f"{name}.log"
         offset = 0 if self.server is None else self.server.log_size()
-        with log.open("w", encoding="utf-8") as stderr:
+        with log.open("w", encoding="utf-8") as stderr, self.outages(netem):
             completed = run_with_deadline(
                 command, self.matrix.deadline, stdout=subprocess.PIPE, stderr=stderr
             )
@@ -602,6 +606,12 @@ class Runner:
             retry = "completed no operation" if result.record.get("ops") == 0 else None
             return Attempt(log, offset, result, f"reported errors: {line}", retry)
         return Attempt(log, offset, result)
+
+    def outages(self, profile: str | None) -> contextlib.AbstractContextManager[None]:
+        """The profile's outages, which run while a client does."""
+        if self.link is None or profile is None:
+            return contextlib.nullcontext()
+        return self.link.outages(profile, self.matrix.warmup + self.matrix.duration)
 
     def fail(self, cell: str, reason: str, log: Path, offset: int) -> None:
         """Reports the failure now and keeps it, with the end of the cell's log and what the
@@ -868,10 +878,11 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
         if servers and set(compressions) & set(DICTIONARY_COMPRESSIONS)
         else None
     )
-    runner = Runner(build_matrix(args, dictionary), out)
+    link = netem.Link() if args.netem else None
+    runner = Runner(build_matrix(args, dictionary), out, link)
     profiles: list[str | None] = [*args.netem] or [None]
-    if args.netem:
-        netem.configure(args.netem)
+    if link is not None:
+        link.configure(args.netem)
     certificate = generate_certificate(work)
     _ = (out / "results.jsonl").write_text("", encoding="utf-8")
     tls = ["--ca", str(certificate.cert), "--server-name", "localhost"]
@@ -883,6 +894,8 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
         server = Server(spec.name, spec.command, certificate, out, server_arguments)
         runner.server = server
         try:
+            if link is not None:
+                link.serve(server.ports.values())
             native = f"127.0.0.1:{server.port('native')}"
             qmux = f"127.0.0.1:{server.port('qmux')}"
             transports = {
@@ -890,7 +903,8 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
                 "tcp": ["--addr", native, "--tcp-addr", qmux, *tls],
             }
             for profile in profiles:
-                apply(profile)
+                if link is not None and profile is not None:
+                    link.apply(profile)
                 for client in clients:
                     for transport, flags in transports.items():
                         runner.run_matrix(
@@ -922,8 +936,11 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
         server = Server("baseline", baseline, certificate, out)
         runner.server = server
         try:
+            if link is not None:
+                link.serve(server.ports.values())
             for profile in profiles:
-                apply(profile)
+                if link is not None and profile is not None:
+                    link.apply(profile)
                 for transport in BASELINE_TRANSPORTS:
                     address = f"127.0.0.1:{server.port(transport)}"
                     runner.run_matrix(
@@ -948,11 +965,6 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
         finally:
             runner.stop(server)
     return runner
-
-
-def apply(profile: str | None) -> None:
-    if profile is not None:
-        netem.apply(profile)
 
 
 def main(argv: list[str]) -> int:

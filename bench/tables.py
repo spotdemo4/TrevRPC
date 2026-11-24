@@ -144,6 +144,21 @@ ALL_COMPRESSIONS = ["none", "gzip", "zstd", "dictionary", "stream", "stream-dict
 # were noisy; 5 s measured the same as 3 s within the runs' spread.
 LOOPBACK = {"duration": 3.0, "warmup": 0.5}
 
+# What the tables of impaired links run: few messages per call, small paced ones, and long
+# windows, which loss and outages need to average out.
+IMPAIRED = {
+    "scenarios": ["unary", "bidi", "server-stream", "client-stream", "paced", "unreliable-paced"],
+    "sizes": [64, 1024],
+    "concurrency": [64],
+    "messages": 10,
+    # 64 workers at 25 messages of 64 bytes per second. One connection on these links carries
+    # roughly 1 MB/s, and a load near that queues until every echo is late: 25 messages of
+    # 1 KiB per worker lost nearly all of them, even over TCP, and 100 of 64 bytes already
+    # doubled the round trips.
+    "rates": [25],
+    "duration": 10.0,
+}
+
 # Real links lose packets in bursts, not one at a time: Wi-Fi and cellular retransmit below IP, so
 # their losses show up as delay, and what does get dropped goes in runs. netem's Gilbert-Elliott
 # model alternates between a good state that loses nothing and a bad one, entered with
@@ -153,6 +168,28 @@ LOOPBACK = {"duration": 3.0, "warmup": 0.5}
 GILBERT_ELLIOTT = [
     "delay 10ms loss gemodel 0.5% 25% 50% 0%",
     "delay 10ms loss gemodel 1% 20% 60% 0%",
+]
+
+# Access networks as their measurements describe them, where what users see is delay, a
+# bottleneck with a deep queue, and outages, more than random loss: Wi-Fi and cellular
+# retransmit below IP. A prototype; see the issue that proposed it for the sources.
+ACCESS = [
+    # Wi-Fi: one medium, so one queue for both directions, at 100 Mbit/s. Pareto slots add 2 ms
+    # to the round trip at the median and 19 ms at p90, as Sui et al. (MobiSys 2016) measured on
+    # a campus network, but only 36 ms at p99, where they saw over 250 ms: their tail comes in
+    # episodes of minutes, which netem's independent slots do not model.
+    "delay 10ms rate 100mbit limit 1000 slot distribution pareto 1ms 8ms",
+    # The same Wi-Fi, roaming between access points every 5 s: 60-400 ms without 802.11r
+    # (Shin et al., MobiSys 2004), the longest here.
+    "delay 10ms rate 100mbit limit 1000 slot distribution pareto 1ms 8ms outage 400ms every 5s",
+    # LTE: a 60 ms round trip, 20 Mbit/s down and 5 up (Huang et al., SIGCOMM 2013; Ghoshal et
+    # al., IMC 2023), each direction behind about a second of queue (Jiang et al., CellNet 2012),
+    # and the 0.06% that TCP retransmits on it.
+    "delay 30ms loss 0.05% up rate 5mbit limit 450 down rate 20mbit limit 1700",
+    # 5G NSA on the move: a 70 ms round trip, 40 Mbit/s down and 12 up (Ghoshal et al.), half a
+    # second of queue, and a 170 ms handover every 5 s (167 ms on average, Hassan et al.,
+    # SIGCOMM 2022), far more often than on a freeway, so that each run sees two.
+    "delay 35ms up rate 12mbit limit 500 down rate 40mbit limit 1700 outage 170ms every 5s",
 ]
 
 TABLES: dict[str, Table] = {
@@ -194,29 +231,18 @@ TABLES: dict[str, Table] = {
     "lossy": Table(
         "Lossy links",
         {
-            "scenarios": [
-                "unary",
-                "bidi",
-                "server-stream",
-                "client-stream",
-                "paced",
-                "unreliable-paced",
-            ],
-            "sizes": [64, 1024],
-            "concurrency": [64],
-            "messages": 10,
-            # 64 workers at 25 messages of 64 bytes per second. One connection on these links
-            # carries roughly 1 MB/s, and a load near that queues until every echo is late:
-            # 25 messages of 1 KiB per worker lost nearly all of them, even over TCP, and 100 of
-            # 64 bytes already doubled the round trips.
-            "rates": [25],
-            "duration": 10.0,
+            **IMPAIRED,
             "netem": [
                 "delay 10ms",
                 "delay 10ms loss 1%",
                 *GILBERT_ELLIOTT,
             ],
         },
+        lossy,
+    ),
+    "access": Table(
+        "Access networks",
+        {**IMPAIRED, "netem": ACCESS},
         lossy,
     ),
     "browser": Table(

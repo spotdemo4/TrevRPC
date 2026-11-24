@@ -454,6 +454,8 @@ class TableTest(unittest.TestCase):
         self.assertEqual(24, self.cells("lossy")[("go", "quic")])
         self.assertEqual(20, self.cells("lossy")[("go", "tcp")])
         self.assertEqual(16, self.cells("lossy")[("grpc", "grpc")])
+        # The access networks run the same cells as the lossy links, over other profiles.
+        self.assertEqual(self.cells("lossy"), self.cells("access"))
         self.assertEqual(
             {("go", "quic"): 12, ("go", "tcp"): 3, ("rust", "quic"): 12, ("rust", "tcp"): 3},
             self.cells("datagrams"),
