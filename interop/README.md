@@ -24,8 +24,7 @@ not validate requests yet (`validation`, [#641](https://trev.zip/llc/TrevRPC/iss
 clients skip that scenario.
 
 The Python client ([#666](https://trev.zip/llc/TrevRPC/issues/666)) calls native QUIC and QMux over
-TLS, falling back from one to the other, compresses messages, sends datagrams and shares connection
-metadata, so far, and skips the scenario that needs decoding `buf.validate.Violations`.
+TLS, falling back from one to the other, and runs every scenario.
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
 packaged Go, Rust and Erlang servers and clients and, on Linux, Chromium and Firefox,
@@ -59,7 +58,7 @@ what it does, and what it skips is reported, never counted as passed:
 Only the cells of runtimes named with `--may-skip` (a client, browser or server
 name) may skip; a skipped cell or scenario anywhere else fails the run, so a
 regression in a complete runtime cannot pass as a skip. The packaged matrix passes
-`--may-skip erlang` and `--may-skip python`, the `safari` workflow `--may-skip erlang`, and the `android` workflow runs
+`--may-skip erlang`, the `safari` workflow `--may-skip erlang`, and the `android` workflow runs
 the Android runner against Erlang with `--may-skip`, which lets it skip only the
 scenarios the server leaves out of its readiness line. Every run that skipped
 anything ends with a summary of the skipped cells and of the passing cells that

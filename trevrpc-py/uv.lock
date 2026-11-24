@@ -280,6 +280,41 @@ wheels = [
 ]
 
 [[package]]
+name = "protovalidate"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "protobuf-py" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a2/af/7518ed77c4355e4bb025496915385bd9337c975d8b7487a2f97adf2c1ab3/protovalidate-2.1.0.tar.gz", hash = "sha256:d2f66bd8c7e8c4929116ad598348e83d90bd718f0387f2307b34f83b1740f318", size = 18779340, upload-time = "2026-10-23T04:01:08.311Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/dc/c6a3f644d9e047279557b8623e25f32c8cc58499eaa575a84cdf201e3756/protovalidate-2.1.0-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:b02fe6dd3e373d6afcbaf858e62c37a337585f4ccb27334274e25bb30a6f55b2", size = 3233878, upload-time = "2026-10-23T04:00:18.714Z" },
+    { url = "https://files.pythonhosted.org/packages/96/8c/9c6aa9bb15ace2a9981ad50d1d2488f35e0d40e04c93a7860010afd50c4c/protovalidate-2.1.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:bdc9783c31de39465b2edbe11d384864113c8d599c20764d2aa154aefbd8fe45", size = 3002932, upload-time = "2026-10-23T04:00:21.008Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/9f/34899955f2569332a99484c651042a8d6f8009ee999bb91ea68c67537174/protovalidate-2.1.0-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b6cd2bb85b9af4bb5449df117c4f005130f9acd358a0385e6909dfb3ddefc353", size = 3745395, upload-time = "2026-10-23T04:00:23.22Z" },
+    { url = "https://files.pythonhosted.org/packages/85/88/2ef642906260c7603cbab71658892a3e68298d6d07f3ece1baa7c99cb336/protovalidate-2.1.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:86d57d28145b56532f43188036a638f1b551996f93453fdd67a2325f8b3267df", size = 4052025, upload-time = "2026-10-23T04:00:25.143Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/d7/0ed4cb8bb3bed00a1ff6cf52773b128143216c22d4a0284f4260917d02dc/protovalidate-2.1.0-cp311-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:c58b0e0247e3eb3b17ef447c30dfb6144a26797805714d1012111ccf5b1fde6a", size = 9998753, upload-time = "2026-10-23T04:00:27.173Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/12/2ab65a0d44384c47acf8b04d1b99bf16d430a5d943e2d5b316f5854200ea/protovalidate-2.1.0-cp311-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:2675889c98660df99a2bd2d919483a95a5b74317eff83dd6f553b65b49058718", size = 10603395, upload-time = "2026-10-23T04:00:29.474Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/5f/b801ca3e2b10095d001520248232dd8dc8ff65db1cc0a26987461e4b7fe1/protovalidate-2.1.0-cp311-abi3-win_amd64.whl", hash = "sha256:7720293383bfd0356be59cd505892f40e68867b759fce9ec9087b6aa5c924075", size = 3289512, upload-time = "2026-10-23T04:00:31.623Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/0a/a06130ae55b30044943daaa6b5aa6a848c4a7a03351ee4d4a974d322e91b/protovalidate-2.1.0-cp311-abi3-win_arm64.whl", hash = "sha256:c8714dbae2e6f3d9be02d54e66e02e3c58d8117438e256cf853a7df8d45643dc", size = 3117228, upload-time = "2026-10-23T04:00:34.058Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/e6/6d02e94e4796147d13b24eb9de9a21d1f9c7bcde8ec1ae0da9b4aac5d7a2/protovalidate-2.1.0-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:e638ece995be36ef4900a6c611b20c4bebc73a62e67929bb4f5b1af9de74e1c3", size = 3235632, upload-time = "2026-10-23T04:00:35.926Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/45/fb89561f602f1e27ac8e56f5be9d9ab3a32743fa24967283d056da7c73ea/protovalidate-2.1.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:186b03426060f3e7ed89bff115cf35226bb14fe47da6aec8fa1c7fd8949408aa", size = 2997711, upload-time = "2026-10-23T04:00:37.601Z" },
+    { url = "https://files.pythonhosted.org/packages/96/7d/2ea4122312dcf76a2eef5ae102cb98ae7fd35b669935c8f08ac92f79e5b0/protovalidate-2.1.0-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:9f77fc7724964dba4316100f76a09d411963fd1e4c527e7982803528660dc4e4", size = 3741558, upload-time = "2026-10-23T04:00:39.871Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/a5/34073d7da6cd2c25ade9041dc3af09849a10eee4fe79e2a5e21799a4c2c5/protovalidate-2.1.0-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:56a11da3008b26ed32b8c5e079526dde275f3d135b4dbae706c202a9af7bb02f", size = 4049199, upload-time = "2026-10-23T04:00:41.667Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/d0/cc037b98222ca1856b942d3c3d657a0714a3a1d3d2af6b2c541902b95145/protovalidate-2.1.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:ea95851de34f094ea95a76d707e6696a29b64170773b7325aded10833b2ffc14", size = 9995518, upload-time = "2026-10-23T04:00:43.779Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/7a/46196078d233eebf69d5c79f28b2ff3da6a43f28143ba4c418e6ed90761a/protovalidate-2.1.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:547536439c5e26e43183081534b5ec80966c4a2382d1ab88bc42a1222dd1c66d", size = 10600466, upload-time = "2026-10-23T04:00:46.148Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/c6/a83123b3805d783567c12e598acd4cf25d2936a61157f6a7acc4d26068ae/protovalidate-2.1.0-cp314-cp314t-win_amd64.whl", hash = "sha256:97765557d6543cdaf603c651e8bf0ad872bfb68e1ec21644614aac3f5243c203", size = 3285263, upload-time = "2026-10-23T04:00:48.529Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/70/cc00959d9ae7f9c709ce575b47a76b518c7c407eb955ccd4a4d9d44b2fa1/protovalidate-2.1.0-cp314-cp314t-win_arm64.whl", hash = "sha256:ef436a67654e73527202385cab671f65ae1e15b73a8309683d8e2a57f44e0ae5", size = 3111993, upload-time = "2026-10-23T04:00:50.362Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/d5/8ddbfa61b6b23f0b25e275c7119ac4e6bce31f9e1a8b99c33842c6082a88/protovalidate-2.1.0-cp315-abi3.abi3t-macosx_10_12_x86_64.whl", hash = "sha256:9542ae752f098796bf538dfd1fa1d85edc3ab16d9545345e6636bb78f2b28fe8", size = 3239459, upload-time = "2026-10-23T04:00:52.04Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/c8/2030f4fa593fa1ee0b60946912073be8636b24b9add69b69ee79960a898d/protovalidate-2.1.0-cp315-abi3.abi3t-macosx_11_0_arm64.whl", hash = "sha256:afb0dd7029a29b859db0c4697480155a32b064ae3f0121dfe7e0d97ec98d0cca", size = 3001796, upload-time = "2026-10-23T04:00:53.749Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/45/cf5a6788d6be5b23943f1b0f0a3b0f01194b84a8bfd2d62dce3cd2168409/protovalidate-2.1.0-cp315-abi3.abi3t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f1cdba9b0b5f67bbb02d0d43fa887863ce0af6296713d9bbd6c20b0fb6a0c34b", size = 3745064, upload-time = "2026-10-23T04:00:56.084Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/98/39fb7a4981ac9de206ddda2ef114f2dd36753c819afe49070afbb7b4dd8f/protovalidate-2.1.0-cp315-abi3.abi3t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c5dd874778b63448725bce985f84bfa3c2f8eb77dd95b8a6a3a8ee5355cbc5c1", size = 4053332, upload-time = "2026-10-23T04:00:57.857Z" },
+    { url = "https://files.pythonhosted.org/packages/af/64/b9ebea974cbf6335f26bfef198db4e6a65fd988de3f0779d2b16911562dd/protovalidate-2.1.0-cp315-abi3.abi3t-musllinux_1_2_aarch64.whl", hash = "sha256:137653777a7e11ffa69f60944c7e903177040c282c3bbe998732f4794e059e4b", size = 9998737, upload-time = "2026-10-23T04:00:59.902Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/31/281fd91ea2314a21bae1c8b6230645b8b92a1575e87427887544ed634313/protovalidate-2.1.0-cp315-abi3.abi3t-musllinux_1_2_x86_64.whl", hash = "sha256:93d66a07f8b82631f40f3f660a2d829f0d2421e5bcedd88a0fefb7b1890962eb", size = 10604949, upload-time = "2026-10-23T04:01:02.314Z" },
+    { url = "https://files.pythonhosted.org/packages/32/eb/379a8ccbb0598102fde5a77c0e7ced4d86d85848586d0119765c3781b026/protovalidate-2.1.0-cp315-abi3.abi3t-win_amd64.whl", hash = "sha256:48060577468a4494e37ab935786547cd95a0dbb2eb0a613c0419432aeb384280", size = 3288667, upload-time = "2026-10-23T04:01:04.445Z" },
+    { url = "https://files.pythonhosted.org/packages/98/f0/530d7654f9ae8dd03c30bbb1e5dacd2d23ad4aac56bbd864f748d66c766c/protovalidate-2.1.0-cp315-abi3.abi3t-win_arm64.whl", hash = "sha256:b654823c28148a0ea5e2ca7093735bf981de05ce8b7564985c0a79cfdf8f7193", size = 3116504, upload-time = "2026-10-23T04:01:06.11Z" },
+]
+
+[[package]]
 name = "pycparser"
 version = "3.12"
 source = { registry = "https://pypi.org/simple" }
@@ -366,8 +401,14 @@ dependencies = [
     { name = "protobuf-py" },
 ]
 
+[package.optional-dependencies]
+protovalidate = [
+    { name = "protovalidate" },
+]
+
 [package.dev-dependencies]
 dev = [
+    { name = "protovalidate" },
     { name = "pytest" },
 ]
 
@@ -375,10 +416,15 @@ dev = [
 requires-dist = [
     { name = "aioquic", specifier = ">=1.9,<1.10" },
     { name = "protobuf-py", specifier = ">=0.7,<0.8" },
+    { name = "protovalidate", marker = "extra == 'protovalidate'", specifier = ">=2.1,<3" },
 ]
+provides-extras = ["protovalidate"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9" }]
+dev = [
+    { name = "protovalidate", specifier = ">=2.1,<3" },
+    { name = "pytest", specifier = ">=9" },
+]
 
 [[package]]
 name = "typing-extensions"

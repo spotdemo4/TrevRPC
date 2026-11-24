@@ -19,6 +19,8 @@ Its methods take and return `google.protobuf.StringValue`:
 - `/test.Echo/Drop` closes the connection at the first request.
 - `/test.Echo/Flood` sends 64 KiB responses for as long as the client lets it.
 - `/test.Echo/Hang` never responds.
+- `/test.Echo/Invalid` fails with `INVALID_ARGUMENT` and a `buf.validate.Violations` detail, as a
+  validating server rejects a request: rule `string.min_len` on the field `name`.
 
 Compression follows the server side of the protocol: it answers dictionary queries from its own
 dictionaries (which compress `google.protobuf.StringValue`), decodes every compressed request,
@@ -147,14 +149,34 @@ class Signal:
 
 
 def _status_frame(
-    code: int = 0, message: str = "", metadata: dict[str, bytes] | None = None
+    code: int = 0,
+    message: str = "",
+    metadata: dict[str, bytes] | None = None,
+    details: tuple[tuple[str, bytes], ...] = (),
 ) -> bytes:
     payload = (
         _varint_field(1, code)
         + (_len_field(2, message.encode()) if message else b"")
         + _map_field(3, metadata or {})
+        + b"".join(
+            _len_field(5, _len_field(1, name.encode()) + _len_field(2, value))
+            for name, value in details
+        )
     )
     return encode_frame(FrameType.STATUS, payload)
+
+
+def _violations() -> bytes:
+    """An encoded `buf.validate.Violations`, built with the tests' own bindings rather than
+    protovalidate's: rule `string.min_len` on the field `name`."""
+    from .gen.buf.validate.validate_pb import FieldPath, FieldPathElement, Violation, Violations
+
+    violation = Violation(
+        field=FieldPath(elements=[FieldPathElement(field_number=1, field_name="name")]),
+        rule_id="string.min_len",
+        message="must be at least 1 characters",
+    )
+    return Violations(violations=[violation]).to_binary()
 
 
 def _headers_frame(metadata: dict[str, bytes]) -> bytes:
@@ -409,6 +431,11 @@ async def _handle(
                 else:
                     suffix = call.metadata.get("suffix", b"").decode()
                     wire.send(call.message(value + suffix) + _status_frame(), end=True)
+            case "Invalid":
+                await queue.get()
+                message = "validation error: name: must be at least 1 characters"
+                detail = ("buf.validate.Violations", _violations())
+                wire.send(_status_frame(3, message, details=(detail,)), end=True)
             case "ServerStream":
                 value = await queue.get()
                 assert value is not None

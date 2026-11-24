@@ -57,8 +57,8 @@ messages as QUIC datagrams.
 - OpenTelemetry metrics and tracing for [Go](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#opentelemetry) and
   [Rust](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#observability)
 - [protovalidate](https://github.com/bufbuild/protovalidate) request validation with CEL rules for Go and Rust
-  servers, whose violations every client reads from the status's details, and for Go, Rust and browser clients,
-  which check requests before sending them
+  servers, whose violations every client reads from the status's details, and for Go, Rust, browser and Python
+  clients, which check requests before sending them
 - built for deployment: certificates from ACME (TLS-ALPN-01 on the TCP port), PROXY protocol from TCP and UDP
   load balancers, QUIC address validation with Retry, and other HTTP content served from the same ports
 - development certificates that browsers trust by hash, so local WebTransport needs no trusted CA

@@ -20,11 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import trevrpc
+from gen.buf.validate.validate_pb import Violations
 from gen.compressed_pb import PlainMessage
 from gen.compressed_trevrpc import CompressedEchoClient, RefusingEchoClient
 from gen.interop_pb import EchoRequest, EchoResponse
 from gen.interop_trevrpc import EchoClient
 from gen.unreliable_trevrpc import UnreliableEchoClient
+from gen.validated_pb import ValidatedRequest
+from gen.validated_trevrpc import ValidatedEchoClient
 from trevrpc import Code, TrevRpcError
 
 # The message types the interop dictionary compresses.
@@ -43,6 +46,7 @@ class Clients:
     compressed: CompressedEchoClient
     refusing: RefusingEchoClient
     unreliable: UnreliableEchoClient
+    validated: ValidatedEchoClient
 
 
 class ScenarioError(Exception):
@@ -416,6 +420,61 @@ async def connection_metadata(clients: Clients) -> None:
         await call("e", "e#")
 
 
+async def validation(clients: Clients) -> None:
+    """ValidatedEcho calls that keep and break its standard and CEL rules. The client does not
+    check them itself: the server's violations are what the scenario reads."""
+    validated = clients.validated
+    expect_response(await validated.unary(ValidatedRequest(message="hello")), "hello", 0)
+    await expect_violation(
+        "empty message", validated.unary(ValidatedRequest(message="")), "string.min_len", "message"
+    )
+    await expect_violation(
+        "forbidden message",
+        validated.unary(ValidatedRequest(message="forbidden")),
+        "message.not_forbidden",
+        "",
+    )
+
+    async def stream() -> object:
+        async with validated.client_stream() as call:
+            # The server may fail the call before the second message is sent; the response
+            # reports it either way.
+            try:
+                await call.send(ValidatedRequest(message="a"))
+                await call.send(ValidatedRequest(message=""))
+            except TrevRpcError:
+                pass
+            return await call.close_and_recv()
+
+    await expect_violation("streamed empty message", stream(), "string.min_len", "message")
+
+
+async def expect_violation(what: str, call: Awaitable[object], rule: str, field: str) -> None:
+    """Checks that `call` fails with `INVALID_ARGUMENT` and a `buf.validate.Violations` detail
+    holding one violation of `rule`, on the field path `field`, or on the message itself when
+    `field` is empty."""
+    try:
+        result = await call
+    except TrevRpcError as error:
+        if error.code != Code.INVALID_ARGUMENT:
+            raise ScenarioError(
+                f"{what}: got status {error.code.name} {error.message!r}, want INVALID_ARGUMENT"
+            ) from None
+        details = error.find_details(Violations)
+        if not details:
+            raise ScenarioError(
+                f"{what}: no buf.validate.Violations detail in {error.details!r}"
+            ) from None
+        violations = [v for detail in details for v in detail.violations]
+        if len(violations) != 1:
+            raise ScenarioError(f"{what}: got {len(violations)} violations, want 1") from None
+        violation = violations[0]
+        path = ".".join(e.field_name for e in violation.field.elements) if violation.field else ""
+        expect((rule, field), (violation.rule_id, path), f"{what}: rule and field")
+        return
+    raise ScenarioError(f"{what}: got {result!r}, want INVALID_ARGUMENT")
+
+
 def on_echo(
     scenario: Callable[[EchoClient], Awaitable[None]],
 ) -> Callable[[Clients], Awaitable[None]]:
@@ -444,7 +503,7 @@ SCENARIOS: dict[str, Scenario] = {
     "refused-stream": refused_stream,
     "compressed-plain": compressed_plain,
     "connection-metadata": connection_metadata,
-    "validation": "buf.validate.Violations details are not decoded",
+    "validation": validation,
 }
 
 DEADLINE = 10.0
@@ -493,6 +552,7 @@ async def run(args: argparse.Namespace) -> int:
             CompressedEchoClient(channel),
             RefusingEchoClient(channel),
             UnreliableEchoClient(channel),
+            ValidatedEchoClient(channel),
         )
         passed = True
         for name, scenario in SCENARIOS.items():

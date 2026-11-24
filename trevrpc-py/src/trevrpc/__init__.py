@@ -27,6 +27,7 @@ from ._method import Method, MethodCompression, MethodKind
 from ._qmux import QMUX_ALPN
 from ._quic import ALPN
 from ._status import Code, StatusDetail, TrevRpcError
+from ._validator import MessageValidator, ValidateFunc, Validator
 
 __all__ = [
     "ALPN",
@@ -40,6 +41,7 @@ __all__ = [
     "Code",
     "Compression",
     "Dictionary",
+    "MessageValidator",
     "Metadata",
     "MetadataInput",
     "Method",
@@ -51,5 +53,7 @@ __all__ = [
     "Transport",
     "TransportPolicy",
     "TrevRpcError",
+    "ValidateFunc",
+    "Validator",
     "connect",
 ]

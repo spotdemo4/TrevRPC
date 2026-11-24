@@ -15,6 +15,7 @@ See the [Python Guide](https://trev.zip/llc/TrevRPC/wiki/Python-Guide) for the w
 ```sh
 pip install trevrpc                              # or: uv add trevrpc
 pip install protoc-gen-py protoc-gen-trevrpc-py  # the protoc plugins, for generating code
+pip install "trevrpc[protovalidate]"             # optionally, with request validation
 ```
 
 ## Generating a client
@@ -66,6 +67,25 @@ Every method takes the call options as keyword arguments: `timeout` (seconds), `
 `INVALID_ARGUMENT`), and the `on_response_headers` and `on_response_metadata` callbacks. A call that
 does not end with an OK status raises `trevrpc.TrevRpcError`, which carries the status's code,
 message, trailing metadata and details (`retry_delay`, `find_details()`).
+
+## Request validation
+
+With the `protovalidate` extra, `trevrpc.protovalidate` checks requests against their
+[`buf.validate`](https://buf.build/bufbuild/protovalidate) rules before a channel sends them, with
+[protovalidate](https://github.com/bufbuild/protovalidate-py). A request that breaks them fails with
+`INVALID_ARGUMENT` and a `buf.validate.Violations` detail, as a validating Go or Rust server answers,
+and `violations()` reads that detail from either:
+
+```python
+from trevrpc.protovalidate import RequestValidator, violations
+
+channel = trevrpc.Channel("example.com:443", validator=RequestValidator())
+try:
+    await users.create(CreateUserRequest(name=""))
+except trevrpc.TrevRpcError as error:
+    for violation in violations(error):
+        print(violation.rule_id, violation.message)
+```
 
 ## Connection metadata
 

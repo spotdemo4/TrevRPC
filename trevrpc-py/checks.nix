@@ -91,8 +91,8 @@ in
   };
 
   # The interop bindings are what interop/generate.sh generates from interop/proto with
-  # protoc-gen-py and protoc-gen-trevrpc-py, and the plugin's _options_pb.py its
-  # trevrpc/options_pb.py.
+  # protoc-gen-py and protoc-gen-trevrpc-py, the plugin's _options_pb.py its trevrpc/options_pb.py,
+  # and the protovalidate tests' bindings what it generates from tests/proto.
   generated = {
     root = ../.;
     files = [
@@ -100,6 +100,8 @@ in
       ../proto
       ./interop/generate.sh
       ./interop/gen
+      ./tests/proto
+      ./tests/gen
       ./protoc-gen-trevrpc-py/src/protoc_gen_trevrpc_py/_options_pb.py
     ];
     packages = [
@@ -108,8 +110,9 @@ in
       pluginEnv
     ];
     script = ''
-      bash trevrpc-py/interop/generate.sh "$TMPDIR/gen"
+      bash trevrpc-py/interop/generate.sh "$TMPDIR/gen" "$TMPDIR/tests-gen"
       diff -ru trevrpc-py/interop/gen "$TMPDIR/gen"
+      diff -ru trevrpc-py/tests/gen "$TMPDIR/tests-gen"
       diff -u trevrpc-py/protoc-gen-trevrpc-py/src/protoc_gen_trevrpc_py/_options_pb.py \
         "$TMPDIR/gen/trevrpc/options_pb.py"
     '';

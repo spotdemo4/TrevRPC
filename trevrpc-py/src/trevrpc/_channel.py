@@ -26,6 +26,7 @@ from ._qmux import QMuxSession
 from ._quic import QuicTransport
 from ._status import Code, TrevRpcError
 from ._stream import Stream
+from ._validator import MessageValidator, Validator
 
 type Transport = Literal["quic", "qmux"]
 """The transport a channel's connection uses: native QUIC, or QMux over TLS."""
@@ -98,6 +99,11 @@ class ChannelOptions(TypedDict, total=False):
     KiB for a direction it decodes and 585 KiB for one it compresses, and the requests an
     optimistic call keeps until the server answers, up to 1 MiB per call. Calls beyond it compress
     per message. 64 MiB by default; a negative value turns stream compression off."""
+    validator: Validator
+    """Checks every request message before it is sent, such as
+    `trevrpc.protovalidate.RequestValidator()` for `buf.validate` rules. A request it rejects is not
+    sent: a unary or server-streaming call fails, and `send()` of a client-streaming or
+    bidirectional call raises while the call goes on. None by default."""
 
 
 def parse_address(address: str) -> tuple[str, int]:
@@ -149,6 +155,8 @@ class Channel:
         memory = options.get("stream_compression_memory", 0) or DEFAULT_STREAM_COMPRESSION_MEMORY
         self.stream_budget = StreamBudget(memory) if memory > 0 else None
         self.connection_metadata = ConnectionMetadataSource(options.get("connection_metadata"))
+        validator = options.get("validator")
+        self.validator = MessageValidator(validator) if validator is not None else None
         self._quic_failed_at: float | None = None
         """When QMux last won a race, while reconnects skip QUIC."""
         self._connection: _Connection | None = None

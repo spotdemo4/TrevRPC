@@ -20,6 +20,7 @@ from ._frames import FrameType, encode_frame
 from ._metadata import Metadata, MetadataInput, normalize_metadata, validate_metadata
 from ._method import Method, MethodKind
 from ._status import Code, TrevRpcError
+from ._validator import MessageValidator
 from ._varint import decode_varint
 from ._wire import RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, StreamCompression, WireError
 
@@ -68,6 +69,7 @@ class StreamOpener(Protocol):
     compression: Compression
     stream_budget: StreamBudget | None
     connection_metadata: ConnectionMetadataSource
+    validator: MessageValidator | None
 
     async def open_stream(self, max_frame_size: int) -> Stream: ...
 
@@ -141,8 +143,11 @@ def _frame_limit(channel: StreamOpener, options: CallOptions) -> int:
     return limit
 
 
-def _serialize(message: Message, max_frame_size: int) -> bytes:
-    """A request message's bytes, which its frame then carries, compressed or not."""
+def _serialize(message: Message, max_frame_size: int, validator: MessageValidator | None) -> bytes:
+    """A request message's bytes, which its frame then carries, compressed or not, once
+    `validator`, if any, found it valid."""
+    if validator is not None:
+        validator.validate(message)
     try:
         payload = message.to_binary()
     except Exception as error:
@@ -333,7 +338,7 @@ async def unary_call[Req: Message, Resp: Message](
     """Sends one request and returns the response."""
     base, deadline = _prepare(method, options)  # pyright: ignore[reportArgumentType]
     max_frame_size = _frame_limit(channel, options)
-    payload = _serialize(request, max_frame_size)
+    payload = _serialize(request, max_frame_size, channel.validator)
     metadata = CallConnectionMetadata(channel.connection_metadata)
     stream: Stream | None = None
     compression: CallCompression | None = None
@@ -414,7 +419,11 @@ class _StreamingCall[Req: Message, Resp: Message]:
         self._request, self._deadline = _prepare(method, options)  # pyright: ignore[reportArgumentType]
         self._connection_metadata = CallConnectionMetadata(channel.connection_metadata)
         """The set current when the call started, which it keeps, through a replay too."""
-        first_payload = _serialize(first, self._max_frame_size) if first is not None else None
+        first_payload = (
+            _serialize(first, self._max_frame_size, channel.validator)
+            if first is not None
+            else None
+        )
         self._compression: CallCompression | None = None
         self._response: _Response | None = None
         self._stream: Stream | None = None
@@ -862,7 +871,7 @@ class _StreamingCall[Req: Message, Resp: Message]:
                 raise self._upload_error(
                     TrevRpcError(Code.FAILED_PRECONDITION, "the request stream is closed")
                 )
-            payload = _serialize(request, self._max_frame_size)
+            payload = _serialize(request, self._max_frame_size, self._channel.validator)
             while True:
                 stream = await self._stream_ready()
                 if self._end is not None or self._error is not None:
