@@ -18,6 +18,9 @@
 
 -export([check/1, encode/2, decode/2]).
 
+%% Used by trevrpc_validator.
+-export([exception/2]).
+
 -export_type([codec/0]).
 
 -type codec() :: #{
@@ -59,10 +62,18 @@ decode(#{decode := Decode}, Bin) ->
     end.
 
 failed(Level, Op, Class, Reason, Stack) ->
+    {Cause, Location} = exception(Reason, Stack),
     logger:log(Level, "trevrpc codec failed to ~s a message: ~p:~p at ~p", [
-        Op, Class, cause(Reason), location(Stack)
+        Op, Class, Cause, Location
     ]),
     error.
+
+%% @private What an exception raised on a message was, and where, for a
+%% log that must not hold the message: its reason's tag, and the function
+%% that raised it, without its arguments.
+-spec exception(term(), [tuple()]) -> {term(), term()}.
+exception(Reason, Stack) ->
+    {cause(Reason), location(Stack)}.
 
 %% What a failure was, without what it failed on: gpb's failures carry the
 %% bytes or the message, and others may too, so only tags and names stay.

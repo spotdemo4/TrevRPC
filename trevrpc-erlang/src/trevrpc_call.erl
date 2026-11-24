@@ -63,8 +63,9 @@ deadline(#call{deadline = Deadline}) -> Deadline.
 %% @doc Reads the next request message of a client-streaming or
 %% bidirectional call, decoded with the route's codec if it has one.
 %% `eof' means the client sent every request. A message the codec cannot
-%% decode returns an `invalid_argument' status, and the call can go on
-%% reading.
+%% decode returns an `invalid_argument' status, and one the server's
+%% validator rejects returns the status the validator gave (see {@link
+%% trevrpc_validator}); either way, the call can go on reading.
 -spec recv(call()) -> {ok, term()} | eof | {error, trevrpc_status:status()}.
 recv(#call{kind = Kind} = Call) when Kind =:= client_streaming; Kind =:= bidirectional_streaming ->
     State = state(Call),
@@ -83,13 +84,19 @@ recv(#call{kind = Kind} = Call) when Kind =:= client_streaming; Kind =:= bidirec
 recv(_Call) ->
     erlang:error(badarg).
 
-%% @private Decodes a request message with the route's codec; `Failure' is
-%% the status message of one it cannot decode.
+%% @private Decodes a request message with the route's codec, and checks
+%% it with the route's validation if it has one; `Failure' is the status
+%% message of one the codec cannot decode.
 -spec decode(call(), binary(), binary()) -> {ok, term()} | {error, trevrpc_status:status()}.
-decode(#call{codec = Codec}, Message, Failure) ->
+decode(#call{codec = Codec, validate = Validate, method = Method}, Message, Failure) ->
     case trevrpc_codec:decode(Codec, Message) of
-        {ok, Decoded} -> {ok, Decoded};
-        error -> {error, trevrpc_status:new(invalid_argument, Failure)}
+        {ok, Decoded} ->
+            case trevrpc_validator:validate(Validate, Method, Decoded, Message) of
+                ok -> {ok, Decoded};
+                {error, Status} -> {error, Status}
+            end;
+        error ->
+            {error, trevrpc_status:new(invalid_argument, Failure)}
     end.
 
 ended({ok, _}, State) ->

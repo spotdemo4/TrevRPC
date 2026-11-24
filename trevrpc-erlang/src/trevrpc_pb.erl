@@ -1,9 +1,11 @@
-%% @doc The protobuf wire format primitives the control messages need.
+%% @doc The protobuf wire format primitives of the messages the runtime
+%% encodes and decodes by hand.
 %%
-%% Only what {@link trevrpc_wire} uses: base-128 varints, tags, and
-%% length-delimited fields, plus reading any field so unknown ones can be
-%% skipped. Application messages never pass through here; they are opaque
-%% bytes to the runtime.
+%% Only what {@link trevrpc_wire} (the control messages) and {@link
+%% trevrpc_violations} (`buf.validate.Violations' status details) use:
+%% base-128 varints, tags, and length-delimited fields, plus reading any
+%% field so unknown ones can be skipped. Application messages never pass
+%% through here; they are opaque bytes to the runtime.
 -module(trevrpc_pb).
 
 -export([
@@ -12,9 +14,11 @@
     varint_field/2,
     bytes_field/2,
     decode_field/1,
+    decode_message/3,
     valid_utf8/1,
     to_uint32/1,
-    to_int32/1
+    to_int32/1,
+    to_int64/1
 ]).
 
 -export_type([field_value/0]).
@@ -101,6 +105,24 @@ decode_value(Number, 5, <<Value:4/binary, Rest/binary>>) ->
 decode_value(_, _, _) ->
     error.
 
+%% @doc Decodes a message field by field: `Field(Number, Value, Acc)' folds
+%% each field into the message, or returns `error' for one it rejects. A
+%% malformed field is an error too.
+-spec decode_message(binary(), fun((pos_integer(), field_value(), Acc) -> Acc | error), Acc) ->
+    {ok, Acc} | error.
+decode_message(<<>>, _Field, Message) ->
+    {ok, Message};
+decode_message(Bin, Field, Message) ->
+    case decode_field(Bin) of
+        {Number, Value, Rest} ->
+            case Field(Number, Value, Message) of
+                error -> error;
+                Next -> decode_message(Rest, Field, Next)
+            end;
+        error ->
+            error
+    end.
+
 %% @doc Whether `Bin' is valid UTF-8, as protobuf strings must be: no
 %% overlong encodings, surrogates or truncated sequences. The conversion
 %% runs in C, which is faster than matching code points one at a time.
@@ -117,4 +139,10 @@ to_uint32(Value) -> Value band 16#FFFFFFFF.
 -spec to_int32(non_neg_integer()) -> integer().
 to_int32(Value) ->
     <<Signed:32/signed>> = <<(Value band 16#FFFFFFFF):32>>,
+    Signed.
+
+%% @doc A decoded varint as an `int64' field holds it: its 64 bits, signed.
+-spec to_int64(non_neg_integer()) -> integer().
+to_int64(Value) ->
+    <<Signed:64/signed>> = <<Value:64>>,
     Signed.

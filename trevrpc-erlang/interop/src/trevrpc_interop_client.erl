@@ -9,6 +9,7 @@
 -define(COMPRESSED_ECHO, trevrpc_interop_v1_compressed_echo).
 -define(REFUSING_ECHO, trevrpc_interop_v1_refusing_echo).
 -define(UNRELIABLE_ECHO, trevrpc_interop_v1_unreliable_echo).
+-define(VALIDATED_ECHO, trevrpc_interop_v1_validated_echo).
 %% The unreliable scenario's small requests, and the size of the one that
 %% cannot be a datagram.
 -define(UNRELIABLE_REQUESTS, 50).
@@ -49,7 +50,7 @@ scenarios() ->
         {<<"refused-stream">>, fun refused_stream/1},
         {<<"compressed-plain">>, fun compressed_plain/1},
         {<<"connection-metadata">>, {new_channel, fun connection_metadata/1}},
-        {<<"validation">>, {unsupported, <<"buf.validate.Violations details are not decoded">>}}
+        {<<"validation">>, fun validation/1}
     ].
 
 %% @doc Runs the client and returns its exit status.
@@ -621,6 +622,85 @@ connection_metadata_calls(Channel) ->
     else
         Error -> describe(Error)
     end.
+
+%% Requests that break the rules of ValidatedEcho fail with
+%% `invalid_argument' and a `buf.validate.Violations' detail naming the rule.
+validation(Channel) ->
+    Unary = fun(Message) -> ?VALIDATED_ECHO:unary(Channel, #{message => Message}, opts()) end,
+    maybe
+        ok ?= expect_unary(Unary(<<"hello">>), <<"hello">>, 0),
+        ok ?= expect_violation("empty message", Unary(<<>>), <<"string.min_len">>, <<"message">>),
+        ok ?=
+            expect_violation(
+                "forbidden message", Unary(<<"forbidden">>), <<"message.not_forbidden">>, <<>>
+            ),
+        {ok, Call} ?= ?VALIDATED_ECHO:client_stream(Channel, opts()),
+        %% The server may fail the call before the second message is sent;
+        %% the response reports it either way.
+        _ =
+            case trevrpc_client:send(Call, #{message => <<"a">>}) of
+                ok -> trevrpc_client:send(Call, #{message => <<>>});
+                Failed -> Failed
+            end,
+        expect_violation(
+            "streamed empty message",
+            trevrpc_client:close_and_recv(Call),
+            <<"string.min_len">>,
+            <<"message">>
+        )
+    else
+        Error -> describe(Error)
+    end.
+
+%% `Result' failed with `invalid_argument' and a `buf.validate.Violations'
+%% detail holding one violation of `Rule', on the field path `Field' (the
+%% names of its elements, joined with dots), empty for a rule on the
+%% message itself.
+expect_violation(What, {error, Status}, Rule, Field) ->
+    case {trevrpc_status:code(Status), trevrpc_violations:from_status(Status)} of
+        {invalid_argument, {ok, [Violation]}} ->
+            Path = iolist_to_binary(
+                lists:join($., [
+                    maps:get(field_name, Element, <<>>)
+                 || Element <- maps:get(elements, maps:get(field, Violation, #{}), [])
+                ])
+            ),
+            case {maps:get(rule_id, Violation, <<>>), Path} of
+                {Rule, Field} ->
+                    ok;
+                {GotRule, GotPath} ->
+                    {error,
+                        iolist_to_binary(
+                            io_lib:format("~s: rule ~p on field ~p, want ~p on ~p", [
+                                What, GotRule, GotPath, Rule, Field
+                            ])
+                        )}
+            end;
+        {invalid_argument, {ok, Violations}} ->
+            {error,
+                iolist_to_binary(
+                    io_lib:format("~s: want one violation, got ~0p", [What, Violations])
+                )};
+        {invalid_argument, error} ->
+            {error,
+                iolist_to_binary(
+                    io_lib:format("~s: no buf.validate.Violations detail that decodes in ~0p", [
+                        What, Status
+                    ])
+                )};
+        {Code, _} ->
+            {error,
+                iolist_to_binary(
+                    io_lib:format("~s: status ~p ~p, want invalid_argument", [
+                        What, Code, trevrpc_status:message(Status)
+                    ])
+                )}
+    end;
+expect_violation(What, Other, _Rule, _Field) ->
+    {error,
+        iolist_to_binary(
+            io_lib:format("~s: ~0p, want invalid_argument", [What, abbreviate(Other)])
+        )}.
 
 %%% Helpers
 

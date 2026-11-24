@@ -21,7 +21,7 @@ native QUIC and QMux over TLS, so far. It takes part in what it implements; see
 [Partial runtimes](#partial-runtimes). Browsers reach it over every lane, the app lanes'
 page coming from its HTTP fallback, and the Android client over HTTP/3 and HTTP/2. Its server does
 not validate requests yet (`validation`, [#641](https://trev.zip/llc/TrevRPC/issues/641)), so
-clients skip that scenario.
+clients skip that scenario against it; its client runs it against the others.
 
 The Python client ([#666](https://trev.zip/llc/TrevRPC/issues/666)) calls native QUIC and QMux over
 TLS, falling back from one to the other, and runs every scenario.

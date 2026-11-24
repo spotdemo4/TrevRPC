@@ -55,6 +55,12 @@
 %% encodes its response, usually through generated code. See
 %% {@link trevrpc_call} for the handler API.
 %%
+%% With a `validator', request messages are checked after they are decoded
+%% and before a handler sees them, so that a request that breaks its rules,
+%% such as its `buf.validate' ones, fails with `invalid_argument' and a
+%% `buf.validate.Violations' detail: see {@link trevrpc_validator}. Without
+%% one, requests are not checked.
+%%
 %% Every connection is owned by a `trevrpc_server_conn' process, which
 %% reads each stream's REQUEST, checks it and runs its handler in a call
 %% process of its own. That process can be stopped at any moment, which is
@@ -147,13 +153,17 @@
     webtransport_admission => trevrpc_admission:admission(),
     http_path => binary(),
     http_fallback => trevrpc_http_request:handler(),
-    misdirected_request_check => boolean()
+    misdirected_request_check => boolean(),
+    validator => trevrpc_validator:validator()
 }.
 
 %% What each connection process needs, shared by all of them.
 -type config() :: #{
     server := pid(),
     routes := routes(),
+    %% What checks the decoded requests of each route that has a check, by
+    %% method path; see trevrpc_validator.
+    validators := #{binary() => trevrpc_validator:validate()},
     max_frame_size := pos_integer(),
     max_streams_per_connection := pos_integer(),
     max_concurrent_requests := pos_integer(),
@@ -274,8 +284,9 @@ init(Opts) ->
         ok ?= check_routes(maps:get(routes, Opts)),
         ok ?= check_browsers(Opts),
         ok ?= trevrpc_socket:check_user_timeout(Opts),
+        {ok, Validators} ?= validators(Opts),
         ok = webtransport_routers(Opts),
-        listen(Opts, Credentials, Compression)
+        listen(Opts, Credentials, Compression, Validators)
     else
         {error, Reason} -> {error, Reason}
     end.
@@ -297,6 +308,15 @@ check_routes(Routes) ->
     case Invalid of
         [] -> ok;
         [Error | _] -> {error, Error}
+    end.
+
+%% Each route's check is bound once, so that rules that cannot be enforced
+%% fail the start rather than every call.
+validators(Opts) ->
+    Validator = maps:get(validator, Opts, undefined),
+    case trevrpc_validator:check(Validator) of
+        ok -> trevrpc_validator:bind(Validator, maps:get(routes, Opts));
+        error -> {error, {invalid_option, validator}}
     end.
 
 check_browsers(Opts) ->
@@ -389,9 +409,9 @@ datagram_route(#{unreliable := Unreliable, kind := Kind} = Route) ->
 datagram_route(Route) ->
     Route.
 
-listen(Opts, Credentials, Compression) ->
+listen(Opts, Credentials, Compression, Validators) ->
     Counters = counters:new(2, [write_concurrency]),
-    Config = config(Opts, Compression),
+    Config = config(Opts, Compression, Validators),
     MaxConnections = maps:get(max_connections, Opts, 256),
     Streams = maps:get(max_streams_per_connection, Config),
     Start = fun(Conn) ->
@@ -586,8 +606,9 @@ listen_tcp(
             Result
     end.
 
-config(Opts, Compression) ->
+config(Opts, Compression, Validators) ->
     #{
+        validators => Validators,
         compression => Compression,
         stream_budget => trevrpc_zstd_stream:budget(
             maps:get(stream_compression_memory, Opts, ?STREAM_COMPRESSION_MEMORY)

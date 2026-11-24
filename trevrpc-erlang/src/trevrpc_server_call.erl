@@ -334,7 +334,8 @@ serve(#{stream := Stream0, router := Router, route := Route, config := Config} =
         metadata = Metadata,
         deadline = Deadline,
         owner = self(),
-        codec = maps:get(codec, Route, undefined)
+        codec = maps:get(codec, Route, undefined),
+        validate = maps:get(Method, maps:get(validators, Config), undefined)
     },
     trevrpc_call:put_state(Call, #call_state{
         stream = Stream,

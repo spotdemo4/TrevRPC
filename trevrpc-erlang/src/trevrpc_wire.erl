@@ -150,7 +150,7 @@ decode_request(Bin) ->
         stream_compression => none,
         connection_metadata => undefined
     },
-    case decode_message(Bin, fun request_field/3, Empty) of
+    case trevrpc_pb:decode_message(Bin, fun request_field/3, Empty) of
         {ok, #{accept_dictionaries := Accept, dictionary_query := Query} = Request} ->
             {ok, Request#{
                 accept_dictionaries := lists:reverse(Accept),
@@ -193,7 +193,7 @@ request_field(9, {bytes, Bin}, #{connection_metadata := Previous} = Request) ->
             undefined -> #{id => 0, metadata => #{}};
             _ -> Previous
         end,
-    case decode_message(Bin, fun connection_metadata_field/3, Base) of
+    case trevrpc_pb:decode_message(Bin, fun connection_metadata_field/3, Base) of
         {ok, Set} -> Request#{connection_metadata := Set};
         error -> error
     end;
@@ -252,7 +252,7 @@ encode_headers(Headers) ->
 %% @doc Decodes an `RpcHeaders'.
 -spec decode_headers(binary()) -> {ok, #{metadata := metadata()}} | error.
 decode_headers(Bin) ->
-    decode_message(Bin, fun headers_field/3, #{metadata => #{}}).
+    trevrpc_pb:decode_message(Bin, fun headers_field/3, #{metadata => #{}}).
 
 headers_field(1, {bytes, Entry}, #{metadata := Metadata} = Headers) ->
     case map_entry(Entry) of
@@ -286,7 +286,7 @@ encode_answer(Answer) ->
     | error.
 decode_answer(Bin) ->
     Empty = #{dictionaries => [], stream_compression => false, connection_metadata => 0},
-    case decode_message(Bin, fun answer_field/3, Empty) of
+    case trevrpc_pb:decode_message(Bin, fun answer_field/3, Empty) of
         {ok, #{dictionaries := Dictionaries} = Answer} ->
             {ok, Answer#{dictionaries := lists:reverse(Dictionaries)}};
         error ->
@@ -312,7 +312,7 @@ encode_dictionary_info(Info) ->
     ].
 
 decode_dictionary_info(Bin) ->
-    decode_message(Bin, fun dictionary_info_field/3, #{id => 0, fingerprint => <<>>}).
+    trevrpc_pb:decode_message(Bin, fun dictionary_info_field/3, #{id => 0, fingerprint => <<>>}).
 
 dictionary_info_field(1, {varint, Value}, Info) ->
     Info#{id := trevrpc_pb:to_uint32(Value)};
@@ -356,7 +356,7 @@ decode_status(Bin) ->
         refused_stream_compression => false,
         details => []
     },
-    case decode_message(Bin, fun status_field/3, Empty) of
+    case trevrpc_pb:decode_message(Bin, fun status_field/3, Empty) of
         {ok, #{code := Code, details := Details} = Status} ->
             {ok, Status#{
                 code := trevrpc_status:from_int(Code),
@@ -378,7 +378,7 @@ status_field(3, {bytes, Entry}, #{metadata := Metadata} = Status) ->
 status_field(4, {varint, Value}, Status) ->
     Status#{refused_stream_compression := Value =/= 0};
 status_field(5, {bytes, Bin}, #{details := Details} = Status) ->
-    case decode_message(Bin, fun detail_field/3, #{type => <<>>, value => <<>>}) of
+    case trevrpc_pb:decode_message(Bin, fun detail_field/3, #{type => <<>>, value => <<>>}) of
         {ok, Detail} -> Status#{details := [Detail | Details]};
         error -> error
     end;
@@ -400,19 +400,6 @@ detail_field(_, _, Detail) ->
 
 %%% Shared
 
-decode_message(<<>>, _Field, Message) ->
-    {ok, Message};
-decode_message(Bin, Field, Message) ->
-    case trevrpc_pb:decode_field(Bin) of
-        {Number, Value, Rest} ->
-            case Field(Number, Value, Message) of
-                error -> error;
-                Next -> decode_message(Rest, Field, Next)
-            end;
-        error ->
-            error
-    end.
-
 string_value(Bin, Set) ->
     case trevrpc_pb:valid_utf8(Bin) of
         true -> Set(Bin);
@@ -421,7 +408,7 @@ string_value(Bin, Set) ->
 
 %% A map<string, bytes> entry. A missing key or value is empty.
 map_entry(Bin) ->
-    case decode_message(Bin, fun map_entry_field/3, {<<>>, <<>>}) of
+    case trevrpc_pb:decode_message(Bin, fun map_entry_field/3, {<<>>, <<>>}) of
         {ok, Entry} -> Entry;
         error -> error
     end.

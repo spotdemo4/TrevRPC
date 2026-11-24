@@ -23,4 +23,4 @@ protoc \
 	-I "$root/interop/proto" \
 	-I "$root/proto" \
 	--trevrpc-erlang_out="$out" \
-	interop.proto compressed.proto unreliable.proto
+	interop.proto compressed.proto unreliable.proto validated.proto

@@ -1,7 +1,7 @@
 %% @doc TrevRPC status codes, whose numeric values match gRPC's.
 -module(trevrpc_status).
 
--export([to_int/1, from_int/1, codes/0, new/2, ok/0, code/1, message/1]).
+-export([to_int/1, from_int/1, codes/0, new/2, ok/0, code/1, message/1, find_details/2]).
 
 -export_type([code/0, status/0]).
 
@@ -44,6 +44,18 @@ code(Status) -> maps:get(code, Status, ok).
 %% @doc The message of a status, empty when it has none.
 -spec message(status()) -> binary().
 message(Status) -> maps:get(message, Status, <<>>).
+
+%% @doc The details of a status whose type is `Type', a protobuf message's
+%% full name such as `buf.validate.Violations', in order: each the encoding
+%% of a message, for the caller to decode (see {@link trevrpc_violations}
+%% for that one).
+-spec find_details(status(), binary()) -> [binary()].
+find_details(Status, Type) when is_binary(Type) ->
+    [
+        maps:get(value, Detail, <<>>)
+     || Detail <- maps:get(details, Status, []),
+        maps:get(type, Detail, <<>>) =:= Type
+    ].
 
 %% @doc Every code, in numeric order.
 -spec codes() -> [code(), ...].
