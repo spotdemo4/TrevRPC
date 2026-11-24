@@ -22,7 +22,8 @@ use crate::http_admission::{
     admission_headers, rejection_head, rpc_response_head, validate_http_request,
     validate_webtransport_admission,
 };
-use crate::quic::{ServerConnection, SessionDatagrams};
+use crate::misdirected::HostCheck;
+use crate::quic::{ServerConnection, SessionDatagrams, server_name};
 use crate::request_pump::{RequestTransportEvent, poll_peer_reset};
 use crate::rpc_body::{
     BodySink, BodySource, WebTransportSessionState, handle_rpc_stream, reject_rpc_stream,
@@ -58,6 +59,7 @@ pub async fn handle_connection(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let raw_connection = connection.clone();
+    let host_check = HostCheck::new(server.options(), server_name(&connection).as_deref());
     let mut builder = h3::server::builder();
     // The connection advertises, and carries, at most one WebTransport session.
     if server.options().webtransport_enabled() {
@@ -109,6 +111,10 @@ pub async fn handle_connection(
                 };
                 if is_webtransport_request(&request) {
                     let remote_addr = raw_connection.client_addr();
+                    if host_check.rejects(&request, remote_addr) {
+                        reject_h3(stream, StatusCode::MISDIRECTED_REQUEST).await;
+                        continue;
+                    }
                     let response_headers = match validate_webtransport_request(&server, &request, remote_addr) {
                         Ok(headers) => headers,
                         Err(status) => {
@@ -138,6 +144,7 @@ pub async fn handle_connection(
                                 request_limit,
                                 stream_limit,
                                 raw_connection.clone(),
+                                host_check,
                                 shutdown.clone(),
                             )
                             .await;
@@ -161,6 +168,7 @@ pub async fn handle_connection(
                     stream_limit.as_ref(),
                     shutdown.clone(),
                     raw_connection.clone(),
+                    &host_check,
                     &mut stream_tasks,
                 );
             }
@@ -196,8 +204,13 @@ fn spawn_http_request(
     stream_limit: Option<&Arc<Semaphore>>,
     shutdown: watch::Receiver<bool>,
     connection: ServerConnection,
+    host_check: &HostCheck,
     stream_tasks: &mut JoinSet<()>,
 ) {
+    if host_check.rejects(&request, connection.client_addr()) {
+        stream_tasks.spawn(reject_h3(stream, StatusCode::MISDIRECTED_REQUEST));
+        return;
+    }
     let Some(stream_permit) = try_acquire_permit(stream_limit) else {
         stream_tasks.spawn(reject_h3(stream, StatusCode::SERVICE_UNAVAILABLE));
         return;
@@ -383,6 +396,7 @@ async fn handle_webtransport_session(
     request_limit: Option<Arc<Semaphore>>,
     stream_limit: Option<Arc<Semaphore>>,
     connection: ServerConnection,
+    host_check: HostCheck,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let session_id = session.session_id();
@@ -484,6 +498,7 @@ async fn handle_webtransport_session(
                             stream_limit.as_ref(),
                             shutdown.clone(),
                             connection.clone(),
+                            &host_check,
                             &mut stream_tasks,
                         );
                     }

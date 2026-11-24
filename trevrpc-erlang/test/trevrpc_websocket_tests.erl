@@ -29,6 +29,8 @@ websocket_test_() ->
                 {"browsers are refused without an admission", fun default_admission_test/1},
                 {"a refused request keeps the connection open", fun keep_alive_test/1},
                 {"an upgrade must be a GET", fun method_test/1},
+                {"an upgrade for another name than the connection's gets 421",
+                    fun misdirected_test/1},
                 {"an idle connection is closed", fun idle_test/1},
                 {"a full server refuses connections", fun full_test/1},
                 {"HTTP/1.1 is not offered without webtransport", fun disabled_test/1}
@@ -272,6 +274,33 @@ disabled_test(#{credentials := Credentials}) ->
         trevrpc_server:stop(Server)
     end.
 
+%% The browser sends the server name localhost. The port, case and a
+%% trailing dot do not count, and a connection without a server name serves
+%% every host.
+misdirected_test(#{port := Port}) ->
+    Upgrade = fun(Host) ->
+        {ok, Socket} = ssl:connect(
+            {127, 0, 0, 1},
+            Port,
+            [
+                binary,
+                {active, false},
+                {verify, verify_none},
+                {alpn_advertised_protocols, [<<"http/1.1">>]},
+                {server_name_indication, "localhost"}
+            ],
+            5000
+        ),
+        Response = send_head(Socket, upgrade_head(<<"/trevrpc">>, [{<<"host">>, Host}], <<"GET">>)),
+        ok = ssl:close(Socket),
+        element(1, Response)
+    end,
+    ?assertEqual(421, Upgrade(<<"other.example">>)),
+    ?assertEqual(101, Upgrade(<<"LocalHost.:443">>)),
+    {Status, _, _, Socket} = upgrade(Port, <<"/trevrpc">>, [{<<"host">>, <<"other.example">>}]),
+    ok = ssl:close(Socket),
+    ?assertEqual(101, Status).
+
 %%% The browser
 
 connect(Port, Alpn) ->
@@ -293,6 +322,9 @@ upgrade(Port, Path, Extra, Alpn) ->
     upgrade(Port, Path, Extra, Alpn, <<"GET">>).
 
 upgrade(Port, Path, Extra, Alpn, Method) ->
+    request(Port, Alpn, upgrade_head(Path, Extra, Method)).
+
+upgrade_head(Path, Extra, Method) ->
     Base = [
         {<<"host">>, <<"localhost">>},
         {<<"upgrade">>, <<"websocket">>},
@@ -304,18 +336,20 @@ upgrade(Port, Path, Extra, Alpn, Method) ->
     Headers = lists:foldl(
         fun({Name, Value}, Acc) -> lists:keystore(Name, 1, Acc, {Name, Value}) end, Base, Extra
     ),
-    Head = [
+    [
         Method,
         <<" ">>,
         Path,
         <<" HTTP/1.1\r\n">>,
         [[Name, <<": ">>, Value, <<"\r\n">>] || {Name, Value} <- Headers],
         <<"\r\n">>
-    ],
-    request(Port, Alpn, Head).
+    ].
 
 request(Port, Alpn, Head) ->
     {ok, Socket} = connect(Port, Alpn),
+    send_head(Socket, Head).
+
+send_head(Socket, Head) ->
     ok = ssl:send(Socket, Head),
     {Status, Headers, Rest} = read_head(Socket, <<>>),
     {Status, Headers, Rest, Socket}.

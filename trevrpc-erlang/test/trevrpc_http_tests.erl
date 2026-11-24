@@ -14,6 +14,35 @@
 -define(MAX_FRAME, 1 bsl 22).
 -define(MEDIA_TYPE, <<"application/trevrpc">>).
 
+%%% Misdirected requests
+
+misdirected_test_() ->
+    Check = fun(Authority, ServerName) ->
+        trevrpc_http:misdirected(Authority, trevrpc_http:server_name(ServerName))
+    end,
+    [
+        ?_assertEqual(Want, Check(Authority, ServerName))
+     || {Authority, ServerName, Want} <- [
+            {<<"b.example">>, <<"a.example">>, true},
+            {<<"b.example:443">>, <<"a.example">>, true},
+            {<<"a.example.evil">>, <<"a.example">>, true},
+            {<<"a.example">>, <<"a.example">>, false},
+            {<<"a.example:8443">>, <<"a.example">>, false},
+            {<<"A.Example.">>, <<"a.example">>, false},
+            {<<"a.example.:443">>, <<"A.EXAMPLE">>, false},
+            {<<"a.example">>, "a.example.", false},
+            {<<"b.example">>, undefined, false},
+            {<<"b.example">>, "", false},
+            {<<"b.example">>, "127.0.0.1", false},
+            {<<>>, <<"a.example">>, false},
+            {<<"127.0.0.1:8080">>, <<"localhost">>, false},
+            {<<"[::1]:8080">>, <<"localhost">>, false},
+            {<<"[::1]">>, <<"localhost">>, false},
+            {<<255, "A.example">>, <<"a.example">>, true},
+            {<<"a.example">>, <<255, "A">>, true}
+        ]
+    ].
+
 %%% Fixture
 
 http_test_() ->

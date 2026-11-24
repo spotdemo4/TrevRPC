@@ -724,6 +724,14 @@ fn http_upload_in_two(
   rest: BitArray,
 ) -> #(Int, BitArray)
 
+@external(erlang, "trevrpc_test_ffi", "http_status_for")
+fn http_status_for(
+  version: HttpVersion,
+  port: Int,
+  server_name: String,
+  authority: String,
+) -> Int
+
 @external(erlang, "trevrpc_test_ffi", "http_exchange")
 fn http_exchange(
   version: HttpVersion,
@@ -771,6 +779,36 @@ fn each_http(
 }
 
 const all_http = [H3, H2, H1]
+
+/// A request for another name than the connection's TLS server name gets
+/// 421, unless `misdirected_request_check` is off.
+pub fn http_fallback_misdirected_request_test() {
+  [#(True, 421), #(False, 200)]
+  |> list.each(fn(case_) {
+    let #(check, want) = case_
+    let #(cert, key, dir) = credentials()
+    let assert Ok(srv) =
+      server.start(
+        server.Config(
+          ..server.config(0, cert, key, []),
+          http_fallback: Some(fallback),
+          misdirected_request_check: check,
+        ),
+      )
+    let assert Ok(port) = server.port(srv)
+    let assert Ok(tcp_port) = server.tcp_port(srv)
+    [#(H3, port), #(H2, tcp_port), #(H1, tcp_port)]
+    |> list.each(fn(client) {
+      let #(version, port) = client
+      http_status_for(version, port, "localhost", "other.example")
+      |> should.equal(want)
+      http_status_for(version, port, "localhost", "localhost")
+      |> should.equal(200)
+    })
+    server.stop(srv)
+    remove(dir)
+  })
+}
 
 pub fn http_fallback_request_test() {
   use version, port, protocol <- each_http(all_http)

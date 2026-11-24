@@ -41,6 +41,14 @@ pub fn negotiated_protocol(connection: &quinn::Connection) -> Option<Vec<u8>> {
         .and_then(|data| data.protocol)
 }
 
+/// Returns the server name (SNI) the client sent in the TLS handshake of `connection`, if any.
+pub fn server_name(connection: &quinn::Connection) -> Option<String> {
+    connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.server_name)
+}
+
 impl MuxConnection for quinn::Connection {
     type SendStream = QuicSendStream;
     type RecvStream = Chunked<quinn::RecvStream>;

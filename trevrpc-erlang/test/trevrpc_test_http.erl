@@ -4,7 +4,7 @@
 %% `{Tag, Conn}', with `Tag' the tag of its events.
 -module(trevrpc_test_http).
 
--export([h3_opts/0, connect/2, close/1, open/3, cancel/2, send_data/4]).
+-export([h3_opts/0, connect/2, connect/3, close/1, open/3, cancel/2, send_data/4]).
 -export([exchange/3, response/2, response_head/2, body/3, request/3, header/2]).
 
 -define(CHUNK, 65536).
@@ -18,25 +18,34 @@ h3_opts() ->
 %% applications, from nothing else.
 connect(Version, Port) ->
     {ok, _} = application:ensure_all_started(application(Version)),
-    connect_started(Version, Port).
+    connect_started(Version, Port, []).
+
+%% Connects like connect/2, sending `ServerName' as the TLS server name.
+connect(Version, Port, ServerName) ->
+    {ok, _} = application:ensure_all_started(application(Version)),
+    connect_started(Version, Port, [{server_name_indication, ServerName}]).
 
 application(h3) -> quic;
 application(h2) -> h2;
 application(h1) -> h1.
 
-connect_started(h3, Port) ->
-    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, h3_opts()),
+%% `Sni' holds the server name to send, or nothing for the clients' own:
+%% none from quic_h3 and erlang_h1 to an IP address, the address itself from
+%% erlang_h2.
+connect_started(h3, Port, Sni) ->
+    Quic = maps:from_list([{server_name, Name} || {server_name_indication, Name} <- Sni]),
+    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, (h3_opts())#{quic_opts => Quic}),
     {quic_h3, Conn};
-connect_started(h2, Port) ->
-    {ok, Conn} = h2:connect("127.0.0.1", Port, #{verify => verify_none}),
+connect_started(h2, Port, Sni) ->
+    {ok, Conn} = h2:connect("127.0.0.1", Port, #{verify => verify_none, ssl_opts => Sni}),
     %% A connection the server closes exits abnormally, and takes its linked
     %% caller with it.
     true = unlink(Conn),
     ok = h2:wait_connected(Conn),
     {h2, Conn};
-connect_started(h1, Port) ->
+connect_started(h1, Port, Sni) ->
     {ok, Conn} = h1:connect("127.0.0.1", Port, #{
-        transport => ssl, ssl_opts => [{verify, verify_none}]
+        transport => ssl, ssl_opts => [{verify, verify_none} | Sni]
     }),
     true = unlink(Conn),
     ok = h1:wait_connected(Conn),

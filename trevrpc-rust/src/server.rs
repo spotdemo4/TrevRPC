@@ -778,6 +778,7 @@ pub struct ServerOptions {
     webtransport_allowed_origins: Vec<String>,
     webtransport_admission: Option<WebTransportAdmission>,
     http_fallback: Option<HttpFallback>,
+    misdirected_request_check: bool,
     #[cfg(feature = "dev-certificate")]
     development_certificate: Option<DevelopmentCertificate>,
     compression: Compression,
@@ -826,6 +827,7 @@ impl Default for ServerOptions {
             webtransport_allowed_origins: Vec::new(),
             webtransport_admission: None,
             http_fallback: None,
+            misdirected_request_check: true,
             #[cfg(feature = "dev-certificate")]
             development_certificate: None,
             compression: Compression::new(),
@@ -985,6 +987,13 @@ impl ServerOptions {
     #[must_use]
     pub const fn http_fallback(&self) -> Option<&HttpFallback> {
         self.http_fallback.as_ref()
+    }
+
+    /// Returns whether HTTP requests for another name than their connection's TLS server name are
+    /// answered with 421 Misdirected Request. On by default.
+    #[must_use]
+    pub const fn misdirected_request_check(&self) -> bool {
+        self.misdirected_request_check
     }
 
     /// Returns the development certificate whose hashes the server publishes, if configured.
@@ -1274,6 +1283,26 @@ impl ServerOptions {
     #[must_use]
     pub fn with_http_fallback(mut self, http_fallback: Option<HttpFallback>) -> Self {
         self.http_fallback = http_fallback;
+        self
+    }
+
+    /// Enables or disables the misdirected request check (enabled by default).
+    ///
+    /// An HTTP request whose host is another name than the TLS server name (SNI) its client sent
+    /// for the connection is answered with 421 Misdirected Request, over every HTTP version and
+    /// whatever its path, before admission, RPCs, browser sessions, the certificate hashes or the
+    /// HTTP fallback see it. Browsers send such requests when the certificate covers both names
+    /// (connection coalescing), and retry them on a new connection after a 421, which a proxy that
+    /// routes by SNI then sends to the right server. The port, a trailing dot and case do not
+    /// count, and a connection without SNI, as a client opens to an IP address, or a request for
+    /// an IP address is always served; an SNI that is an IP address counts as none. Each 421 is
+    /// logged at debug level.
+    ///
+    /// Disable it to serve every host, as a server whose clients reach it through a proxy that
+    /// terminates TLS and sends a server name of its own needs.
+    #[must_use]
+    pub const fn with_misdirected_request_check(mut self, enabled: bool) -> Self {
+        self.misdirected_request_check = enabled;
         self
     }
 

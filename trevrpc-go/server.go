@@ -155,6 +155,21 @@ type Server struct {
 // skips it. Zero and false, the defaults, never ask. Once a connection
 // completes its handshake its address is proven either way, so RemoteAddr is
 // a sound key for per-client limits.
+//
+// An HTTP request whose host is another name than the TLS server name (SNI)
+// its client sent for the connection is answered 421 Misdirected Request,
+// over every HTTP version and whatever its path, before admission, RPCs,
+// browser sessions, the certificate hashes or HTTPFallback see it. Browsers
+// send such requests when the certificate covers both names (connection
+// coalescing), and retry them on a new connection after a 421, which a proxy
+// that routes by SNI then sends to the right server. The port, a trailing dot
+// and case do not count, and a connection without SNI, as a client opens to
+// an IP address, or a request for an IP address is always served; an SNI
+// that is an IP address counts as none. Each 421 is reported as a
+// ServerDiagnosticMisdirectedRequest diagnostic.
+// DisableMisdirectedRequestCheck serves every host, as a server whose clients
+// reach it through a proxy that terminates TLS and sends a server name of its
+// own needs.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -181,6 +196,7 @@ type ServerOptions struct {
 	StreamCompressionMemory           int64
 	AddressValidationRate             int
 	ValidateAllAddresses              bool
+	DisableMisdirectedRequestCheck    bool
 }
 
 // servesHTTP reports whether the listener serves HTTP: HTTP/3 on the UDP
@@ -261,6 +277,9 @@ type ServerDiagnosticPhase string
 // client acknowledged. A ClientHello that arrived long before a handshake that
 // ended at once points at a connection that waited to be accepted; a server
 // flight the client acknowledged but never answered, at a stalled client.
+// ServerDiagnosticMisdirectedRequest reports an HTTP request answered 421
+// because its host is another name than its connection's TLS server name;
+// its Message names both.
 const (
 	ServerDiagnosticHandlerPanic           ServerDiagnosticPhase = "handler_panic"
 	ServerDiagnosticAuthorizerPanic        ServerDiagnosticPhase = "authorizer_panic"
@@ -282,6 +301,7 @@ const (
 	ServerDiagnosticExecutionDetached      ServerDiagnosticPhase = "execution_detached"
 	ServerDiagnosticExecutionFinallyExited ServerDiagnosticPhase = "execution_finally_exited"
 	ServerDiagnosticShutdownIncomplete     ServerDiagnosticPhase = "shutdown_incomplete"
+	ServerDiagnosticMisdirectedRequest     ServerDiagnosticPhase = "misdirected_request"
 )
 
 // ServerDiagnostic describes a local server failure. Request bodies and metadata are never included.

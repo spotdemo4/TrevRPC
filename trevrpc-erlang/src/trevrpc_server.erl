@@ -37,6 +37,20 @@
 %% setting a fallback serves those HTTP versions even with both off. HTTP/2
 %% and HTTP/1.1 responses advertise HTTP/3 through `Alt-Svc'.
 %%
+%% An HTTP request whose host is another name than the TLS server name (SNI)
+%% its client sent for the connection is answered `421 Misdirected Request',
+%% over every HTTP version and whatever its path, before admission, RPCs,
+%% browser sessions or the fallback see it. Browsers send such requests
+%% when the certificate covers both names (connection coalescing), and
+%% retry them on a new connection after a `421', which a proxy that routes
+%% by SNI then sends to the right server. The port, a trailing dot and case
+%% do not count, and a connection without SNI, as a client opens to an IP
+%% address, or a request for an IP address is always served; an SNI that
+%% is an IP address counts as none. Each `421' is logged at debug level.
+%% `misdirected_request_check => false' serves every host, as a server
+%% whose clients reach it through a proxy that terminates TLS and sends a
+%% server name of its own needs.
+%%
 %% Messages are opaque binaries here: a handler decodes its request and
 %% encodes its response, usually through generated code. See
 %% {@link trevrpc_call} for the handler API.
@@ -132,7 +146,8 @@
     webtransport => boolean(),
     webtransport_admission => trevrpc_admission:admission(),
     http_path => binary(),
-    http_fallback => trevrpc_http_request:handler()
+    http_fallback => trevrpc_http_request:handler(),
+    misdirected_request_check => boolean()
 }.
 
 %% What each connection process needs, shared by all of them.
@@ -179,7 +194,10 @@
     %% erlang_h1's options for HTTP/1.1 connections, and how long one may
     %% go without a request in flight.
     h1 := map(),
-    h1_idle_timeout := timeout()
+    h1_idle_timeout := timeout(),
+    %% Whether HTTP requests for another name than their connection's TLS
+    %% server name are answered `421'.
+    misdirected_request_check := boolean()
 }.
 
 -record(state, {
@@ -198,6 +216,9 @@
 -define(STREAM_COMPRESSION_MEMORY, 268435456).
 -define(HTTP_PATH, <<"/trevrpc">>).
 -define(H3, <<"h3">>).
+%% Where a QUIC connection's process keeps the client's server name from
+%% the SNI hook to the ALPN hook.
+-define(SERVER_NAME_KEY, {?MODULE, server_name}).
 %% How long a stopping server waits at most for its QUIC connections to
 %% drain before it closes the listener's socket; see close_quic/2.
 -define(QUIC_DRAIN_WAIT, 2000).
@@ -290,6 +311,8 @@ check_browsers(Opts) ->
             {error, {invalid_option, webtransport_admission}};
         #{http_fallback := Fallback} when not is_function(Fallback, 1) ->
             {error, {invalid_option, http_fallback}};
+        #{misdirected_request_check := Enabled} when not is_boolean(Enabled) ->
+            {error, {invalid_option, misdirected_request_check}};
         #{http_path := <<"/", _/binary>>} ->
             ok;
         #{http_path := _} ->
@@ -392,7 +415,7 @@ listen(Opts, Credentials, Compression) ->
             QuicOpts0#{extra_socket_opts => [{ip, maps:get(ip, Opts, {0, 0, 0, 0})}]},
             webtransport_quic(Config)
         ),
-        quic_handlers(Start, Config)
+        quic_handlers(Start, Credentials, Config)
     ),
     case start_quic(maps:get(port, Opts, 0), QuicOpts) of
         {ok, Name} ->
@@ -450,9 +473,11 @@ webtransport_quic(#{webtransport := _}) ->
 %% HTTP, WebTransport or the fallback, a connection that negotiated `h3' is
 %% HTTP/3, whose `quic_h3' process the owner hands the connection to in the
 %% ALPN hook, which runs in the connection's process.
-quic_handlers(Start, #{http := undefined, webtransport := undefined, fallback := undefined}) ->
+quic_handlers(Start, _Credentials, #{
+    http := undefined, webtransport := undefined, fallback := undefined
+}) ->
     #{connection_handler => Start};
-quic_handlers(Start, Config) ->
+quic_handlers(Start, Credentials, Config) ->
     #{
         alpn => [trevrpc:alpn(), ?H3],
         %% The control and QPACK streams of HTTP/3, and room for the
@@ -462,10 +487,20 @@ quic_handlers(Start, Config) ->
         max_streams_uni => 8,
         max_stream_data_uni => 16384,
         connection_handler => Start,
+        %% erlang_quic tells the ALPN hook nothing of the server name the
+        %% client sent, which HTTP/3 requests must name (see
+        %% trevrpc_http:misdirected/2). The SNI hook runs just before it in
+        %% the same connection process, so it leaves the name there, and
+        %% presents the server's certificate as without it.
+        sni_callback => fun(ServerName) ->
+            _ = put(?SERVER_NAME_KEY, ServerName),
+            {ok, Credentials}
+        end,
         alpn_handler => fun
             (Conn, ?H3, Owner) ->
-                serve_h3(Conn, Owner, Config);
+                serve_h3(Conn, Owner, erase(?SERVER_NAME_KEY), Config);
             (Conn, _Alpn, Owner) ->
+                _ = erase(?SERVER_NAME_KEY),
                 %% Every stream the client opens starts in manual flow
                 %% control (see trevrpc_transport:hold_streams/1).
                 ok = trevrpc_transport:hold_streams({quic, Conn}),
@@ -477,14 +512,14 @@ quic_handlers(Start, Config) ->
 %% from now on. With WebTransport, they go through the connection's stream
 %% router, which keeps those of the sessions' streams and datagrams, and the
 %% connection advertises WebTransport in its SETTINGS.
-serve_h3(Conn, Owner, #{webtransport := undefined}) ->
+serve_h3(Conn, Owner, ServerName, #{webtransport := undefined}) ->
     %% No handler: the owner answers each request.
-    accept_h3(Conn, Owner, #{owner => Owner, handler => undefined});
-serve_h3(Conn, Owner, #{webtransport := #{h3 := H3Settings}}) ->
+    accept_h3(Conn, Owner, ServerName, #{owner => Owner, handler => undefined});
+serve_h3(Conn, Owner, ServerName, #{webtransport := #{h3 := H3Settings}}) ->
     #{connection_handler := Routed, settings := Settings} = H3Settings,
     #{owner := Router} = PerConnection = Routed(Conn),
     ok = webtransport_h3_router:set_passthrough(Router, Owner),
-    accept_h3(Conn, Owner, PerConnection#{
+    accept_h3(Conn, Owner, ServerName, PerConnection#{
         handler => undefined,
         settings => Settings,
         %% The client's SETTINGS tell its WebTransport draft.
@@ -492,10 +527,10 @@ serve_h3(Conn, Owner, #{webtransport := #{h3 := H3Settings}}) ->
         notify_streams_available => true
     }).
 
-accept_h3(Conn, Owner, Opts) ->
+accept_h3(Conn, Owner, ServerName, Opts) ->
     maybe
         {ok, H3} ?= quic_h3:accept(Conn, Opts),
-        ok ?= trevrpc_server_conn:serve_h3(Owner, H3, Conn),
+        ok ?= trevrpc_server_conn:serve_h3(Owner, H3, Conn, ServerName),
         {ok, H3}
     end.
 
@@ -585,7 +620,8 @@ config(Opts, Compression) ->
         %% An HTTP/1.1 client has the TLS handshake timeout to send a
         %% request's head, after the handshake or the request before, as
         %% from the Rust server.
-        h1_idle_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT)
+        h1_idle_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
+        misdirected_request_check => maps:get(misdirected_request_check, Opts, true)
     }.
 
 http_options(#{http := true} = Opts) ->

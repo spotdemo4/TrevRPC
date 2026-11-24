@@ -15,7 +15,8 @@ import (
 //     trusted proxy, which suggests a misconfigured load balancer;
 //   - slog.LevelInfo for a handler that finally returned after its call ended;
 //   - slog.LevelDebug for the sessions and connections clients open and close,
-//     and failed TLS handshakes, which clients cause.
+//     failed TLS handshakes, and requests for another name than their
+//     connection's, which clients cause.
 //
 // An unknown phase is slog.LevelWarn.
 func (p ServerDiagnosticPhase) Level() slog.Level {
@@ -39,7 +40,8 @@ func (p ServerDiagnosticPhase) Level() slog.Level {
 		ServerDiagnosticSessionUpgradeSuccess,
 		ServerDiagnosticSessionClosed,
 		ServerDiagnosticHTTP3ConnectionClosed,
-		ServerDiagnosticTLSHandshakeFailed:
+		ServerDiagnosticTLSHandshakeFailed,
+		ServerDiagnosticMisdirectedRequest:
 		return slog.LevelDebug
 	default:
 		return slog.LevelWarn

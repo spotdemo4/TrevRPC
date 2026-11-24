@@ -31,6 +31,7 @@ mod http2;
 mod http3;
 mod http_admission;
 mod latest;
+mod misdirected;
 mod mux;
 mod native;
 mod proxy_protocol;

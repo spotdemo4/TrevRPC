@@ -18,6 +18,7 @@ use crate::fallback::{
     FallbackBody, ResponseBody, ResponseSink, advertise_http3, multiplexed_head, write_body,
 };
 use crate::http_admission::{rejection_head, rpc_response_head, validate_http_request};
+use crate::misdirected::HostCheck;
 use crate::request_pump::RequestTransportEvent;
 use crate::rpc_body::{BodySink, BodySource, handle_rpc_stream};
 use crate::serve::{drain_tasks, log_task_error, transport_limits, unless_shutting_down};
@@ -27,10 +28,12 @@ use crate::{Error, Result, Status};
 
 /// Serves one HTTP/2 connection from the client at `remote_addr` until it closes or the server
 /// shuts down.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection<T>(
     server: Server,
     io: T,
     remote_addr: SocketAddr,
+    host_check: HostCheck,
     alt_svc: Option<HeaderValue>,
     handshake_timeout: Duration,
     request_limit: Option<Arc<Semaphore>>,
@@ -75,6 +78,10 @@ pub async fn handle_connection<T>(
                 let Some(Ok((request, respond))) = accepted else {
                     break;
                 };
+                if host_check.rejects(&request, remote_addr) {
+                    reject(respond, StatusCode::MISDIRECTED_REQUEST);
+                    continue;
+                }
                 let Some(stream_permit) = try_acquire_permit(stream_limit.as_ref()) else {
                     reject(respond, StatusCode::SERVICE_UNAVAILABLE);
                     continue;

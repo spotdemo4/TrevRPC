@@ -214,7 +214,8 @@ fn default_port(scheme: &str) -> Option<u16> {
     }
 }
 
-fn authority_host(authority: &str) -> &str {
+/// Returns the host of an HTTP authority without its port and the brackets of an IPv6 address.
+pub fn authority_host(authority: &str) -> &str {
     if let Some(authority) = authority.strip_prefix('[')
         && let Some((host, _)) = authority.split_once(']')
     {

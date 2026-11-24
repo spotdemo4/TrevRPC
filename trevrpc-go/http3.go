@@ -78,6 +78,9 @@ func (l *Listener) handleHTTP3(w http.ResponseWriter, r *http.Request) {
 		// PROXY headers name, for admission, handlers and the fallback alike.
 		r.RemoteAddr = state.quic.remoteAddr().String()
 	}
+	if l.rejectMisdirected(w, r) {
+		return
+	}
 	if !l.runtime.options.claimsPath(r.URL.Path) {
 		l.serveUnclaimed(w, r)
 		return

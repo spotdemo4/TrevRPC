@@ -121,6 +121,9 @@ func (h *httpTCPServer) finished(conn net.Conn) {
 
 func (h *httpTCPServer) handle(w http.ResponseWriter, r *http.Request) {
 	l := h.listener
+	if l.rejectMisdirected(w, r) {
+		return
+	}
 	if !l.runtime.options.claimsPath(r.URL.Path) {
 		h.setAltSvc(w)
 		l.serveUnclaimed(w, r)

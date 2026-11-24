@@ -342,11 +342,7 @@ run(#{transport := Transport, id := Id, ref := Ref, router := Router} = Spec) ->
         {iolist_to_binary(Name), iolist_to_binary(Value)}
      || {Name, Value} <- RawHeaders, not pseudo(Name)
     ],
-    Authority =
-        case trevrpc_http:header(<<":authority">>, RawHeaders) of
-            <<>> -> trevrpc_http:header(<<"host">>, RawHeaders);
-            Value -> Value
-        end,
+    Authority = trevrpc_http:authority(RawHeaders),
     %% Only writes go through the stream; its frame reader is unused.
     Stream = trevrpc_stream:new(Transport, Id, Ref, Router, trevrpc_frame:reader(1, #{})),
     Req = #{

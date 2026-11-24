@@ -16,6 +16,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
 
+use crate::misdirected::HostCheck;
 use crate::proxy_protocol::{self, Rewound};
 use crate::qmux_conn::{MAX_RECORD_SIZE, QmuxConnection, server_config};
 use crate::serve::{ConnectionLog, unless_shutting_down};
@@ -320,10 +321,13 @@ pub(crate) async fn handle_connection(
             .await;
         }
         Some(H2_ALPN) if options.serves_http2() => {
+            // Only HTTP requests name a host to check against the server name.
+            let host_check = HostCheck::new(options, stream.get_ref().1.server_name());
             http2::handle_connection(
                 server,
                 stream,
                 remote_addr,
+                host_check,
                 alt_svc,
                 HANDSHAKE_TIMEOUT,
                 request_limit,
@@ -332,10 +336,12 @@ pub(crate) async fn handle_connection(
             .await;
         }
         Some(HTTP1_ALPN) | None if options.serves_http1() => {
+            let host_check = HostCheck::new(options, stream.get_ref().1.server_name());
             http1::handle_connection(
                 server,
                 stream,
                 remote_addr,
+                host_check,
                 alt_svc,
                 request_limit,
                 shutdown,

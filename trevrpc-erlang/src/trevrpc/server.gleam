@@ -82,6 +82,13 @@ pub type Config {
     /// even with `http` and `webtransport` off: see `trevrpc/http_request`.
     /// TrevRPC claims the HTTP path while either of them is on.
     http_fallback: Option(fn(Request) -> Nil),
+    /// Whether an HTTP request whose host is another name than the TLS
+    /// server name (SNI) its client sent for the connection is answered
+    /// `421 Misdirected Request`, as browsers that reuse a connection for
+    /// another name the certificate covers need to retry on a connection of
+    /// their own. Turn it off behind a proxy that terminates TLS and sends a
+    /// server name of its own. See `trevrpc_server` for the details.
+    misdirected_request_check: Bool,
     max_frame_size: Option(Int),
     max_streams_per_connection: Option(Int),
     max_concurrent_requests: Option(Int),
@@ -109,6 +116,7 @@ pub fn config(
     webtransport: False,
     webtransport_origins: [],
     http_fallback: None,
+    misdirected_request_check: True,
     max_frame_size: None,
     max_streams_per_connection: None,
     max_concurrent_requests: None,

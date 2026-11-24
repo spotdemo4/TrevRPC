@@ -17,6 +17,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::Instant;
 
 use crate::fallback::{FallbackBody, ResponseBody, advertise_http3, empty_response};
+use crate::misdirected::HostCheck;
 use crate::server::Server;
 use crate::websocket;
 
@@ -27,6 +28,7 @@ pub async fn handle_connection<T>(
     server: Server,
     io: T,
     remote_addr: SocketAddr,
+    host_check: HostCheck,
     alt_svc: Option<HeaderValue>,
     request_limit: Option<Arc<Semaphore>>,
     mut shutdown: watch::Receiver<bool>,
@@ -40,7 +42,11 @@ pub async fn handle_connection<T>(
             let server = server.clone();
             let alt_svc = alt_svc.clone();
             let upgrades = upgrades.clone();
+            let misdirected = host_check.rejects(&request, remote_addr);
             async move {
+                if misdirected {
+                    return Ok(empty_response(StatusCode::MISDIRECTED_REQUEST));
+                }
                 Ok::<_, Infallible>(
                     handle_request(&server, request, remote_addr, alt_svc, &upgrades).await,
                 )

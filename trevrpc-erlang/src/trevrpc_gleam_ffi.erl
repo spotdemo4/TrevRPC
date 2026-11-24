@@ -34,8 +34,8 @@
 -type server_config() ::
     {config, inet:port_number(), binary(), binary(), [{binary(), trevrpc_server:route()}],
         boolean(), option(inet:port_number()), boolean(), boolean(), [binary()],
-        option(trevrpc_http_request:handler()), option(pos_integer()), option(pos_integer()),
-        option(pos_integer()), option(non_neg_integer())}.
+        option(trevrpc_http_request:handler()), boolean(), option(pos_integer()),
+        option(pos_integer()), option(pos_integer()), option(non_neg_integer())}.
 
 %%% Channels
 
@@ -201,7 +201,7 @@ streamed({error, Status}) -> {error, to_status(Status)}.
 -spec start(server_config()) -> {ok, pid()} | {error, binary()}.
 start(
     {config, Port, CertFile, KeyFile, Routes, Tcp, TcpPort, Http, WebTransport, Origins, Fallback,
-        MaxFrame, MaxStreams, MaxRequests, Grace}
+        MisdirectedCheck, MaxFrame, MaxStreams, MaxRequests, Grace}
 ) ->
     Invalid = [Origin || Origin <- Origins, trevrpc_admission:normalize_origin(Origin) =:= error],
     case [Path || {Path, _} <- Routes] -- lists:usort([Path || {Path, _} <- Routes]) of
@@ -217,7 +217,8 @@ start(
                     tcp => Tcp,
                     http => Http,
                     webtransport => WebTransport,
-                    webtransport_admission => trevrpc_admission:same_origin(Origins)
+                    webtransport_admission => trevrpc_admission:same_origin(Origins),
+                    misdirected_request_check => MisdirectedCheck
                 },
                 [
                     {tcp_port, TcpPort},

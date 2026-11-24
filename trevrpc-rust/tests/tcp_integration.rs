@@ -152,8 +152,21 @@ async fn connect_tls_at(
     cert: &CertificateDer<'static>,
     alpn: &[u8],
 ) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
+    connect_tls_with_sni(addr, cert, alpn, true).await
+}
+
+/// Connects like [`connect_tls_at`], sending the server name `localhost` in the handshake only
+/// when `sni` is set; the certificate is verified for it either way.
+async fn connect_tls_with_sni(
+    addr: SocketAddr,
+    cert: &CertificateDer<'static>,
+    alpn: &[u8],
+    sni: bool,
+) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
     let stream = TcpStream::connect(addr).await?;
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(support::client_tls(cert, &[alpn])?));
+    let mut tls = support::client_tls(cert, &[alpn])?;
+    tls.enable_sni = sni;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
     Ok(connector
         .connect(ServerName::try_from("localhost")?, stream)
         .await?)
@@ -1241,16 +1254,30 @@ async fn http1_request(
     path: &str,
     body: &str,
 ) -> TestResult<FallbackReply> {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    let mut tls = connect_tls(server, b"http/1.1").await?;
+    let tls = connect_tls(server, b"http/1.1").await?;
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
+    http1_exchange(tls, &request).await
+}
+
+/// Sends `request`, a whole HTTP/1.1 request that asks to close the connection, on `tls`.
+async fn http1_exchange(
+    mut tls: tokio_rustls::client::TlsStream<TcpStream>,
+    request: &str,
+) -> TestResult<FallbackReply> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
     tls.write_all(request.as_bytes()).await?;
     let mut response = Vec::new();
-    within!(TEST_TIMEOUT, tls.read_to_end(&mut response))??;
+    // hyper closes a connection whose upgrade it refused without a TLS close_notify. Such a
+    // response counts only when its body is as long as its Content-Length says.
+    let truncated = match within!(TEST_TIMEOUT, tls.read_to_end(&mut response))? {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => true,
+        Err(error) => return Err(error.into()),
+    };
     let response = String::from_utf8(response)?;
     let (head, body) = response
         .split_once("\r\n\r\n")
@@ -1260,11 +1287,26 @@ async fn http1_request(
         .next()
         .and_then(|line| line.split(' ').nth(1))
         .ok_or("HTTP/1.1 response has no status line")?;
-    let alt_svc = lines.find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("alt-svc")
-            .then(|| value.trim().to_owned())
-    });
+    let headers: Vec<(&str, &str)> = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name, value.trim()))
+        .collect();
+    let header = |wanted: &str| {
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| *value)
+    };
+    if truncated {
+        let length = header("content-length")
+            .ok_or("HTTP/1.1 response without close_notify has no Content-Length")?;
+        ensure_eq!(
+            body.len(),
+            length.parse::<usize>()?,
+            "HTTP/1.1 response without close_notify is cut short"
+        );
+    }
+    let alt_svc = header("alt-svc").map(str::to_owned);
     Ok((
         http::StatusCode::from_bytes(status.as_bytes())?,
         alt_svc,
@@ -1273,7 +1315,14 @@ async fn http1_request(
 }
 
 async fn http2_sender(server: &Serving) -> TestResult<h2::client::SendRequest<Bytes>> {
-    let tls = connect_tls(server, b"h2").await?;
+    http2_sender_with_sni(server, true).await
+}
+
+async fn http2_sender_with_sni(
+    server: &Serving,
+    sni: bool,
+) -> TestResult<h2::client::SendRequest<Bytes>> {
+    let tls = connect_tls_with_sni(server.tcp, &server.cert, b"h2", sni).await?;
     let (sender, connection) = h2::client::handshake(tls).await?;
     tokio::spawn(connection);
     Ok(sender)
@@ -1326,7 +1375,18 @@ async fn http3_sender(
     server: &Serving,
     webtransport: bool,
 ) -> TestResult<(quinn::Endpoint, Http3Sender)> {
-    let tls = support::client_tls(&server.cert, &[trevrpc::HTTP3_ALPN])?;
+    http3_sender_with_sni(server, webtransport, true).await
+}
+
+/// Opens an HTTP/3 connection like [`http3_sender`], sending the server name `localhost` only
+/// when `sni` is set.
+async fn http3_sender_with_sni(
+    server: &Serving,
+    webtransport: bool,
+    sni: bool,
+) -> TestResult<(quinn::Endpoint, Http3Sender)> {
+    let mut tls = support::client_tls(&server.cert, &[trevrpc::HTTP3_ALPN])?;
+    tls.enable_sni = sni;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
@@ -1590,6 +1650,138 @@ async fn http3_serves_requests_alongside_a_webtransport_session() -> TestResult 
         ),
     }
     drop(session);
+    server.stop(TEST_TIMEOUT).await
+}
+
+/// Sends `head`, the request line and headers of an HTTP/1.1 request without a body, on a
+/// connection of its own that sends the server name `localhost` when `sni` is set, and returns the
+/// response status.
+async fn http1_status(server: &Serving, sni: bool, head: &str) -> TestResult<http::StatusCode> {
+    let tls = connect_tls_with_sni(server.tcp, &server.cert, b"http/1.1", sni).await?;
+    let request = format!("{head}Connection: close\r\nContent-Length: 0\r\n\r\n");
+    Ok(http1_exchange(tls, &request).await?.0)
+}
+
+fn get_request(host: &str, port: u16, path: &str) -> http::Result<http::Request<()>> {
+    http::Request::get(format!("https://{host}:{port}{path}")).body(())
+}
+
+#[tokio::test]
+async fn misdirected_requests_get_421_over_every_http_version() -> TestResult {
+    const MISDIRECTED: http::StatusCode = http::StatusCode::MISDIRECTED_REQUEST;
+    let fallback = EchoFallback::default();
+    let server = spawn_server(fallback_options(test_options(), &fallback)).await?;
+    let (tcp, udp) = (server.tcp.port(), server.udp.port());
+    let rpc = |port: u16| {
+        http::Request::post(format!("https://other.example:{port}/trevrpc"))
+            .header(http::header::CONTENT_TYPE, "application/trevrpc")
+            .body(())
+    };
+
+    // The clients send the server name localhost.
+    for path in ["/app/index.html", "/trevrpc", "/trevrpc/certificate-hashes"] {
+        let method = if path == "/trevrpc" { "POST" } else { "GET" };
+        let head = format!("{method} {path} HTTP/1.1\r\nHost: other.example\r\n");
+        ensure_eq!(
+            http1_status(&server, true, &head).await?,
+            MISDIRECTED,
+            "HTTP/1.1 {path}"
+        );
+    }
+    let websocket = format!(
+        "GET /trevrpc HTTP/1.1\r\nHost: other.example:{tcp}\r\nOrigin: {ORIGIN}\r\n\
+         Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: qmux-02.trevrpc-1\r\n"
+    );
+    ensure_eq!(
+        http1_status(&server, true, &websocket).await?,
+        MISDIRECTED,
+        "WebSocket upgrade"
+    );
+
+    let h2 = http2_sender(&server).await?;
+    for request in [
+        get_request("other.example", tcp, "/app/index.html")?,
+        get_request("other.example", tcp, "/trevrpc/certificate-hashes")?,
+        rpc(tcp)?,
+    ] {
+        let path = request.uri().path().to_owned();
+        let status = http2_request(&h2, request, Bytes::new()).await?.0;
+        ensure_eq!(status, MISDIRECTED, "HTTP/2 {path}");
+    }
+
+    let (_endpoint, mut h3) = http3_sender(&server, true).await?;
+    let connect = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(format!("https://other.example:{udp}/trevrpc"))
+        .header(http::header::ORIGIN, ORIGIN)
+        .extension(h3::ext::Protocol::WEB_TRANSPORT)
+        .body(())?;
+    for request in [
+        get_request("other.example", udp, "/app/index.html")?,
+        get_request("other.example", udp, "/trevrpc/certificate-hashes")?,
+        rpc(udp)?,
+        connect,
+    ] {
+        let path = format!("{} {}", request.method(), request.uri().path());
+        let status = http3_exchange(&mut h3, request, Bytes::new())
+            .await?
+            .0
+            .status();
+        ensure_eq!(status, MISDIRECTED, "HTTP/3 {path}");
+    }
+    server.stop(TEST_TIMEOUT).await
+}
+
+#[tokio::test]
+async fn requests_for_the_connections_name_or_without_one_are_served() -> TestResult {
+    const OK: http::StatusCode = http::StatusCode::OK;
+    let fallback = EchoFallback::default();
+    let server = spawn_server(fallback_options(test_options(), &fallback)).await?;
+    let (tcp, udp) = (server.tcp.port(), server.udp.port());
+
+    // The port, case and a trailing dot do not count.
+    for host in ["localhost", "LocalHost.:443"] {
+        let head = format!("GET /app/index.html HTTP/1.1\r\nHost: {host}\r\n");
+        ensure_eq!(
+            http1_status(&server, true, &head).await?,
+            OK,
+            "HTTP/1.1 {host}"
+        );
+    }
+    let h2 = http2_sender(&server).await?;
+    let (_endpoint, mut h3) = http3_sender(&server, false).await?;
+    for host in ["localhost", "LocalHost."] {
+        let request = get_request(host, tcp, "/app/index.html")?;
+        let status = http2_request(&h2, request, Bytes::new()).await?.0;
+        ensure_eq!(status, OK, "HTTP/2 {host}");
+        let request = get_request(host, udp, "/app/index.html")?;
+        let status = http3_exchange(&mut h3, request, Bytes::new())
+            .await?
+            .0
+            .status();
+        ensure_eq!(status, OK, "HTTP/3 {host}");
+    }
+
+    // Without a server name, as clients that reach the server by address send, every host is
+    // served.
+    let head = "GET /app/index.html HTTP/1.1\r\nHost: other.example\r\n";
+    ensure_eq!(
+        http1_status(&server, false, head).await?,
+        OK,
+        "HTTP/1.1 without SNI"
+    );
+    let h2 = http2_sender_with_sni(&server, false).await?;
+    let request = get_request("other.example", tcp, "/app/index.html")?;
+    let status = http2_request(&h2, request, Bytes::new()).await?.0;
+    ensure_eq!(status, OK, "HTTP/2 without SNI");
+    let (_endpoint, mut h3) = http3_sender_with_sni(&server, false, false).await?;
+    let request = get_request("other.example", udp, "/app/index.html")?;
+    let status = http3_exchange(&mut h3, request, Bytes::new())
+        .await?
+        .0
+        .status();
+    ensure_eq!(status, OK, "HTTP/3 without SNI");
     server.stop(TEST_TIMEOUT).await
 }
 

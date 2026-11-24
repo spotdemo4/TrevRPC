@@ -39,6 +39,13 @@ fallback_test_() ->
                 {"a fallback alone serves every path", fun alone_test/1, [h3, h2, h1]},
                 {"a request takes a stream slot", fun slot_test/1, [h3, h2]},
                 {"a CONNECT off the HTTP path goes to the fallback", fun connect_test/1, [h3]},
+                {"a request for another name than the connection's gets 421",
+                    fun misdirected_test/1, [h3, h2, h1]},
+                {"a WebTransport CONNECT for another name gets 421", fun misdirected_connect_test/1,
+                    [h3]},
+                {"misdirected_request_check => false serves every name", fun unchecked_test/1, [
+                    h3, h2, h1
+                ]},
                 {"a HEAD response keeps the headers of its body", fun head_test/1, [h3, h2, h1]},
                 {"a large response goes out whole", fun large_reply_test/1, [h3, h2, h1]},
                 {"a request in flight outlasts the HTTP/1.1 request timeout",
@@ -63,6 +70,9 @@ fallback_test_() ->
             Version <- Versions
         ] ++
             [
+                {"misdirected_request_check must be a boolean", fun() ->
+                    run(fun invalid_misdirected_test/1, Env)
+                end},
                 {"HTTP is not offered without a fallback, HTTP or WebTransport", fun() ->
                     run(fun disabled_test/1, Env)
                 end},
@@ -347,6 +357,67 @@ connect_test(#{port := Port}) ->
     ),
     close(Client).
 
+%% The clients send the server name localhost. The port, case and a
+%% trailing dot do not count, and a connection without a server name serves
+%% every host.
+misdirected_test(Env) ->
+    Client = connect(Env, "localhost"),
+    Misdirected = [
+        for(<<"other.example">>, request(<<"GET">>, <<"/app">>, [])),
+        for(<<"other.example:443">>, request(<<"GET">>, <<"/trevrpc">>, [])),
+        for(
+            <<"other.example">>,
+            request(<<"POST">>, <<"/trevrpc">>, [{<<"content-type">>, ?MEDIA_TYPE}])
+        )
+    ],
+    lists:foreach(
+        fun(Request) -> ?assertMatch({421, _, _}, exchange(Client, Request, <<>>)) end, Misdirected
+    ),
+    lists:foreach(
+        fun(Host) ->
+            ?assertMatch(
+                {200, _, <<"fallback ", _/binary>>},
+                exchange(Client, for(Host, request(<<"GET">>, <<"/app">>, [])), <<>>)
+            )
+        end,
+        [<<"localhost">>, <<"LocalHost.:443">>]
+    ),
+    close(Client),
+    Unnamed = connect(Env),
+    ?assertMatch(
+        {200, _, <<"fallback ", _/binary>>},
+        exchange(Unnamed, for(<<"other.example">>, request(<<"GET">>, <<"/app">>, [])), <<>>)
+    ),
+    close(Unnamed).
+
+misdirected_connect_test(#{port := Port}) ->
+    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, (h3_opts())#{
+        settings => #{enable_connect_protocol => 1}, quic_opts => #{server_name => "localhost"}
+    }),
+    Client = {quic_h3, Conn},
+    Connect = [
+        {<<":method">>, <<"CONNECT">>},
+        {<<":protocol">>, <<"webtransport">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"other.example">>},
+        {<<":path">>, <<"/trevrpc">>}
+    ],
+    ?assertMatch({421, _, _}, exchange(Client, Connect, <<>>)),
+    close(Client).
+
+unchecked_test(#{credentials := Credentials} = Env) ->
+    Server = start_server(Credentials, #{http => true, misdirected_request_check => false}),
+    try
+        Client = connect(Env#{port => port(Server), tcp_port => tcp_port(Server)}, "localhost"),
+        ?assertMatch(
+            {200, _, <<"fallback ", _/binary>>},
+            exchange(Client, for(<<"other.example">>, request(<<"GET">>, <<"/app">>, [])), <<>>)
+        ),
+        close(Client)
+    after
+        trevrpc_server:stop(Server)
+    end.
+
 head_test(Env) ->
     Client = connect(Env),
     {200, Headers, Body} = exchange(Client, request(<<"HEAD">>, <<"/head">>, []), <<>>),
@@ -590,6 +661,14 @@ disabled_test(#{credentials := #{cert := Cert, key := Key}}) ->
     ?assertMatch({error, _}, h2:connect("127.0.0.1", tcp_port(Server), #{verify => verify_none})),
     trevrpc_server:stop(Server).
 
+invalid_misdirected_test(#{credentials := #{cert := Cert, key := Key}}) ->
+    ?assertEqual(
+        {error, {invalid_option, misdirected_request_check}},
+        trevrpc_server:start(#{
+            cert => Cert, key => Key, routes => #{}, misdirected_request_check => yes
+        })
+    ).
+
 invalid_test(#{credentials := #{cert := Cert, key := Key}}) ->
     ?assertEqual(
         {error, {invalid_option, http_fallback}},
@@ -655,3 +734,13 @@ request(Method, Path, Extra, Query) ->
 %% A client of the test's version, on the server's port for it.
 connect(#{version := h3, port := Port}) -> trevrpc_test_http:connect(h3, Port);
 connect(#{version := Version, tcp_port := Port}) -> trevrpc_test_http:connect(Version, Port).
+
+%% A client like connect/1 that sends `ServerName' as the TLS server name.
+connect(#{version := h3, port := Port}, ServerName) ->
+    trevrpc_test_http:connect(h3, Port, ServerName);
+connect(#{version := Version, tcp_port := Port}, ServerName) ->
+    trevrpc_test_http:connect(Version, Port, ServerName).
+
+%% `Request' for `Authority'.
+for(Authority, Request) ->
+    lists:keystore(<<":authority">>, 1, Request, {<<":authority">>, Authority}).

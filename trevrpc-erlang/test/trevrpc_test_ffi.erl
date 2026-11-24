@@ -6,7 +6,7 @@
 -export([run_tests/0]).
 -export([credentials/0, remove/1, sleep/1, register_self/1, is_alive/1, monitor/1, wait_down/2]).
 -export([quietly/1]).
--export([http_exchange/6, http_unfinished/3, http_upload_in_two/5]).
+-export([http_exchange/6, http_status_for/4, http_unfinished/3, http_upload_in_two/5]).
 
 %% Runs the tests in trevrpc_test, with eunit's timeouts scaled as gleeunit
 %% scales them, and halts with their result.
@@ -73,6 +73,21 @@ http_exchange(Version, Port, Method, Path, Headers, Body) ->
     trevrpc_test_http:close(Client),
     {Status, [{iolist_to_binary(N), iolist_to_binary(V)} || {N, V} <- ResponseHeaders],
         ResponseBody}.
+
+%% Sends a GET for `Authority' over `Version' on a connection of its own
+%% that sends the TLS server name `ServerName', and returns the response's
+%% status.
+http_status_for(Version, Port, ServerName, Authority) ->
+    Client = trevrpc_test_http:connect(Version, Port, binary_to_list(ServerName)),
+    Request = lists:keystore(
+        <<":authority">>,
+        1,
+        trevrpc_test_http:request(<<"GET">>, <<"/">>, []),
+        {<<":authority">>, Authority}
+    ),
+    {Status, _, _} = trevrpc_test_http:exchange(Client, Request, <<>>),
+    trevrpc_test_http:close(Client),
+    Status.
 
 %% Opens a request over HTTP/3 or HTTP/2 whose body never comes, and
 %% returns the response's status.

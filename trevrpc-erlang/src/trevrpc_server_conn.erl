@@ -44,7 +44,7 @@
 
 -behaviour(gen_server).
 
--export([start/2, start_qmux/3, start_http/3, serve_h3/3, shutdown/1, admit/4, finish/3, reserve/4]).
+-export([start/2, start_qmux/3, start_http/3, serve_h3/4, shutdown/1, admit/4, finish/3, reserve/4]).
 -export([store_connection_metadata/3, connection_metadata/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -95,6 +95,10 @@
     %% The client's address, for the HTTP admission: looked up at the first
     %% request over HTTP/3.
     peer :: {inet:ip_address(), inet:port_number()} | undefined | unknown,
+    %% The TLS server name the client sent, which its HTTP requests must
+    %% name (see trevrpc_http:misdirected/2), or `undefined' when they are
+    %% not checked.
+    server_name :: binary() | undefined,
     %% When an HTTP/2 connection last had a stream, to close it once idle.
     active_at = 0 :: integer(),
     %% Lone STATUS frames quic_h3 refused with a full send queue, written
@@ -162,9 +166,14 @@ start_http(Kind, Socket, Config) ->
                     {ok, Address} -> Address;
                     {error, _} -> unknown
                 end,
+            ServerName =
+                case ssl:connection_information(Socket, [sni_hostname]) of
+                    {ok, [{sni_hostname, Name}]} -> Name;
+                    _ -> undefined
+                end,
             case ssl:controlling_process(Socket, Pid) of
                 ok ->
-                    gen_server:cast(Pid, {Kind, Socket, Peer}),
+                    gen_server:cast(Pid, {Kind, Socket, Peer, ServerName}),
                     {ok, Pid};
                 {error, _} = Error ->
                     exit(Pid, kill),
@@ -177,10 +186,11 @@ start_http(Kind, Socket, Config) ->
 %% @doc Makes the owner `Pid' of the QUIC connection `Quic', which
 %% negotiated `h3', serve HTTP/3 through `H3', the connection's `quic_h3'
 %% process, whose events it receives from now on. Called in the QUIC
-%% connection's ALPN hook, before any stream event.
--spec serve_h3(pid(), pid(), pid()) -> ok.
-serve_h3(Pid, H3, Quic) ->
-    gen_server:call(Pid, {h3, H3, Quic}).
+%% connection's ALPN hook, before any stream event. `ServerName' is the TLS
+%% server name the client sent, if any.
+-spec serve_h3(pid(), pid(), pid(), binary() | undefined) -> ok.
+serve_h3(Pid, H3, Quic, ServerName) ->
+    gen_server:call(Pid, {h3, H3, Quic, ServerName}).
 
 %% @doc Cancels every call, waits for their handlers up to the graceful
 %% shutdown timeout, then closes the connection.
@@ -279,8 +289,10 @@ init({Transport, Config}) ->
     {ok, #state{transport = Transport, config = Config, flows = Flows}}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
-handle_call({h3, H3, Quic}, _From, #state{transport = {quic, Quic}} = State) ->
-    {reply, ok, State#state{transport = {h3, H3, Quic}}};
+handle_call({h3, H3, Quic, ServerName}, _From, #state{transport = {quic, Quic}} = State) ->
+    {reply, ok, State#state{
+        transport = {h3, H3, Quic}, server_name = checked_server_name(ServerName, State)
+    }};
 handle_call({admit, Id, Ref, Admission}, {Pid, _}, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #entry{state = starting, ref = Ref, pid = Pid} = Entry} ->
@@ -338,7 +350,7 @@ handle_cast({qmux, Socket, Opts}, #state{config = Config} = State) ->
         {error, _Reason} ->
             {stop, normal, State}
     end;
-handle_cast({Kind, Socket, Peer}, #state{config = Config} = State) when
+handle_cast({Kind, Socket, Peer, ServerName}, #state{config = Config} = State) when
     Kind =:= h2; Kind =:= h1
 ->
     case start_http_connection(Kind, Socket, Config) of
@@ -346,6 +358,7 @@ handle_cast({Kind, Socket, Peer}, #state{config = Config} = State) when
             {noreply, State#state{
                 transport = arm_idle({Kind, Conn}, Config),
                 peer = Peer,
+                server_name = checked_server_name(ServerName, State),
                 active_at = erlang:monotonic_time(millisecond)
             }};
         {error, _Reason} ->
@@ -567,14 +580,45 @@ store_metadata(Id, Set, #state{metadata_sets = Table0, metadata_ids = Ids0} = St
 
 %%% HTTP requests
 
-%% TrevRPC claims the HTTP path while it serves the HTTP mapping or
-%% browsers; every other request goes to the fallback, CONNECTs included,
-%% as on the Go server.
+%% A request for another name than the connection's is answered `421'
+%% before anything else. TrevRPC claims the HTTP path while it serves the
+%% HTTP mapping or browsers; every other request goes to the fallback,
+%% CONNECTs included, as on the Go server.
 http_request(Id, Method, Target, Headers, #state{config = #{http_path := HttpPath}} = State) ->
-    case trevrpc_http:path(Target) of
-        HttpPath -> claimed(Id, Method, Target, Headers, State);
-        _ -> unclaimed(Id, Method, Target, Headers, State)
+    case misdirected(Id, Headers, State) of
+        true ->
+            State;
+        false ->
+            case trevrpc_http:path(Target) of
+                HttpPath -> claimed(Id, Method, Target, Headers, State);
+                _ -> unclaimed(Id, Method, Target, Headers, State)
+            end
     end.
+
+%% Answers `421' to a request whose host is another name than the TLS server
+%% name of its connection, and says whether it did.
+misdirected(_Id, _Headers, #state{server_name = undefined}) ->
+    false;
+misdirected(Id, Headers, #state{server_name = ServerName} = State) ->
+    Authority = trevrpc_http:authority(Headers),
+    case trevrpc_http:misdirected(Authority, ServerName) of
+        true ->
+            logger:debug("trevrpc: answered 421 to a request for ~s on a connection for ~s", [
+                Authority, ServerName
+            ]),
+            Message = <<"misdirected request: this connection serves ", ServerName/binary>>,
+            refuse_http(Id, 421, refusal_headers([], State), Message, State),
+            true;
+        false ->
+            false
+    end.
+
+%% The server name the connection's HTTP requests are checked against,
+%% unless the server turned the check off.
+checked_server_name(_Name, #state{config = #{misdirected_request_check := false}}) ->
+    undefined;
+checked_server_name(Name, _State) ->
+    trevrpc_http:server_name(Name).
 
 claimed(Id, _Method, _Target, _Headers, #state{transport = {h1, _}} = State) ->
     %% WebSocket upgrades come as upgrade events.
@@ -681,12 +725,14 @@ protocol({h1, _}) -> <<"HTTP/1.1">>.
 %% response declines the upgrade.
 upgrade(Id, Method, Target, Headers, #state{config = #{http_path := HttpPath} = Config} = State0) ->
     Claimed = trevrpc_http:path(Target) =:= HttpPath,
-    case {Claimed, Config} of
-        {false, _} ->
+    case {misdirected(Id, Headers, State0), Claimed, Config} of
+        {true, _, _} ->
+            {noreply, State0};
+        {false, false, _} ->
             {noreply, unclaimed(Id, Method, Target, Headers, State0)};
-        {true, #{webtransport := undefined}} ->
+        {false, true, #{webtransport := undefined}} ->
             {noreply, claimed(Id, Method, Target, Headers, State0)};
-        {true, #{webtransport := WebTransport}} ->
+        {false, true, #{webtransport := WebTransport}} ->
             {Peer, State} = peer(State0),
             Checked =
                 case trevrpc_http1:check_upgrade(Method, Target, Headers, Peer, WebTransport) of
