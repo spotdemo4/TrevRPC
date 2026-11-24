@@ -62,7 +62,7 @@ impl HostTarget {
         if let Some(endpoint) = &*slot {
             return Ok(endpoint.clone());
         }
-        let mut endpoint = quinn::Endpoint::client(local).map_err(Error::transport)?;
+        let mut endpoint = crate::udp::client_endpoint(local).map_err(Error::transport)?;
         endpoint.set_default_client_config(self.quic.clone());
         *slot = Some(endpoint.clone());
         drop(slot);

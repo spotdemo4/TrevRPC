@@ -1,5 +1,7 @@
 //! The QUIC side of a server: a Quinn endpoint, and the UDP load balancers in front of it that
-//! name the client with a PROXY protocol header on every datagram.
+//! name the client with a PROXY protocol header on every datagram. Every endpoint this crate binds,
+//! client or server, also gets larger socket buffers than the system's defaults; see
+//! [`client_endpoint`].
 //!
 //! A UDP load balancer cannot open a connection with a PROXY header, so a trusted one puts a
 //! version 2 header in front of every datagram it forwards instead. The endpoint's socket strips
@@ -12,7 +14,7 @@ use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, Once, RwLock};
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
@@ -35,6 +37,90 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_FLOWS: usize = 1 << 18;
 /// How often dropped datagrams are logged.
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+/// The receive and send buffer sizes asked for on every UDP socket this crate binds, as quic-go
+/// asks for. Quinn leaves the system's defaults, about 208 KiB on Linux, and a socket that small
+/// drops datagrams when a burst arrives faster than the endpoint reads them, as when a Wi-Fi or
+/// cellular link delivers aggregated frames: every drop then cuts the sender's congestion window.
+/// Linux caps the request at `net.core.rmem_max` and `net.core.wmem_max`, and reports twice what
+/// it grants.
+const SOCKET_BUFFER_BYTES: usize = 7 << 20;
+
+/// Binds a client endpoint on `addr`, as [`quinn::Endpoint::client`] does, with receive and send
+/// buffers of 7 MiB where the system allows them. An IPv6 address binds a dual-stack socket where
+/// the system allows it, so `[::]:0` can dial IPv4 servers too.
+///
+/// The system's default buffers drop the bursts that Wi-Fi and cellular links deliver, and each
+/// drop slows the connection as congestion would. Linux caps the buffers at `net.core.rmem_max`
+/// and `net.core.wmem_max`; when that leaves the receive buffer smaller, this logs a warning, once
+/// per process.
+///
+/// # Errors
+///
+/// When the socket cannot be bound, or there is no async runtime.
+pub fn client_endpoint(addr: SocketAddr) -> io::Result<quinn::Endpoint> {
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        bind_socket(addr, true)?,
+        runtime,
+    )
+}
+
+/// Binds a UDP socket for a QUIC endpoint and sizes its buffers. With `dual_stack`, an IPv6 socket
+/// also takes IPv4 where the system allows it, as [`quinn::Endpoint::client`] does; otherwise it
+/// keeps the system's default, as [`quinn::Endpoint::server`] does.
+fn bind_socket(addr: SocketAddr, dual_stack: bool) -> io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if dual_stack
+        && addr.is_ipv6()
+        && let Err(error) = socket.set_only_v6(false)
+    {
+        tracing::debug!(%error, "unable to make the UDP socket dual-stack");
+    }
+    socket.bind(&addr.into())?;
+    let socket = socket.into();
+    size_buffers(&socket);
+    Ok(socket)
+}
+
+/// Asks for [`SOCKET_BUFFER_BYTES`] buffers. A socket the system will not resize keeps working
+/// with smaller ones.
+fn size_buffers(socket: &std::net::UdpSocket) {
+    let Ok(state) = quinn::udp::UdpSocketState::new(socket.into()) else {
+        return;
+    };
+    let _ = state.set_recv_buffer_size(socket.into(), SOCKET_BUFFER_BYTES);
+    let _ = state.set_send_buffer_size(socket.into(), SOCKET_BUFFER_BYTES);
+    if let Ok(reported) = state.recv_buffer_size(socket.into())
+        && granted_buffer(reported) < SOCKET_BUFFER_BYTES
+    {
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                granted = granted_buffer(reported),
+                wanted = SOCKET_BUFFER_BYTES,
+                "the UDP receive buffer is smaller than QUIC needs to absorb bursts without \
+                 loss; raise net.core.rmem_max"
+            );
+        });
+    }
+}
+
+/// The buffer size a system granted, from the size it reports: Linux reports twice what it grants,
+/// keeping the rest for its own bookkeeping.
+fn granted_buffer(reported: usize) -> usize {
+    if cfg!(target_os = "linux") {
+        reported / 2
+    } else {
+        reported
+    }
+}
 
 /// A Quinn endpoint for [`Server::serve`](crate::server::Server::serve) and its variants, which
 /// also take a bare [`quinn::Endpoint`].
@@ -46,7 +132,7 @@ pub struct QuicEndpoint {
 
 impl QuicEndpoint {
     /// Binds a server endpoint on `addr`, as [`quinn::Endpoint::server`] does, behind the UDP
-    /// load balancers in `trusted_proxies`.
+    /// load balancers in `trusted_proxies`, with the larger socket buffers of [`client_endpoint`].
     ///
     /// Every datagram from a trusted proxy must start with a PROXY protocol version 2 header,
     /// which is stripped. The source address of the headers from a proxy's address when the
@@ -58,8 +144,7 @@ impl QuicEndpoint {
     /// other than UDP over IPv4 or IPv6, leaves the proxy's own address.
     ///
     /// The header takes up to 52 bytes of every datagram, plus any extensions, which the path
-    /// between the proxy and the endpoint must have room for. With no trusted proxies, this is
-    /// [`quinn::Endpoint::server`].
+    /// between the proxy and the endpoint must have room for.
     ///
     /// # Errors
     ///
@@ -70,12 +155,18 @@ impl QuicEndpoint {
         trusted_proxies: impl IntoIterator<Item = IpPrefix>,
     ) -> io::Result<Self> {
         let trusted: Vec<IpPrefix> = trusted_proxies.into_iter().collect();
-        if trusted.is_empty() {
-            return quinn::Endpoint::server(config, addr).map(Self::from);
-        }
-        let socket = std::net::UdpSocket::bind(addr)?;
+        let socket = bind_socket(addr, false)?;
         let runtime =
             quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+        if trusted.is_empty() {
+            return quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(config),
+                socket,
+                runtime,
+            )
+            .map(Self::from);
+        }
         let clients = Arc::new(ProxiedClients::default());
         let socket = Arc::new(ProxiedSocket {
             inner: runtime.wrap_udp_socket(socket)?,
@@ -469,6 +560,58 @@ mod tests {
 
     fn addr(text: &str) -> SocketAddr {
         text.parse().unwrap()
+    }
+
+    /// Linux grants a buffer request up to `net.core.rmem_max` or `net.core.wmem_max`, and
+    /// reports twice what it grants.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sockets_ask_for_large_buffers_up_to_the_system_limit() {
+        let limit = |name: &str| -> usize {
+            std::fs::read_to_string(format!("/proc/sys/net/core/{name}"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let socket = super::bind_socket(addr("127.0.0.1:0"), false).unwrap();
+        let state = quinn::udp::UdpSocketState::new((&socket).into()).unwrap();
+        let received = state.recv_buffer_size((&socket).into()).unwrap();
+
+        assert_eq!(
+            2 * super::SOCKET_BUFFER_BYTES.min(limit("rmem_max")),
+            received
+        );
+        assert_eq!(
+            2 * super::SOCKET_BUFFER_BYTES.min(limit("wmem_max")),
+            state.send_buffer_size((&socket).into()).unwrap()
+        );
+        assert_eq!(
+            super::SOCKET_BUFFER_BYTES.min(limit("rmem_max")),
+            super::granted_buffer(received)
+        );
+    }
+
+    /// The warning compares what Linux granted, half of what it reports, with what was asked for:
+    /// a 4 MiB `rmem_max` grants 4 MiB and reports 8 MiB, which is still short.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_buffer_capped_below_the_request_is_short() {
+        assert!(super::granted_buffer(2 * (4 << 20)) < super::SOCKET_BUFFER_BYTES);
+        assert_eq!(
+            super::SOCKET_BUFFER_BYTES,
+            super::granted_buffer(2 * super::SOCKET_BUFFER_BYTES)
+        );
+    }
+
+    #[test]
+    fn client_sockets_on_ipv6_take_ipv4_too() {
+        let Ok(socket) = super::bind_socket(addr("[::]:0"), true) else {
+            return; // No IPv6 here.
+        };
+        let socket = socket2::SockRef::from(&socket);
+
+        assert!(!socket.only_v6().unwrap());
     }
 
     const PROXY: &str = "127.0.0.1:5000";

@@ -202,7 +202,7 @@ impl Fixture {
         let client_tls = serving::client_tls(&server.cert, &[]).unwrap();
         let link = match transport {
             Transport::Quic => {
-                let mut endpoint = quinn::Endpoint::client(loopback).unwrap();
+                let mut endpoint = trevrpc::udp::client_endpoint(loopback).unwrap();
                 endpoint.set_default_client_config(
                     ChannelConfig::new().quic_config(client_tls).unwrap(),
                 );

@@ -107,7 +107,7 @@ pub fn client_endpoint(
     } else {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     };
-    let mut endpoint = quinn::Endpoint::client(bind)?;
+    let mut endpoint = trevrpc::udp::client_endpoint(bind)?;
     endpoint.set_default_client_config(config.quic_config(tls)?);
     Ok(endpoint)
 }

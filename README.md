@@ -163,7 +163,7 @@ let tls = quinn::rustls::ServerConfig::builder()
     .with_no_client_auth()
     .with_single_cert(certs, key)?;
 let addr = "[::]:50051".parse()?;
-let endpoint = quinn::Endpoint::server(server.quic_config(tls.clone())?, addr)?;
+let endpoint = trevrpc::udp::QuicEndpoint::server(server.quic_config(tls.clone())?, addr, [])?;
 // TCP is opt-in in Rust.
 let tcp = trevrpc::tcp::TcpFallback::new(
     tokio::net::TcpListener::bind(addr).await?,

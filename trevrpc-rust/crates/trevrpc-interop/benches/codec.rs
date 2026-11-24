@@ -220,7 +220,7 @@ impl Fixture {
                 .with_no_client_auth();
             let config = ChannelConfig::new();
             let mut endpoint =
-                quinn::Endpoint::client((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+                trevrpc::udp::client_endpoint((std::net::Ipv4Addr::LOCALHOST, 0).into()).unwrap();
             endpoint.set_default_client_config(config.quic_config(tls).unwrap());
             let channel =
                 Channel::connect_with_config(endpoint.clone(), server.udp, "localhost", config)

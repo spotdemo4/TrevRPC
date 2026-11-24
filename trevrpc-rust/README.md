@@ -47,7 +47,7 @@ greeter::register_greeter(&mut server, GreeterService);
 let tls = quinn::rustls::ServerConfig::builder()
     .with_no_client_auth()
     .with_single_cert(certs, key)?;
-let endpoint = quinn::Endpoint::server(server.quic_config(tls)?, "[::]:50051".parse()?)?;
+let endpoint = trevrpc::udp::QuicEndpoint::server(server.quic_config(tls)?, "[::]:50051".parse()?, [])?;
 server.serve(endpoint).await?;
 ```
 

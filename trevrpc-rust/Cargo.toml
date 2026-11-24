@@ -252,6 +252,8 @@ rcgen = { version = "0.14", optional = true, default-features = false, features 
   "ring",
 ] }
 ring = "0.17"
+# UDP sockets bound dual-stack, as quinn::Endpoint::client binds them.
+socket2 = "0.6"
 # The development certificate's validity, from SystemTime (rcgen leaves out time's "std").
 time = { version = "0.3", optional = true }
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

@@ -116,23 +116,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     ));
     greeter::register_greeter(&mut server, GreeterService);
 
-    let endpoint = quinn::Endpoint::server(server.quic_config(certificate.server_config())?, addr)?;
+    let endpoint = trevrpc::udp::QuicEndpoint::server(
+        server.quic_config(certificate.server_config())?,
+        addr,
+        [],
+    )?;
 
     println!(
         "TrevRPC greeter native QUIC server listening on {}",
-        endpoint.local_addr()?
+        endpoint.endpoint().local_addr()?
     );
     println!(
         "TrevRPC greeter HTTP/3 server listening on https://{}/trevrpc",
-        endpoint.local_addr()?
+        endpoint.endpoint().local_addr()?
     );
     println!(
         "TrevRPC greeter WebTransport server listening on https://{}/trevrpc",
-        endpoint.local_addr()?
+        endpoint.endpoint().local_addr()?
     );
     println!(
         "certificate hashes at https://{}/trevrpc/certificate-hashes",
-        endpoint.local_addr()?
+        endpoint.endpoint().local_addr()?
     );
     println!("certificate written to {}", certificate_path.display());
     println!("bearer token: {auth_token}");

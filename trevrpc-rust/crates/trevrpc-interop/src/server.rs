@@ -486,11 +486,12 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let tls = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-    let endpoint = quinn::Endpoint::server(
+    let endpoint = trevrpc::udp::QuicEndpoint::server(
         server.quic_config(tls.clone())?,
         SocketAddr::new(host, port),
+        [],
     )?;
-    let udp = endpoint.local_addr()?.port();
+    let udp = endpoint.endpoint().local_addr()?.port();
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(host, port)).await?;
     let tcp = listener.local_addr()?.port();
     let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls));
