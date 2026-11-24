@@ -109,7 +109,10 @@
     quic_connection_idle_timeout => pos_integer(),
     %% Request metadata every call carries, sent once per connection; see
     %% set_connection_metadata/2.
-    connection_metadata => trevrpc_metadata:metadata()
+    connection_metadata => trevrpc_metadata:metadata(),
+    %% Checks the requests of calls before they are sent; see
+    %% trevrpc_validator.
+    validator => trevrpc_validator:validator()
 }.
 
 %% What a calling process needs to use a stream it opened.
@@ -594,7 +597,14 @@ init(Opts) ->
                 ok -> ok;
                 {error, Invalid} -> {error, {connection_metadata, Invalid}}
             end,
+        Validator = maps:get(validator, Opts, undefined),
+        ok ?=
+            case trevrpc_validator:check(Validator) of
+                ok -> ok;
+                error -> {error, {invalid_option, validator}}
+            end,
         {ok, State} = init(Opts, Compression),
+        ok = trevrpc_validator:install(Validator),
         {ok, replace_metadata(ConnectionMetadata, State)}
     end.
 
@@ -1063,6 +1073,7 @@ handle_info(_Message, State) ->
 
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{subscribers = Subscribers} = State) ->
+    ok = trevrpc_validator:uninstall(),
     _ = [Pid ! {trevrpc_channel, self(), closed} || Pid <- maps:values(Subscribers)],
     fail_streams(fun(_Conn) -> true end, State),
     Stopped = stop_extra_attempts(stop_attempts(State)),

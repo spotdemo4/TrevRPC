@@ -48,7 +48,8 @@
 -type field_path() :: #{elements => [element()]}.
 
 %% One step of a field path: a field, with the index or key of a repeated
-%% or map field's item.
+%% or map field's item. `field_number' and the field types are int32s, an
+%% `int_key' an int64, and an `index' and a `uint_key' from 0 to 2^64 - 1.
 -type element() :: #{
     field_number => integer(),
     field_name => binary(),
@@ -183,7 +184,9 @@ hex(Byte) -> io_lib:format("\\x~2.16.0b", [Byte]).
 
 %%% Encoding
 
-%% @doc Encodes a `buf.validate.Violations' holding `Violations'.
+%% @doc Encodes a `buf.validate.Violations' holding `Violations'. A number
+%% its field's type cannot hold raises `{out_of_range, Key, Value}': see
+%% element/0 for the ranges.
 -spec encode([violation()]) -> iodata().
 encode(Violations) ->
     [trevrpc_pb:bytes_field(1, encode_violation(Violation)) || Violation <- Violations].
@@ -214,20 +217,20 @@ path(Number, Key, Map) ->
 encode_element(Element) ->
     [
         case Element of
-            #{field_number := FieldNumber} -> signed(1, FieldNumber);
+            #{field_number := FieldNumber} -> int(1, field_number, 32, FieldNumber);
             #{} -> []
         end,
         string(2, field_name, Element),
         [
-            signed(Number, type_to_int(maps:get(Key, Element)))
+            int(Number, Key, 32, type_to_int(maps:get(Key, Element)))
          || {Number, Key} <- [{3, field_type}, {4, key_type}, {5, value_type}],
             is_map_key(Key, Element)
         ],
         case Element of
-            #{subscript := {index, Index}} -> trevrpc_pb:varint_field(6, Index);
+            #{subscript := {index, Index}} -> uint64(6, index, Index);
             #{subscript := {bool_key, Key}} -> bool(7, Key);
-            #{subscript := {int_key, Key}} -> signed(8, Key);
-            #{subscript := {uint_key, Key}} -> trevrpc_pb:varint_field(9, Key);
+            #{subscript := {int_key, Key}} -> int(8, int_key, 64, Key);
+            #{subscript := {uint_key, Key}} -> uint64(9, uint_key, Key);
             #{subscript := {string_key, Key}} -> trevrpc_pb:bytes_field(10, Key);
             #{} -> []
         end
@@ -244,8 +247,20 @@ string(Number, Key, Map) ->
 bool(Number, true) -> trevrpc_pb:varint_field(Number, 1);
 bool(Number, false) -> trevrpc_pb:varint_field(Number, 0).
 
-%% An int32, int64 or enum: a negative value is its 64-bit two's complement.
-signed(Number, Value) -> trevrpc_pb:varint_field(Number, Value band ?UINT64_MASK).
+%% An int32 or enum (Bits 32), or an int64 (Bits 64): a negative value is
+%% its 64-bit two's complement. A value its type cannot hold is refused
+%% rather than cut down to one it can.
+int(Number, _Key, Bits, Value) when
+    is_integer(Value), Value >= -(1 bsl (Bits - 1)), Value < 1 bsl (Bits - 1)
+->
+    trevrpc_pb:varint_field(Number, Value band ?UINT64_MASK);
+int(_Number, Key, _Bits, Value) ->
+    erlang:error({out_of_range, Key, Value}).
+
+uint64(Number, _Key, Value) when is_integer(Value), Value >= 0, Value =< ?UINT64_MASK ->
+    trevrpc_pb:varint_field(Number, Value);
+uint64(_Number, Key, Value) ->
+    erlang:error({out_of_range, Key, Value}).
 
 %%% Decoding
 

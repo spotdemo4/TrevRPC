@@ -10,6 +10,7 @@
 -export([handler_recv/1, handler_send/2, send_headers/2, set_trailers/2]).
 -export([http_header/2, http_peer/1, http_read_body/2]).
 -export([http_reply/4, http_stream_reply/3, http_stream_body/3]).
+-export([violations_status/1, violations_from_status/1, violation_to_string/1]).
 
 %% Gleam's values as this module sees them: a custom type's value is a tuple
 %% tagged with its constructor's name in snake case, `Nil' is `nil'.
@@ -29,20 +30,24 @@
     {config, binary(), inet:port_number(), option(inet:port_number()), auto | quic | tcp,
         option(binary()), option(binary()), boolean(), option(pos_integer()), option(pos_integer()),
         option(pos_integer()), option(pos_integer()), option(pos_integer()),
-        trevrpc_metadata:metadata()}.
+        trevrpc_metadata:metadata(), option(validator())}.
+%% A Gleam validator: the check of a request type's messages, if any, which
+%% answers `Nil' or a Gleam status.
+-type validator() :: fun((binary()) -> option(fun((term(), binary()) -> result(nil)))).
 -type kind() :: unary | server_streaming | client_streaming | bidirectional_streaming.
 -type server_config() ::
     {config, inet:port_number(), binary(), binary(), [{binary(), trevrpc_server:route()}],
         boolean(), option(inet:port_number()), boolean(), boolean(), [binary()],
         option(trevrpc_http_request:handler()), boolean(), option(pos_integer()),
-        option(pos_integer()), option(pos_integer()), option(non_neg_integer())}.
+        option(pos_integer()), option(pos_integer()), option(non_neg_integer()),
+        option(validator())}.
 
 %%% Channels
 
 -spec connect(channel_config(), timeout()) -> result(pid()).
 connect(
     {config, Host, Port, TcpPort, Transport, ServerName, CaFile, Verify, MaxFrame, ConnectTimeout,
-        IdleTimeout, MinQuic, MaxQuic, ConnectionMetadata},
+        IdleTimeout, MinQuic, MaxQuic, ConnectionMetadata, Validator},
     Timeout
 ) ->
     Opts = options(
@@ -61,7 +66,8 @@ connect(
             {connect_timeout, ConnectTimeout},
             {idle_timeout, IdleTimeout},
             {min_quic_connections, MinQuic},
-            {max_quic_connections, MaxQuic}
+            {max_quic_connections, MaxQuic},
+            {validator, map_option(Validator, fun validator/1)}
         ]
     ),
     result(trevrpc_channel:connect(Opts, Timeout)).
@@ -99,8 +105,21 @@ client_stream(Channel, {method, Path, _, _, _, _, _, _, _, _} = Method, Options)
 bidi(Channel, {method, Path, _, _, _, _, _, _, _, _} = Method, Options) ->
     result(trevrpc_client:bidi(Channel, Path, call_options(Method, Options))).
 
--spec send(trevrpc_client:call(), term()) -> result(nil).
-send(Call, Request) -> usable(fun() -> done(trevrpc_client:send(Call, Request)) end).
+-spec send(trevrpc_client:call(), term()) ->
+    {ok, nil} | {error, {ended, status()} | {invalid, status()}}.
+send(Call, Request) ->
+    Sent = usable(fun() ->
+        case trevrpc_client:send(Call, Request) of
+            ok -> {ok, nil};
+            {invalid, Status} -> {error, {invalid, status(Status)}};
+            {error, Status} -> {error, {ended, status(Status)}}
+        end
+    end),
+    case Sent of
+        %% usable/1's own: the call cannot be written.
+        {error, {status, _, _, _, _} = Status} -> {error, {ended, Status}};
+        Result -> Result
+    end.
 
 -spec close_send(trevrpc_client:call()) -> result(nil).
 close_send(Call) -> usable(fun() -> done(trevrpc_client:close_send(Call)) end).
@@ -201,7 +220,7 @@ streamed({error, Status}) -> {error, to_status(Status)}.
 -spec start(server_config()) -> {ok, pid()} | {error, binary()}.
 start(
     {config, Port, CertFile, KeyFile, Routes, Tcp, TcpPort, Http, WebTransport, Origins, Fallback,
-        MisdirectedCheck, MaxFrame, MaxStreams, MaxRequests, Grace}
+        MisdirectedCheck, MaxFrame, MaxStreams, MaxRequests, Grace, Validator}
 ) ->
     Invalid = [Origin || Origin <- Origins, trevrpc_admission:normalize_origin(Origin) =:= error],
     case [Path || {Path, _} <- Routes] -- lists:usort([Path || {Path, _} <- Routes]) of
@@ -226,7 +245,8 @@ start(
                     {max_frame_size, MaxFrame},
                     {max_streams_per_connection, MaxStreams},
                     {max_concurrent_requests, MaxRequests},
-                    {graceful_shutdown_timeout, Grace}
+                    {graceful_shutdown_timeout, Grace},
+                    {validator, map_option(Validator, fun validator/1)}
                 ]
             ),
             %% Linked, so that the server stops with the process that started
@@ -372,6 +392,141 @@ codec({codec, Encode, _}, {codec, _, Decode}) ->
             end
         end
     }.
+
+%% A Gleam validator as the runtime takes one: `none' for `None', and a
+%% check whose `Nil' is `ok' and whose Gleam status is the runtime's.
+validator(Validator) ->
+    fun(Type) ->
+        case Validator(Type) of
+            none ->
+                none;
+            {some, Check} ->
+                {ok, fun(Request, Encoded) ->
+                    case Check(Request, Encoded) of
+                        {ok, nil} -> ok;
+                        {error, Status} -> {error, to_status(Status)}
+                    end
+                end}
+        end
+    end.
+
+%%% Violations
+
+%% A Gleam violation, with its unset fields at their zero values, as a
+%% trevrpc_violations map, which leaves them out.
+-type violation() ::
+    {violation, [path_element()], [path_element()], binary(), binary(), boolean()}.
+-type path_element() ::
+    {field_path_element, integer(), binary(), option(field_type()), option(field_type()),
+        option(field_type()), option(trevrpc_violations:subscript())}.
+%% A FieldType: a constructor of field_types/0, or `{unknown_type, N}'.
+-type field_type() :: atom() | {unknown_type, integer()}.
+
+-spec violations_status([violation()]) -> status().
+violations_status(Violations) ->
+    status(trevrpc_violations:status([violation_map(Violation) || Violation <- Violations])).
+
+-spec violations_from_status(status()) -> {ok, [violation()]} | {error, nil}.
+violations_from_status(Status) ->
+    case trevrpc_violations:from_status(to_status(Status)) of
+        {ok, Violations} ->
+            %% A Gleam String is UTF-8, which a peer's strings need not be.
+            try
+                {ok, [violation_record(Violation) || Violation <- Violations]}
+            catch
+                throw:not_utf8 -> {error, nil}
+            end;
+        error ->
+            {error, nil}
+    end.
+
+-spec violation_to_string(violation()) -> binary().
+violation_to_string(Violation) ->
+    iolist_to_binary(trevrpc_violations:format(violation_map(Violation))).
+
+violation_map({violation, Field, Rule, RuleId, Message, ForKey}) ->
+    maps:from_list(
+        [{field, path_map(Field)} || Field =/= []] ++
+            [{rule, path_map(Rule)} || Rule =/= []] ++
+            [{rule_id, RuleId} || RuleId =/= <<>>] ++
+            [{message, Message} || Message =/= <<>>] ++
+            [{for_key, true} || ForKey]
+    ).
+
+path_map(Elements) ->
+    #{
+        elements => [
+            maps:from_list(
+                [{field_number, Number} || Number =/= 0] ++
+                    [{field_name, Name} || Name =/= <<>>] ++
+                    [
+                        {Key, type_map(Type)}
+                     || {Key, {some, Type}} <- [
+                            {field_type, FieldType}, {key_type, KeyType}, {value_type, ValueType}
+                        ]
+                    ] ++
+                    [{subscript, Subscript} || {some, Subscript} <- [Sub]]
+            )
+         || {field_path_element, Number, Name, FieldType, KeyType, ValueType, Sub} <- Elements
+        ]
+    }.
+
+violation_record(Violation) ->
+    {violation, path_record(maps:get(field, Violation, #{})),
+        path_record(maps:get(rule, Violation, #{})), utf8(maps:get(rule_id, Violation, <<>>)),
+        utf8(maps:get(message, Violation, <<>>)), maps:get(for_key, Violation, false)}.
+
+path_record(Path) ->
+    [
+        {field_path_element, maps:get(field_number, Element, 0),
+            utf8(maps:get(field_name, Element, <<>>)), type_option(field_type, Element),
+            type_option(key_type, Element), type_option(value_type, Element),
+            case Element of
+                #{subscript := {string_key, Key}} -> {some, {string_key, utf8(Key)}};
+                #{subscript := Subscript} -> {some, Subscript};
+                #{} -> none
+            end}
+     || Element <- maps:get(elements, Path, [])
+    ].
+
+utf8(Bin) ->
+    case trevrpc_pb:valid_utf8(Bin) of
+        true -> Bin;
+        false -> throw(not_utf8)
+    end.
+
+type_option(Key, Element) ->
+    case Element of
+        #{Key := Number} when is_integer(Number) -> {some, {unknown_type, Number}};
+        #{Key := Type} -> {some, element(2, lists:keyfind(Type, 1, field_types()))};
+        #{} -> none
+    end.
+
+type_map({unknown_type, Number}) -> Number;
+type_map(Type) -> element(1, lists:keyfind(Type, 2, field_types())).
+
+%% trevrpc_violations' field types and Gleam's FieldType constructors.
+field_types() ->
+    [
+        {'TYPE_DOUBLE', type_double},
+        {'TYPE_FLOAT', type_float},
+        {'TYPE_INT64', type_int64},
+        {'TYPE_UINT64', type_uint64},
+        {'TYPE_INT32', type_int32},
+        {'TYPE_FIXED64', type_fixed64},
+        {'TYPE_FIXED32', type_fixed32},
+        {'TYPE_BOOL', type_bool},
+        {'TYPE_STRING', type_string},
+        {'TYPE_GROUP', type_group},
+        {'TYPE_MESSAGE', type_message},
+        {'TYPE_BYTES', type_bytes},
+        {'TYPE_UINT32', type_uint32},
+        {'TYPE_ENUM', type_enum},
+        {'TYPE_SFIXED32', type_sfixed32},
+        {'TYPE_SFIXED64', type_sfixed64},
+        {'TYPE_SINT32', type_sint32},
+        {'TYPE_SINT64', type_sint64}
+    ].
 
 format(Reason) ->
     unicode:characters_to_binary(io_lib:format("~0p", [Reason])).

@@ -4,6 +4,7 @@
 import gleam/option.{type Option, None}
 import trevrpc/metadata.{type Metadata}
 import trevrpc/status.{type Status}
+import trevrpc/validator.{type Validator}
 
 /// A channel: the process that keeps the connection.
 pub type Channel
@@ -42,6 +43,9 @@ pub type Config {
     /// once per connection instead of in every call; none when empty. See
     /// `set_connection_metadata`.
     connection_metadata: Metadata,
+    /// Checks the request messages of calls before they are sent: see
+    /// `trevrpc/validator`.
+    validator: Option(Validator),
   )
 }
 
@@ -61,6 +65,7 @@ pub fn config(host: String, port: Int) -> Config {
     min_quic_connections: None,
     max_quic_connections: None,
     connection_metadata: metadata.new(),
+    validator: None,
   )
 }
 

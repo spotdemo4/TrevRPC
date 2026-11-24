@@ -73,14 +73,23 @@ pub fn bidi(
   options: Options,
 ) -> Result(Call(request, response), Status)
 
-/// Sends a request. An error means the call ended, with that status (OK
-/// when the server finished it successfully); its responses can still be
-/// read.
+/// Why `send` did not send a request.
+pub type SendError {
+  /// The call ended, with this status (OK when the server finished it
+  /// successfully); its responses can still be read.
+  Ended(Status)
+  /// The channel's validator rejected the request, with this status,
+  /// normally `InvalidArgument` with the violations `violations.from_status`
+  /// reads: it was not sent, and the call goes on. See `trevrpc/validator`.
+  Invalid(Status)
+}
+
+/// Sends a request.
 @external(erlang, "trevrpc_gleam_ffi", "send")
 pub fn send(
   call: Call(request, response),
   request: request,
-) -> Result(Nil, Status)
+) -> Result(Nil, SendError)
 
 /// Ends the requests.
 @external(erlang, "trevrpc_gleam_ffi", "close_send")

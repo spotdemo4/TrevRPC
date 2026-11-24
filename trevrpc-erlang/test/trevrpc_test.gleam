@@ -6,6 +6,8 @@
 
 import gleam/bit_array
 import gleam/bytes_tree
+import gleam/dynamic.{type Dynamic}
+import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
@@ -22,6 +24,8 @@ import trevrpc/metadata
 import trevrpc/schema
 import trevrpc/server
 import trevrpc/status
+import trevrpc/validator
+import trevrpc/violations
 
 /// Runs this module's tests. gleeunit.main() would run every module in test/,
 /// the runtime's eunit tests too, which rebar3 runs.
@@ -451,7 +455,7 @@ pub fn cancel_test() {
   // The call is finished.
   let assert Error(error) = client.recv(call)
   error.code |> should.equal(status.FailedPrecondition)
-  let assert Error(error) = client.send(call, hello("late"))
+  let assert Error(client.Ended(error)) = client.send(call, hello("late"))
   error.code |> should.equal(status.FailedPrecondition)
 }
 
@@ -880,4 +884,148 @@ pub fn http_fallback_download_test() {
     |> bytes_tree.concat
     |> bytes_tree.to_bit_array,
   )
+}
+
+// Validation
+
+/// A name that is empty breaks `string.min_len` on the field `name`.
+fn empty_name() -> violations.Violation {
+  violations.Violation(
+    field: [
+      violations.FieldPathElement(
+        field_number: 1,
+        field_name: "name",
+        field_type: Some(violations.TypeString),
+        key_type: None,
+        value_type: None,
+        subscript: None,
+      ),
+    ],
+    rule: [],
+    rule_id: "string.min_len",
+    message: "value length must be at least 1 characters",
+    for_key: False,
+  )
+}
+
+/// Checks HelloRequests, which it reads the name of from the decoded
+/// message: an empty name breaks a rule.
+fn hello_validator() -> validator.Validator {
+  fn(type_name) {
+    case type_name {
+      "greet.v1.HelloRequest" -> Some(check_hello)
+      _ -> None
+    }
+  }
+}
+
+fn check_hello(
+  request: Dynamic,
+  _encoded: BitArray,
+) -> Result(Nil, status.Status) {
+  case decode.run(request, decode.at([1], decode.string)) {
+    Ok("") -> Error(violations.status([empty_name()]))
+    Ok(_) -> Ok(Nil)
+    Error(_) -> Error(status.new(status.Internal, "not a HelloRequest"))
+  }
+}
+
+pub fn violations_test() {
+  let keyed =
+    violations.Violation(
+      field: [
+        violations.FieldPathElement(
+          field_number: 3,
+          field_name: "labels",
+          field_type: Some(violations.TypeMessage),
+          key_type: Some(violations.TypeString),
+          value_type: Some(violations.UnknownType(99)),
+          subscript: Some(violations.StringKey("a")),
+        ),
+        violations.FieldPathElement(
+          field_number: 0,
+          field_name: "items",
+          field_type: None,
+          key_type: None,
+          value_type: None,
+          subscript: Some(violations.Index(2)),
+        ),
+      ],
+      rule: [],
+      rule_id: "",
+      message: "",
+      for_key: True,
+    )
+  let failed = violations.status([empty_name(), keyed])
+  failed.code |> should.equal(status.InvalidArgument)
+  failed.message
+  |> should.equal(
+    "validation error: name: value length must be at least 1 characters (and 1 more)",
+  )
+  violations.from_status(failed) |> should.equal(Ok([empty_name(), keyed]))
+  violations.to_string(keyed)
+  |> should.equal("labels[\"a\"].items[2]: [unknown]")
+  violations.from_status(status.new(status.InvalidArgument, "no detail"))
+  |> should.equal(Error(Nil))
+}
+
+/// A server's validator fails a request that breaks its rules before the
+/// handler sees it.
+pub fn server_validator_test() {
+  let #(cert, key, dir) = credentials()
+  let routes = greeter_trevrpc.routes(handlers())
+  let config =
+    server.Config(
+      ..server.config(0, cert, key, routes),
+      validator: Some(hello_validator()),
+    )
+  let assert Ok(srv) = server.start(config)
+  let assert Ok(port) = server.port(srv)
+  let assert Ok(ch) =
+    channel.connect(
+      channel.Config(
+        ..channel.config("127.0.0.1", port),
+        transport: channel.Quic,
+        server_name: Some("localhost"),
+        ca_file: Some(cert),
+      ),
+      10_000,
+    )
+  let assert Ok(reply) =
+    greeter_trevrpc.say_hello(ch, hello("ada"), client.options())
+  reply.message.message |> should.equal("hello ada")
+  let assert Error(failed) =
+    greeter_trevrpc.say_hello(ch, hello(""), client.options())
+  failed.code |> should.equal(status.InvalidArgument)
+  violations.from_status(failed) |> should.equal(Ok([empty_name()]))
+  // The handler's recv returns the status, which it fails the call with.
+  let assert Ok(call) = greeter_trevrpc.collect(ch, client.options())
+  let assert Ok(Nil) = client.send(call, hello("a"))
+  let _ = client.send(call, hello(""))
+  let assert Error(failed) = client.close_and_recv(call)
+  violations.from_status(failed) |> should.equal(Ok([empty_name()]))
+  channel.close(ch)
+  server.stop(srv)
+  remove(dir)
+}
+
+/// A channel's validator fails a request that breaks its rules without
+/// sending it; the server, which checks nothing, would have answered it.
+pub fn client_validator_test() {
+  let configure = fn(config) {
+    channel.Config(..config, validator: Some(hello_validator()))
+  }
+  use ch <- with_configured_channel(channel.Quic, [], configure)
+  let assert Error(failed) =
+    greeter_trevrpc.say_hello(ch, hello(""), client.options())
+  failed.code |> should.equal(status.InvalidArgument)
+  violations.from_status(failed) |> should.equal(Ok([empty_name()]))
+  // A rejected request is not sent, and the call goes on.
+  let assert Ok(call) = greeter_trevrpc.collect(ch, client.options())
+  let assert Ok(Nil) = client.send(call, hello("a"))
+  let assert Error(client.Invalid(failed)) = client.send(call, hello(""))
+  violations.from_status(failed) |> should.equal(Ok([empty_name()]))
+  let assert Ok(Nil) = client.send(call, hello("b"))
+  client.close_and_recv(call)
+  |> should.equal(Ok(HelloReply(message: "a,b", index: 2)))
 }

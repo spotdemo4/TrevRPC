@@ -7,6 +7,7 @@ import trevrpc/handler.{type Call}
 import trevrpc/http_request.{type Request}
 import trevrpc/schema.{type Method}
 import trevrpc/status.{type Status}
+import trevrpc/validator.{type Validator}
 
 pub type Server
 
@@ -94,6 +95,9 @@ pub type Config {
     max_concurrent_requests: Option(Int),
     /// Milliseconds the handlers get to finish on shutdown.
     graceful_shutdown_timeout: Option(Int),
+    /// Checks request messages before handlers see them: see
+    /// `trevrpc/validator`.
+    validator: Option(Validator),
   )
 }
 
@@ -121,6 +125,7 @@ pub fn config(
     max_streams_per_connection: None,
     max_concurrent_requests: None,
     graceful_shutdown_timeout: None,
+    validator: None,
   )
 }
 

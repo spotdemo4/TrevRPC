@@ -17,6 +17,14 @@
 %% one. A response the codec cannot decode ends the call with an `internal'
 %% status.
 %%
+%% A channel with a `validator' checks the requests of calls that name their
+%% `request_type', as generated code's do, before they are sent (see
+%% {@link trevrpc_validator}): a unary or server-streaming call whose
+%% request breaks its rules fails with the validator's status, normally
+%% `invalid_argument' with a `buf.validate.Violations' detail, without
+%% reaching the server, and {@link send/2} returns `{invalid, Status}' for
+%% a streamed one, which is not sent, while the call goes on.
+%%
 %% A call is read and written by the process that started it, which owns
 %% its stream; if that process exits first, the channel cancels the call. A
 %% call is finished once {@link recv/1} returns `{eof, Trailers}' or
@@ -84,7 +92,10 @@
     kind :: trevrpc_wire:kind(),
     deadline :: trevrpc_stream:deadline(),
     owner :: pid(),
-    codec :: trevrpc_codec:codec() | undefined
+    codec :: trevrpc_codec:codec() | undefined,
+    %% What checks the requests the call sends, if anything: the channel's
+    %% validator's check of the call's request type.
+    check :: fun((term(), binary()) -> ok | {error, trevrpc_status:status()}) | undefined
 }).
 
 -opaque call() :: #client_call{}.
@@ -199,9 +210,11 @@ start(Channel, Method, Kind, Opts, Request) ->
         ok ?= check_deadline(Deadline),
         ok ?= check_metadata(Metadata),
         ok ?= check_codec(Codec),
-        %% Encoded before the stream opens, which a request the codec
-        %% cannot encode never does.
-        {ok, First} ?= first(Codec, Request),
+        %% Encoded and checked before the stream opens, which a request the
+        %% codec cannot encode or the channel's validator rejects never
+        %% does.
+        {ok, Check} ?= request_check(Channel, Method, Opts),
+        {ok, First} ?= first(Codec, Check, Request),
         ok ?= check_unreliable(maps:get(unreliable, Opts, #{})),
         Unreliable = trevrpc_datagram:effective(maps:get(unreliable, Opts, #{}), Kind),
         {ok, Info} ?=
@@ -218,7 +231,8 @@ start(Channel, Method, Kind, Opts, Request) ->
             kind = Kind,
             deadline = Deadline,
             owner = self(),
-            codec = Codec
+            codec = Codec,
+            check = Check
         },
         {Requests, Responses} =
             Modes = trevrpc_datagram:compression(
@@ -419,12 +433,38 @@ check_metadata(Metadata) ->
         {error, Message} -> {error, trevrpc_status:new(invalid_argument, Message)}
     end.
 
-first(_Codec, none) ->
+%% The channel's check of the call's requests; a type the validator cannot
+%% check fails the call, whatever its kind, before its stream opens.
+request_check(Channel, Method, Opts) ->
+    case
+        trevrpc_validator:request_check(Channel, Method, maps:get(request_type, Opts, undefined))
+    of
+        {error, Status} -> {error, Status};
+        Check -> {ok, Check}
+    end.
+
+first(_Codec, _Check, none) ->
     {ok, none};
-first(Codec, {message, Request}) ->
+first(Codec, Check, {message, Request}) ->
     case trevrpc_codec:encode(Codec, Request) of
-        {ok, Message} -> {ok, {message, Message}};
-        error -> {error, encode_status()}
+        {ok, Message} ->
+            case checked(Check, Request, Message) of
+                {ok, Checked} -> {ok, {message, Checked}};
+                {error, Status} -> {error, Status}
+            end;
+        error ->
+            {error, encode_status()}
+    end.
+
+%% A request the call's check passes, as its encoding; a check sees the
+%% encoding as a binary.
+checked(undefined, _Request, Message) ->
+    {ok, Message};
+checked(Check, Request, Message) ->
+    Encoded = iolist_to_binary(Message),
+    case Check(Request, Encoded) of
+        ok -> {ok, Encoded};
+        {error, Status} -> {error, Status}
     end.
 
 encode_status() ->
@@ -446,8 +486,11 @@ timeout_nanos(Deadline) ->
 %% means the call ended, with `Status' (which is OK when the server
 %% finished it successfully); its responses can still be read. A request
 %% the codec cannot encode abandons the call with an `internal' status.
--spec send(call(), term()) -> ok | {error, trevrpc_status:status()}.
-send(#client_call{kind = Kind, codec = Codec} = Call, Request) when
+%% `{invalid, Status}' means the channel's validator rejected the request
+%% (see {@link trevrpc_validator}): it was not sent, and the call goes on.
+-spec send(call(), term()) ->
+    ok | {invalid, trevrpc_status:status()} | {error, trevrpc_status:status()}.
+send(#client_call{kind = Kind, codec = Codec, check = Check} = Call, Request) when
     Kind =:= client_streaming; Kind =:= bidirectional_streaming
 ->
     case state(Call) of
@@ -455,8 +498,13 @@ send(#client_call{kind = Kind, codec = Codec} = Call, Request) when
             erlang:error(send_closed);
         #cstate{terminal = undefined} = State ->
             case trevrpc_codec:encode(Codec, Request) of
-                {ok, Message} -> send_message(Call, State, Message);
-                error -> {error, abort(Call, State, encode_status())}
+                {ok, Message} ->
+                    case checked(Check, Request, Message) of
+                        {ok, Checked} -> send_message(Call, State, Checked);
+                        {error, Status} -> {invalid, Status}
+                    end;
+                error ->
+                    {error, abort(Call, State, encode_status())}
             end;
         #cstate{terminal = Terminal} ->
             {error, terminal_status(Terminal)}

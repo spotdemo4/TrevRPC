@@ -208,6 +208,21 @@ format_test() ->
         })
     ).
 
+%% A number its field's type cannot hold is refused, not cut down.
+out_of_range_test() ->
+    Encode = fun(Element) ->
+        iolist_to_binary(trevrpc_violations:encode([#{field => #{elements => [Element]}}]))
+    end,
+    ?assertError({out_of_range, index, -1}, Encode(#{subscript => {index, -1}})),
+    ?assertError(
+        {out_of_range, uint_key, 1 bsl 64}, Encode(#{subscript => {uint_key, 1 bsl 64}})
+    ),
+    ?assertError({out_of_range, int_key, 1 bsl 63}, Encode(#{subscript => {int_key, 1 bsl 63}})),
+    ?assertError({out_of_range, field_number, 1 bsl 31}, Encode(#{field_number => 1 bsl 31})),
+    ?assertError({out_of_range, field_type, 1 bsl 31}, Encode(#{field_type => 1 bsl 31})),
+    ?assertMatch(<<_/binary>>, Encode(#{subscript => {int_key, -(1 bsl 63)}})),
+    ?assertMatch(<<_/binary>>, Encode(#{field_number => -(1 bsl 31)})).
+
 from_status_test() ->
     ?assertEqual(error, trevrpc_violations:from_status(trevrpc_status:new(invalid_argument, <<>>))),
     ?assertEqual(
@@ -451,3 +466,269 @@ start_test_() ->
                 )
             ]
         end}.
+
+%%% A channel's validator
+
+-define(UNBOUND_TYPE, <<"test.UnboundRequest">>).
+
+%% The server checks nothing, so what fails was refused by the client: a
+%% request the server sees comes back echoed.
+client_setup() ->
+    {ok, _} = application:ensure_all_started(quic),
+    logger:set_primary_config(level, none),
+    Credentials = trevrpc_test_tls:credentials(),
+    {ok, Server} = trevrpc_server:start(maps:remove(validator, server_opts(Credentials))),
+    {ok, Port} = trevrpc_server:port(Server),
+    {ok, Channel} = client_channel(Port, Credentials, fun client_validator/1),
+    #{server => Server, channel => Channel}.
+
+%% A client checks the message it was given, before the codec encodes it.
+client_validator(?UNBOUND_TYPE) ->
+    erlang:error(nope);
+client_validator(?VALIDATED) ->
+    {ok, fun(Request, Encoded) -> validate({request, Request}, Encoded) end};
+client_validator(Type) ->
+    validator(Type).
+
+client_channel(Port, Credentials, Validator) ->
+    maybe
+        {ok, Channel} ?=
+            trevrpc_channel:start(#{
+                host => {127, 0, 0, 1},
+                port => Port,
+                transport => quic,
+                server_name => "localhost",
+                cacerts => maps:get(cacerts, Credentials),
+                validator => Validator
+            }),
+        ok ?= trevrpc_channel:wait_until_ready(Channel, 30000),
+        {ok, Channel}
+    end.
+
+client_test_() ->
+    {setup, fun client_setup/0, fun cleanup/1, fun(Env) ->
+        [
+            {Name, {timeout, 30, fun() -> Test(Env) end}}
+         || {Name, Test} <- [
+                {"valid request", fun client_valid_test/1},
+                {"invalid request", fun client_invalid_test/1},
+                {"streamed request", fun client_streamed_test/1},
+                {"type without rules", fun client_unchecked_test/1},
+                {"call without a request type", fun client_untyped_test/1},
+                {"type the validator cannot bind", fun client_unbound_test/1},
+                {"streaming call of a type the validator cannot bind",
+                    fun client_unbound_stream_test/1},
+                {"check that crashes", fun client_crash_test/1}
+            ]
+        ]
+    end}.
+
+typed_opts(Type) ->
+    #{timeout => 5000, request_type => Type, codec => codec()}.
+
+typed_unary(Channel, Method, Type, Request) ->
+    case trevrpc_client:unary(Channel, Method, Request, typed_opts(Type)) of
+        {ok, {request, Response}, _} -> {ok, Response};
+        {error, Status} -> {error, Status}
+    end.
+
+client_valid_test(#{channel := Channel}) ->
+    ?assertEqual({ok, <<"hello">>}, typed_unary(Channel, ?UNARY, ?VALIDATED, <<"hello">>)).
+
+client_invalid_test(#{channel := Channel}) ->
+    {error, Status} = typed_unary(Channel, ?UNARY, ?VALIDATED, <<>>),
+    ?assertEqual(invalid_argument, trevrpc_status:code(Status)),
+    ?assertEqual({ok, [known_violation()]}, trevrpc_violations:from_status(Status)).
+
+%% A rejected request is not sent, and the call goes on.
+client_streamed_test(#{channel := Channel}) ->
+    {ok, Call} = trevrpc_client:client_stream(Channel, ?CLIENT_STREAM, typed_opts(?VALIDATED)),
+    ok = trevrpc_client:send(Call, <<"a">>),
+    {invalid, Status} = trevrpc_client:send(Call, <<"forbidden">>),
+    ?assertMatch(
+        {ok, [#{rule_id := <<"message.not_forbidden">>}]}, trevrpc_violations:from_status(Status)
+    ),
+    ok = trevrpc_client:send(Call, <<"b">>),
+    ?assertEqual({ok, {request, <<"ab">>}}, trevrpc_client:close_and_recv(Call)).
+
+client_unchecked_test(#{channel := Channel}) ->
+    ?assertEqual({ok, <<>>}, typed_unary(Channel, ?UNCHECKED, ?PLAIN, <<>>)).
+
+client_untyped_test(#{channel := Channel}) ->
+    ?assertMatch(
+        {ok, {request, <<>>}, _},
+        trevrpc_client:unary(Channel, ?UNARY, <<>>, #{timeout => 5000, codec => codec()})
+    ).
+
+%% A type whose rules cannot be enforced is never sent.
+client_unbound_test(#{channel := Channel}) ->
+    ?assertEqual(
+        {error, #{code => internal, message => <<"cannot validate test.UnboundRequest">>}},
+        typed_unary(Channel, ?UNARY, ?UNBOUND_TYPE, <<"hello">>)
+    ).
+
+client_crash_test(#{channel := Channel}) ->
+    ?assertEqual(
+        {error, #{code => internal, message => <<"request validation failed">>}},
+        typed_unary(Channel, ?UNARY, ?CRASHING, <<"hello">>)
+    ).
+
+%% A streaming call of such a type fails as it starts, before it opens a
+%% stream, rather than refusing each request it sends.
+client_unbound_stream_test(#{channel := Channel}) ->
+    ?assertEqual(
+        {error, #{code => internal, message => <<"cannot validate test.UnboundRequest">>}},
+        trevrpc_client:client_stream(Channel, ?CLIENT_STREAM, typed_opts(?UNBOUND_TYPE))
+    ).
+
+%% The validator is asked about each request type once, when the first call
+%% of the type starts, whatever its kind; calls that start first at once may
+%% each ask, but every call uses the one answer kept.
+client_bind_test_() ->
+    {timeout, 60, fun client_bind/0}.
+
+-define(RACED_TYPE, <<"test.RacedRequest">>).
+-define(RACERS, 20).
+-define(CLOSING_TYPE, <<"test.ClosingRequest">>).
+
+wait_for(Ready, Timeout) when Timeout > 0 ->
+    case Ready() of
+        true ->
+            ok;
+        false ->
+            timer:sleep(1),
+            wait_for(Ready, Timeout - 1)
+    end;
+wait_for(_Ready, _Timeout) ->
+    timeout.
+
+%% A channel that closes while its validator answers takes the answers'
+%% table with it: the call that asked fails as a call on a closed channel
+%% does, rather than crash storing the answer.
+client_close_while_binding_test_() ->
+    {timeout, 60, fun client_close_while_binding/0}.
+
+client_close_while_binding() ->
+    {ok, _} = application:ensure_all_started(quic),
+    logger:set_primary_config(level, none),
+    Credentials = trevrpc_test_tls:credentials(),
+    {ok, Server} = trevrpc_server:start(maps:remove(validator, server_opts(Credentials))),
+    {ok, Port} = trevrpc_server:port(Server),
+    Self = self(),
+    Validator = fun(?CLOSING_TYPE) ->
+        Self ! {binding, self()},
+        receive
+            answer -> {ok, fun validate/2}
+        after 10000 -> none
+        end
+    end,
+    {ok, Channel} = client_channel(Port, Credentials, Validator),
+    try
+        {Caller, Monitor} = spawn_monitor(fun() ->
+            exit({result, typed_unary(Channel, ?UNARY, ?CLOSING_TYPE, <<"x">>)})
+        end),
+        receive
+            {binding, Caller} -> ok
+        after 10000 -> error(not_binding)
+        end,
+        %% close/1 returns before the channel's process, which owns the
+        %% table, exits: the validator answers once the table is gone.
+        ChannelMonitor = monitor(process, Channel),
+        trevrpc_channel:close(Channel),
+        receive
+            {'DOWN', ChannelMonitor, process, Channel, _} -> ok
+        after 10000 -> error(channel_alive)
+        end,
+        Caller ! answer,
+        receive
+            {'DOWN', Monitor, process, Caller, Reason} ->
+                ?assertEqual(
+                    {result, {error, #{code => unavailable, message => <<"channel is closed">>}}},
+                    Reason
+                )
+        after 10000 -> error(caller_timeout)
+        end
+    after
+        trevrpc_server:stop(Server),
+        logger:set_primary_config(level, notice)
+    end.
+
+client_bind() ->
+    {ok, _} = application:ensure_all_started(quic),
+    logger:set_primary_config(level, none),
+    Credentials = trevrpc_test_tls:credentials(),
+    {ok, Server} = trevrpc_server:start(maps:remove(validator, server_opts(Credentials))),
+    {ok, Port} = trevrpc_server:port(Server),
+    Self = self(),
+    %% Each answer for the raced type refuses requests with a status of its
+    %% own, and none comes before every racer is asking, so that they all
+    %% missed the table and all but one lose the insert.
+    Racing = atomics:new(1, []),
+    Validator = fun
+        (?RACED_TYPE) ->
+            Self ! {bound, ?RACED_TYPE},
+            atomics:add(Racing, 1, 1),
+            ok = wait_for(fun() -> atomics:get(Racing, 1) >= ?RACERS end, 10000),
+            Answer = integer_to_binary(erlang:unique_integer([positive])),
+            {ok, fun(_Request, _Encoded) ->
+                {error, trevrpc_status:new(invalid_argument, Answer)}
+            end};
+        (Type) ->
+            Self ! {bound, Type},
+            validator(Type)
+    end,
+    {ok, Channel} = client_channel(Port, Credentials, Validator),
+    try
+        %% A streaming call binds its type as it starts, sending nothing.
+        {ok, Call} = trevrpc_client:client_stream(
+            Channel, ?CLIENT_STREAM, typed_opts(?OK_STATUS_TYPE)
+        ),
+        trevrpc_client:cancel(Call),
+        _ = [typed_unary(Channel, ?UNARY, ?OK_STATUS_TYPE, <<"x">>) || _ <- [1, 2, 3]],
+        ?assertEqual([?OK_STATUS_TYPE], collect_bound([])),
+        Racers = [
+            spawn_monitor(fun() ->
+                exit({result, typed_unary(Channel, ?UNARY, ?RACED_TYPE, <<"x">>)})
+            end)
+         || _ <- lists:seq(1, ?RACERS)
+        ],
+        Results = [
+            receive
+                {'DOWN', Monitor, process, Pid, {result, Result}} -> Result
+            after 10000 -> error(racer_timeout)
+            end
+         || {Pid, Monitor} <- Racers
+        ],
+        ?assertEqual(lists:duplicate(?RACERS, ?RACED_TYPE), collect_bound([])),
+        [{error, #{code := invalid_argument, message := Kept}} | _] = Results,
+        ?assertEqual([{error, #{code => invalid_argument, message => Kept}}], lists:usort(Results)),
+        ?assertEqual(
+            {error, #{code => invalid_argument, message => Kept}},
+            typed_unary(Channel, ?UNARY, ?RACED_TYPE, <<"x">>)
+        ),
+        ?assertEqual([], collect_bound([]))
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server),
+        logger:set_primary_config(level, notice)
+    end.
+
+%% The validator is installed while the channel runs, and gone once it
+%% closes; an invalid one fails the start.
+client_lifecycle_test() ->
+    {ok, _} = application:ensure_all_started(quic),
+    %% The test CA, as the build sandbox has no system trust store.
+    Opts = #{
+        host => {127, 0, 0, 1},
+        port => 1,
+        transport => quic,
+        cacerts => maps:get(cacerts, trevrpc_test_tls:credentials())
+    },
+    ?assertEqual(
+        {error, {invalid_option, validator}},
+        trevrpc_channel:start(Opts#{validator => fun(_, _) -> none end})
+    ),
+    {ok, Channel} = trevrpc_channel:start(Opts#{validator => fun validator/1}),
+    ?assertNotEqual(undefined, persistent_term:get({trevrpc_validator, Channel}, undefined)),
+    trevrpc_channel:close(Channel),
+    ?assertEqual(undefined, persistent_term:get({trevrpc_validator, Channel}, undefined)).
