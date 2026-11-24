@@ -56,7 +56,9 @@ fallback_test_() ->
                 {"shutdown lets requests finish, refuses new ones, then cuts off",
                     fun shutdown_test/1, [h3, h2]},
                 {"shutdown closes an HTTP/1.1 connection after its request", fun shutdown_h1_test/1,
-                    [h1]}
+                    [h1]},
+                {"a client that stops reading is dropped after the TCP user timeout",
+                    fun stalled_reader_test/1, [h1]}
             ],
             Version <- Versions
         ] ++
@@ -175,6 +177,11 @@ fallback(Req) ->
                 lists:seq(1, 5)
             ),
             trevrpc_http_request:stream_body(Req, <<>>, fin);
+        <<"/flood">> ->
+            %% Streams until a write fails, and reports the failure.
+            Test ! {holding, self()},
+            ok = trevrpc_http_request:stream_reply(Req, 200, []),
+            flood(Req, Test);
         <<"/alt-svc">> ->
             trevrpc_http_request:reply(Req, 200, [{<<"Alt-Svc">>, <<"clear">>}], <<>>);
         Path ->
@@ -200,6 +207,12 @@ fallback(Req) ->
             trevrpc_http_request:reply(
                 Req, 200, [{<<"content-type">>, <<"text/plain">>}], Reply
             )
+    end.
+
+flood(Req, Test) ->
+    case trevrpc_http_request:stream_body(Req, binary:copy(<<"f">>, ?CHUNK), nofin) of
+        ok -> flood(Req, Test);
+        {error, Reason} -> Test ! {flood_failed, self(), Reason}
     end.
 
 read_all(Req, Size, Hash) ->
@@ -523,6 +536,51 @@ shutdown_h1_test(#{credentials := Credentials} = Env) ->
     after 5000 -> error(not_closed)
     end,
     trevrpc_server:stop(Server).
+
+%% erlang_h1's writes wait as long as the socket does: a client that stops
+%% reading holds the handler's write until the kernel drops the connection
+%% after `tcp_user_timeout' (TCP_USER_TIMEOUT, which only Linux has). The
+%% write then fails, unless the connection's process, seeing the socket
+%% close between two writes, kills the handler first.
+stalled_reader_test(#{credentials := Credentials}) ->
+    case os:type() of
+        {unix, linux} -> stalled_reader(Credentials);
+        _ -> ok
+    end.
+
+stalled_reader(Credentials) ->
+    Server = start_server(Credentials, #{tcp_user_timeout => 500}),
+    {ok, Socket} = ssl:connect(
+        {127, 0, 0, 1},
+        tcp_port(Server),
+        [
+            binary,
+            {active, false},
+            {recbuf, 4096},
+            {verify, verify_none},
+            {alpn_advertised_protocols, [<<"http/1.1">>]}
+        ],
+        5000
+    ),
+    try
+        ok = ssl:send(Socket, <<"GET /flood HTTP/1.1\r\nhost: x\r\n\r\n">>),
+        Handler = holding(),
+        Monitor = monitor(process, Handler),
+        Start = erlang:monotonic_time(millisecond),
+        %% Under 5 s, so that a call timeout of that length would fail the
+        %% test: the drop takes about 0.9 s. A call that timed out would
+        %% fail the write with `{error, closed}' too (trevrpc_transport's
+        %% ?SAFE), so the reason cannot tell them apart.
+        receive
+            {flood_failed, Handler, _} -> ok;
+            {'DOWN', Monitor, process, Handler, killed} -> ok
+        after 4000 -> error(not_dropped)
+        end,
+        ?assert(erlang:monotonic_time(millisecond) - Start >= 500)
+    after
+        _ = ssl:close(Socket),
+        trevrpc_server:stop(Server)
+    end.
 
 disabled_test(#{credentials := #{cert := Cert, key := Key}}) ->
     {ok, Server} = trevrpc_server:start(#{

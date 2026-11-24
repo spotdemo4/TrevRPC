@@ -67,9 +67,7 @@
 
 -define(H3_NO_ERROR, 16#100).
 -define(H3_REQUEST_CANCELLED, 16#10c).
-%% erlang_h1 writes are calls with gen_statem's default 5 s timeout, which
-%% a slow client could run out on one large write: each takes at most this
-%% many bytes.
+%% The most bytes an erlang_h1 write takes (see h1_send/4).
 -define(H1_CHUNK, 65536).
 
 -spec pid(t()) -> pid().
@@ -186,9 +184,11 @@ send_data_async({wt, Session, _Quic, _Prefix}, Id, Data, Fin) ->
     %% The session queues what its send queue does not take yet.
     trevrpc_webtransport:send_async(Session, Id, Data, Fin).
 
-%% An HTTP/1.1 write in parts of at most ?H1_CHUNK bytes, so that each of
-%% erlang_h1's calls has its 5 s for one part only: only a client that
-%% takes less than that in 5 s fails the write.
+%% An HTTP/1.1 write in parts of at most ?H1_CHUNK bytes. erlang_h1's calls
+%% have no timeout: each waits as long as the socket does, and a client that
+%% stops reading holds it until the kernel drops the connection after the
+%% listener's TCP_USER_TIMEOUT. The parts let the connection's process take
+%% its other calls between them rather than after the whole body.
 h1_send(Conn, Id, <<Part:?H1_CHUNK/binary, Rest/binary>>, Fin) when Rest =/= <<>> ->
     case ?SAFE(h1_connection:send_data(Conn, Id, Part, false)) of
         ok -> h1_send(Conn, Id, Rest, Fin);
