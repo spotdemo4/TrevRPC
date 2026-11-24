@@ -76,7 +76,7 @@ event(Session) ->
 %% add nothing to it, and once it runs again exactly one Pong, to the
 %% latest Ping, reaches the peer with the data.
 ping_flood(Credentials) ->
-    {Session, Socket} = pair(Credentials, maps:put(initial_max_streams_bidi, 3, ?PARAMETERS), #{}),
+    {Session, Socket} = pair(Credentials, maps:put(initial_max_streams_bidi, 2, ?PARAMETERS), #{}),
     Large = 1 bsl 30,
     Parameters = qmux_frame:transport_parameters(
         maps:merge(?PARAMETERS, #{
@@ -96,18 +96,16 @@ ping_flood(Credentials) ->
     ok = qmux:send_data_async(
         Session, get({send_queue, Session}), 0, binary:copy(<<"d">>, Size), false
     ),
-    %% A stream the peer opens is a marker: its event follows every Ping
-    %% sent before it.
-    Marker = fun(Id) ->
-        ok = ssl:send(Socket, ws_record([qmux_frame:stream(Id, 0, [<<"m">>], false)])),
-        ?assertEqual({stream_opened, Id}, event(Session)),
-        ?assertMatch({stream_data, Id, <<"m">>, false}, event(Session))
-    end,
-    Marker(4),
+    flushed(Session),
     {message_queue_len, Filled} = process_info(Writer, message_queue_len),
+    ?assert(Filled > 0),
     Ping = ws_frame:encode({ping, binary:copy(<<"p">>, 125)}, client),
     _ = [ok = ssl:send(Socket, Ping) || _ <- lists:seq(1, 1000)],
-    Marker(8),
+    %% A stream the peer opens is a marker: its event follows every Ping
+    %% sent before it.
+    ok = ssl:send(Socket, ws_record([qmux_frame:stream(4, 0, [<<"m">>], false)])),
+    ?assertEqual({stream_opened, 4}, event(Session)),
+    ?assertMatch({stream_data, 4, <<"m">>, false}, event(Session)),
     ?assertEqual({message_queue_len, Filled}, process_info(Writer, message_queue_len)),
     erlang:resume_process(Writer),
     ?assertEqual(1, ws_pongs(Socket, Size)),
@@ -121,6 +119,16 @@ writer(Session) ->
     {monitors, Monitors} = process_info(Session, monitors),
     [Writer] = [Pid || {process, Pid} <- Monitors, Pid =/= self()],
     Writer.
+
+%% Waits until the session handled what this process wrote to it before:
+%% a write queues a flush the session sends itself as it takes the write,
+%% so the flush is in its mailbox once a first call returns, and a second
+%% call follows it. The peer's records order nothing here, as they can
+%% reach the session before that flush.
+flushed(Session) ->
+    {ok, _} = qmux:peername(Session),
+    {ok, _} = qmux:peername(Session),
+    ok.
 
 ws_record(Frames) ->
     ws_frame:encode({binary, iolist_to_binary(Frames)}, client).
