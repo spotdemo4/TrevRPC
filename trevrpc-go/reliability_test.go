@@ -53,8 +53,6 @@ func TestConnectionStreamSlotIsFreeWhenClientSeesTheStatus(t *testing.T) {
 		}
 		for shape, call := range calls {
 			t.Run(transport.name+"/"+shape, func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
-				defer cancel()
 				// Several connections keep the server busy, which widens the
 				// window between the last write of a call and its cleanup.
 				var transports []Transport
@@ -77,7 +75,16 @@ func TestConnectionStreamSlotIsFreeWhenClientSeesTheStatus(t *testing.T) {
 					for range limit {
 						workers.Go(func() {
 							for range callsPerWorker {
+								// Each call has its own deadline. One deadline
+								// for the whole subtest could expire on a
+								// starved machine and fail the remaining
+								// calls, a failure this test is not about.
+								// A worker stops at its first call that runs
+								// out of time, so calls that hang fail the
+								// subtest after one deadline, not 300.
+								ctx, cancel := context.WithTimeout(t.Context(), rpcTestTimeout)
 								err := call(ctx, transport)
+								cancel()
 								if err == nil {
 									continue
 								}
@@ -90,6 +97,9 @@ func TestConnectionStreamSlotIsFreeWhenClientSeesTheStatus(t *testing.T) {
 								}
 								tally.count++
 								mu.Unlock()
+								if code == CodeDeadlineExceeded {
+									return
+								}
 							}
 						})
 					}
