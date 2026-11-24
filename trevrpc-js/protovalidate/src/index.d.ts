@@ -14,6 +14,9 @@ import type { RequestValidator } from "@trevrpc/trevrpc-js";
  * are not checked and cost nothing.
  *
  * `createClient` compiles the rules of each request type that has some, and throws a TrevRpcError
- * with `Code.Internal` when they cannot compile.
+ * with `Code.Internal` when they cannot compile. A rule that only fails to evaluate for some
+ * values, such as a division by a field that is 0 by default, fails only the requests it cannot
+ * evaluate, with `Code.Internal`; protovalidate-es reports a rule that names a field the message
+ * lacks that way too.
  */
 export function createRequestValidator(validator?: Validator): RequestValidator;

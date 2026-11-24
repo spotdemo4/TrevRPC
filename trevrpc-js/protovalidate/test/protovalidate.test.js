@@ -13,10 +13,12 @@ import {
   BrokenRequestSchema,
   ChoiceRequestSchema,
   CreateUserRequestSchema,
+  DivisorRequestSchema,
   FragileRequestSchema,
   LookupRequestSchema,
   NestedRequestSchema,
   RangeRequestSchema,
+  SyntaxErrorRequestSchema,
   TreeSchema,
   UserSchema,
   Users,
@@ -140,13 +142,26 @@ test("rules held in nested messages, message rules and oneof rules are enforced"
 
 test("rules that cannot compile fail createClient", () => {
   assert.throws(
-    () => createRequestValidator().validateFunc(BrokenRequestSchema),
+    () => createRequestValidator().validateFunc(SyntaxErrorRequestSchema),
     (error) =>
       error instanceof TrevRpcError &&
       error.code === Code.Internal &&
-      error.statusMessage.startsWith("cannot validate protovalidate.v1.BrokenRequest: ") &&
+      error.statusMessage.startsWith("cannot validate protovalidate.v1.SyntaxErrorRequest: ") &&
       error.cause !== undefined,
   );
+});
+
+test("rules that name a missing field fail every request with Internal", () => {
+  const check = createRequestValidator().validateFunc(BrokenRequestSchema);
+  for (const name of ["", "x"]) {
+    assert.throws(
+      () => check(create(BrokenRequestSchema, { name })),
+      (error) =>
+        error instanceof TrevRpcError &&
+        error.code === Code.Internal &&
+        error.statusMessage.startsWith("request validation failed: "),
+    );
+  }
 });
 
 test("rules that cannot be evaluated fail the request with Internal", () => {
@@ -164,6 +179,23 @@ test("rules that cannot be evaluated fail the request with Internal", () => {
   assert.throws(
     () => validate({ number: "-1" }),
     (error) => assertViolations(error, ["number"]),
+  );
+});
+
+test("rules that cannot be evaluated for the empty message do not fail createClient", () => {
+  const check = createRequestValidator().validateFunc(DivisorRequestSchema);
+  assert.ok(check !== undefined);
+  check(create(DivisorRequestSchema, { count: 5 }));
+  assert.throws(
+    () => check(create(DivisorRequestSchema, { count: 200 })),
+    (error) => assertViolations(error, ["count"]),
+  );
+  assert.throws(
+    () => check(create(DivisorRequestSchema)),
+    (error) =>
+      error instanceof TrevRpcError &&
+      error.code === Code.Internal &&
+      error.statusMessage.startsWith("request validation failed: "),
   );
 });
 

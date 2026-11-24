@@ -34,7 +34,7 @@ try {
 
 - A request message that breaks its rules is not sent, and fails with `InvalidArgument` and a `buf.validate.Violations` status detail, as the Go and Rust servers report it, so one error handler serves both. The message names the first violation and counts the rest. The request of a unary or server-streaming call fails the call, after its interceptors ran; a message passed to `send()` of a client-streaming or bidirectional call rejects that send, and the call goes on.
 - A rule that cannot be evaluated for a message fails it with `Internal`.
-- `createClient` compiles the rules of each method's request type, and throws a `TrevRpcError` with `Code.Internal` when one cannot compile.
+- `createClient` compiles the rules of each method's request type, and throws a `TrevRpcError` with `Code.Internal` when one cannot compile. A rule that only fails to evaluate for some values, such as a division by a field that is 0 by default, fails only the requests it cannot evaluate. protovalidate-es reports a rule that names a field the message lacks that way too, so such a rule fails every request of its type with `Internal`.
 - Methods whose request type has no rules, directly or in a message it holds, are not checked and cost nothing.
 - `createRequestValidator(validator?)` takes a protovalidate validator, by default one from `createValidator()`. Pass `createValidator({ registry })`, with a registry that holds their extensions, to enforce predefined rules, or `createValidator({ failFast: true })` to stop at the first violation.
 

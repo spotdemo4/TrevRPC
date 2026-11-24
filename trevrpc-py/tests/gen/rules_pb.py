@@ -310,7 +310,8 @@ _BrokenRequestFields: TypeAlias = Literal["name"]
 
 class BrokenRequest(Message[_BrokenRequestFields]):
     """
-    A rule that cannot compile.
+    A rule that names a field the message lacks, which protovalidate reports only when it evaluates
+    the rule.
 
     ```proto
     message test.rules.BrokenRequest
@@ -366,6 +367,36 @@ class SyntaxErrorRequest(Message[_SyntaxErrorRequestFields]):
 
         name: str
 
+_DivisorRequestFields: TypeAlias = Literal["count"]
+
+class DivisorRequest(Message[_DivisorRequestFields]):
+    """
+    A rule that cannot be evaluated for the empty message's default values: division by zero.
+
+    ```proto
+    message test.rules.DivisorRequest
+    ```
+
+    Attributes:
+        count:
+            ```proto
+            int32 count = 1;
+            ```
+    """
+
+    __slots__ = ("count",)
+
+    if TYPE_CHECKING:
+
+        def __init__(
+            self,
+            *,
+            count: int = 0,
+        ) -> None:
+            pass
+
+        count: int
+
 _FragileRequestFields: TypeAlias = Literal["number"]
 
 class FragileRequest(Message[_FragileRequestFields]):
@@ -398,7 +429,7 @@ class FragileRequest(Message[_FragileRequestFields]):
 
 
 _DESC = file_desc(
-    b'\n\x0brules.proto\x12\ntest.rules\x1a\x1bbuf/validate/validate.proto"O\n\x11CreateUserRequest\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12\x1d\n\x05email\x18\x02 \x01(\tR\x05emailB\x07\xbaH\x04r\x02`\x01"\x1a\n\x04User\x12\x12\n\x04name\x18\x01 \x01(\tR\x04name"E\n\rLookupRequest\x12\x0e\n\x02id\x18\x01 \x01(\tR\x02id\x12$\n\x04tree\x18\x02 \x01(\x0b2\x10.test.rules.TreeR\x04tree"\xb3\x01\n\x04Tree\x12,\n\x08children\x18\x01 \x03(\x0b2\x10.test.rules.TreeR\x08children\x121\n\x05named\x18\x02 \x03(\x0b2\x1b.test.rules.Tree.NamedEntryR\x05named\x1aJ\n\nNamedEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12&\n\x05value\x18\x02 \x01(\x0b2\x10.test.rules.TreeR\x05value:\x028\x01"\xa2\x01\n\x0cBatchRequest\x129\n\x05users\x18\x01 \x03(\x0b2#.test.rules.BatchRequest.UsersEntryR\x05users\x1aW\n\nUsersEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x123\n\x05value\x18\x02 \x01(\x0b2\x1d.test.rules.CreateUserRequestR\x05value:\x028\x01"8\n\rNestedRequest\x12\'\n\x05batch\x18\x01 \x01(\x0b2\x11.test.rules.BatchR\x05batch"<\n\x05Batch\x123\n\x05users\x18\x01 \x03(\x0b2\x1d.test.rules.CreateUserRequestR\x05users"y\n\x0cRangeRequest\x12\x14\n\x05start\x18\x01 \x01(\x05R\x05start\x12\x10\n\x03end\x18\x02 \x01(\x05R\x03end:A\xbaH>\x1a<\n\x05range\x12\x1bstart must not be after end\x1a\x16this.start <= this.end">\n\rChoiceRequest\x12\x0e\n\x01a\x18\x01 \x01(\tH\x00R\x01a\x12\x0e\n\x01b\x18\x02 \x01(\tH\x00R\x01bB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"E\n\rBrokenRequest\x12\x12\n\x04name\x18\x01 \x01(\tR\x04name: \xbaH\x1d\x1a\x1b\n\x06broken\x1a\x11this.missing == 1"@\n\x12SyntaxErrorRequest\x12*\n\x04name\x18\x01 \x01(\tR\x04nameB\x16\xbaH\x13\xba\x01\x10\n\x06syntax\x1a\x06this +"g\n\x0eFragileRequest\x12U\n\x06number\x18\x01 \x01(\tR\x06numberB=\xbaH:\xba\x017\n\x06number\x12\x10must be positive\x1a\x1bthis == \'\' || int(this) > 0b\x06proto3',
+    b'\n\x0brules.proto\x12\ntest.rules\x1a\x1bbuf/validate/validate.proto"O\n\x11CreateUserRequest\x12\x1b\n\x04name\x18\x01 \x01(\tR\x04nameB\x07\xbaH\x04r\x02\x10\x01\x12\x1d\n\x05email\x18\x02 \x01(\tR\x05emailB\x07\xbaH\x04r\x02`\x01"\x1a\n\x04User\x12\x12\n\x04name\x18\x01 \x01(\tR\x04name"E\n\rLookupRequest\x12\x0e\n\x02id\x18\x01 \x01(\tR\x02id\x12$\n\x04tree\x18\x02 \x01(\x0b2\x10.test.rules.TreeR\x04tree"\xb3\x01\n\x04Tree\x12,\n\x08children\x18\x01 \x03(\x0b2\x10.test.rules.TreeR\x08children\x121\n\x05named\x18\x02 \x03(\x0b2\x1b.test.rules.Tree.NamedEntryR\x05named\x1aJ\n\nNamedEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12&\n\x05value\x18\x02 \x01(\x0b2\x10.test.rules.TreeR\x05value:\x028\x01"\xa2\x01\n\x0cBatchRequest\x129\n\x05users\x18\x01 \x03(\x0b2#.test.rules.BatchRequest.UsersEntryR\x05users\x1aW\n\nUsersEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x123\n\x05value\x18\x02 \x01(\x0b2\x1d.test.rules.CreateUserRequestR\x05value:\x028\x01"8\n\rNestedRequest\x12\'\n\x05batch\x18\x01 \x01(\x0b2\x11.test.rules.BatchR\x05batch"<\n\x05Batch\x123\n\x05users\x18\x01 \x03(\x0b2\x1d.test.rules.CreateUserRequestR\x05users"y\n\x0cRangeRequest\x12\x14\n\x05start\x18\x01 \x01(\x05R\x05start\x12\x10\n\x03end\x18\x02 \x01(\x05R\x03end:A\xbaH>\x1a<\n\x05range\x12\x1bstart must not be after end\x1a\x16this.start <= this.end">\n\rChoiceRequest\x12\x0e\n\x01a\x18\x01 \x01(\tH\x00R\x01a\x12\x0e\n\x01b\x18\x02 \x01(\tH\x00R\x01bB\r\n\x04kind\x12\x05\xbaH\x02\x08\x01"E\n\rBrokenRequest\x12\x12\n\x04name\x18\x01 \x01(\tR\x04name: \xbaH\x1d\x1a\x1b\n\x06broken\x1a\x11this.missing == 1"@\n\x12SyntaxErrorRequest\x12*\n\x04name\x18\x01 \x01(\tR\x04nameB\x16\xbaH\x13\xba\x01\x10\n\x06syntax\x1a\x06this +"\\\n\x0eDivisorRequest\x12J\n\x05count\x18\x01 \x01(\x05R\x05countB4\xbaH1\xba\x01.\n\x07divides\x12\x13must be at most 100\x1a\x0e100 / this > 0"g\n\x0eFragileRequest\x12U\n\x06number\x18\x01 \x01(\tR\x06numberB=\xbaH:\xba\x017\n\x06number\x12\x10must be positive\x1a\x1bthis == \'\' || int(this) > 0b\x06proto3',
     [
         validate_pb.desc(),
     ],
@@ -414,6 +445,7 @@ _DESC = file_desc(
         "ChoiceRequest": ChoiceRequest,
         "BrokenRequest": BrokenRequest,
         "SyntaxErrorRequest": SyntaxErrorRequest,
+        "DivisorRequest": DivisorRequest,
         "FragileRequest": FragileRequest,
     },
 )

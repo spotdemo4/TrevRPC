@@ -1,5 +1,5 @@
 import { create, hasOption, toBinary } from "@bufbuild/protobuf";
-import { createValidator, violationsToProto } from "@bufbuild/protovalidate";
+import { RuntimeError, createValidator, violationsToProto } from "@bufbuild/protovalidate";
 import {
   ViolationsSchema,
   field as fieldRules,
@@ -19,10 +19,14 @@ export function createRequestValidator(validator = createValidator()) {
       if (!hasRules(schema, new Set())) {
         return undefined;
       }
-      // Compiles the rules now, through the validator's cache, so a rule that cannot compile fails
-      // createClient instead of the first call.
+      // Compiles the rules now, through the validator's cache, by checking an empty message, so a
+      // rule that cannot compile fails createClient instead of the first call. A rule that only
+      // fails to evaluate for the empty message's default values, such as a division by a field
+      // that is 0 by default, is left to each message's own check, which fails it with Internal.
+      // protovalidate-es reports a rule naming a missing field that way too, so it fails each
+      // request instead of createClient; #722 tracks surfacing it at startup.
       const compiled = validator.validate(schema, create(schema));
-      if (compiled.kind === "error") {
+      if (compiled.kind === "error" && !(compiled.error instanceof RuntimeError)) {
         throw new TrevRpcError(
           Code.Internal,
           `cannot validate ${schema.typeName}: ${compiled.error.message}`,

@@ -15,6 +15,12 @@ import (
 	"trev.zip/llc/trevrpc/trevrpc-go"
 )
 
+func messageRules(rules *validate.MessageRules) *descriptorpb.MessageOptions {
+	options := &descriptorpb.MessageOptions{}
+	proto.SetExtension(options, validate.E_Message, rules)
+	return options
+}
+
 func fieldRules(rules *validate.FieldRules) *descriptorpb.FieldOptions {
 	options := &descriptorpb.FieldOptions{}
 	proto.SetExtension(options, validate.E_Field, rules)
@@ -44,6 +50,8 @@ func repeatedField(name string, number int32, typ descriptorpb.FieldDescriptorPr
 //	message Holder { Inner inner = 1; }
 //	message Plain { string name = 1; Plain next = 2; }
 //	message BadRule { string name = 1 [cel "this +"]; }
+//	message Missing { option cel "this.missing == 1"; string name = 1; }
+//	message Divisor { int32 count = 1 [cel "100 / this > 0"]; }
 //	message Items { repeated string items = 1 [items min_len 1]; }
 func testFile(t *testing.T) protoreflect.FileDescriptor {
 	t.Helper()
@@ -65,6 +73,8 @@ func testFile(t *testing.T) protoreflect.FileDescriptor {
 			message("Holder", field("inner", 1, msg, ".test.Inner", nil)),
 			message("Plain", field("name", 1, str, "", nil), field("next", 2, msg, ".test.Plain", nil)),
 			message("BadRule", field("name", 1, str, "", fieldRules(validate.FieldRules_builder{Cel: []*validate.Rule{validate.Rule_builder{Id: new("bad"), Expression: new("this +")}.Build()}}.Build()))),
+			{Name: new("Missing"), Field: []*descriptorpb.FieldDescriptorProto{field("name", 1, str, "", nil)}, Options: messageRules(validate.MessageRules_builder{Cel: []*validate.Rule{validate.Rule_builder{Id: new("missing"), Expression: new("this.missing == 1")}.Build()}}.Build())},
+			message("Divisor", field("count", 1, i32, "", fieldRules(validate.FieldRules_builder{Cel: []*validate.Rule{validate.Rule_builder{Id: new("divides"), Message: new("must be at most 100"), Expression: new("100 / this > 0")}.Build()}}.Build()))),
 			message("Items", repeatedField("items", 1, str, fieldRules(validate.FieldRules_builder{Repeated: validate.RepeatedRules_builder{Items: validate.FieldRules_builder{String: validate.StringRules_builder{MinLen: proto.Uint64(1)}.Build()}.Build()}.Build()}.Build()))),
 		},
 	}
@@ -120,9 +130,38 @@ func TestBrokenRulesFailWithViolations(t *testing.T) {
 }
 
 func TestRulesThatCannotCompileFailToBind(t *testing.T) {
-	desc := testFile(t).Messages().ByName("BadRule")
-	if validate, err := New(nil).ValidateFunc(desc); err == nil || validate != nil {
-		t.Fatalf("ValidateFunc = %v, %v; want the compilation error", validate != nil, err)
+	for _, name := range []protoreflect.Name{"BadRule", "Missing"} {
+		desc := testFile(t).Messages().ByName(name)
+		if validate, err := New(nil).ValidateFunc(desc); err == nil || validate != nil {
+			t.Fatalf("ValidateFunc(%s) = %v, %v; want the compilation error", name, validate != nil, err)
+		}
+	}
+}
+
+// A rule that cannot be evaluated for the empty message's default values
+// binds, and fails only the messages it cannot evaluate.
+func TestRulesThatFailOnlyForSomeValuesBind(t *testing.T) {
+	desc := testFile(t).Messages().ByName("Divisor")
+	validateDivisor, err := New(nil).ValidateFunc(desc)
+	if err != nil || validateDivisor == nil {
+		t.Fatalf("ValidateFunc = %v, %v; want a function", validateDivisor != nil, err)
+	}
+	count := func(value int32) error {
+		message := dynamicpb.NewMessage(desc)
+		message.Set(desc.Fields().ByName("count"), protoreflect.ValueOfInt32(value))
+		return validateDivisor(message)
+	}
+	if err := count(5); err != nil {
+		t.Fatalf("valid message: %v", err)
+	}
+	if status := trevrpc.StatusFromError(count(200)); status.Code != trevrpc.CodeInvalidArgument {
+		t.Fatalf("broken rule: status = %v, want InvalidArgument", status)
+	}
+	if status := trevrpc.StatusFromError(count(0)); status.Code != trevrpc.CodeInternal {
+		t.Fatalf("rule that cannot be evaluated: status = %v, want Internal", status)
+	}
+	if err := Validate(dynamicpb.NewMessage(desc)); trevrpc.StatusFromError(err).Code != trevrpc.CodeInternal {
+		t.Fatalf("Validate(empty) = %v, want Internal", err)
 	}
 }
 

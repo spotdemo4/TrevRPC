@@ -61,21 +61,32 @@ type requestValidator struct {
 }
 
 // ValidateFunc returns nil for a type without rules. For the others it
-// compiles the rules now, through the validator's cache, so a rule that
-// cannot compile fails Listen instead of the first call.
+// compiles the rules now, through the validator's cache, by checking an empty
+// message, so a rule that cannot compile fails Listen instead of the first
+// call. A rule that only fails to evaluate for the empty message's default
+// values, such as a division by a field that is 0 by default, is left to each
+// message's own check, which fails a message it cannot evaluate with Internal.
 func (v requestValidator) ValidateFunc(desc protoreflect.MessageDescriptor) (func(proto.Message) error, error) {
 	if !hasRules(desc, map[protoreflect.FullName]bool{}) {
 		return nil, nil
 	}
-	if err := v.validator.Validate(dynamicpb.NewMessage(desc)); err != nil {
-		if _, ok := errors.AsType[*protovalidate.ValidationError](err); !ok {
-			return nil, err
-		}
+	if err := v.validator.Validate(dynamicpb.NewMessage(desc)); err != nil && !evaluated(err) {
+		return nil, err
 	}
 	validator := v.validator
 	return func(message proto.Message) error {
 		return statusFromError(validator.Validate(message))
 	}, nil
+}
+
+// evaluated reports whether err comes from rules that compiled: a broken
+// rule, or one that could not be evaluated for the message's values.
+func evaluated(err error) bool {
+	if _, ok := errors.AsType[*protovalidate.ValidationError](err); ok {
+		return true
+	}
+	_, ok := errors.AsType[*protovalidate.RuntimeError](err)
+	return ok
 }
 
 // MaxDetailViolations is how many violations the buf.validate.Violations

@@ -18,12 +18,14 @@
 //! does, so keep the rules of request types cheap to evaluate: a rule that takes long blocks that
 //! executor thread while it runs.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use prost::Message;
 use prost_protovalidate::bridge::RuntimeBridge;
 use prost_protovalidate::types::Violations;
 use prost_protovalidate::{Error, Violation};
+use prost_types::{DescriptorProto, FileDescriptorSet};
 use trevrpc::client::RequestCheck;
 use trevrpc::{Detail, Status};
 
@@ -40,6 +42,9 @@ pub const MAX_DETAIL_VIOLATIONS: usize = 100;
 #[derive(Clone)]
 pub struct Validator {
     bridge: Arc<RuntimeBridge>,
+    /// The full names of the set's message types. prost-protovalidate reports a type it lacks
+    /// as a runtime error, like a rule that cannot be evaluated, so registration looks it up here.
+    types: Arc<HashSet<String>>,
 }
 
 impl Validator {
@@ -50,15 +55,33 @@ impl Validator {
     ///
     /// Panics when the set does not decode. Generated code embeds it, so that is a generator bug.
     #[must_use]
+    #[allow(clippy::expect_used)] // RuntimeBridge::from_fds has already panicked on a bad set.
     pub fn from_descriptor_set(descriptor_set: &[u8]) -> Self {
+        let bridge = Arc::new(RuntimeBridge::from_fds(descriptor_set));
+        let set = FileDescriptorSet::decode(descriptor_set)
+            .expect("trevrpc-protovalidate: the descriptor set does not decode");
+        let mut types = HashSet::new();
+        for file in &set.file {
+            let package = file.package();
+            let prefix = if package.is_empty() {
+                String::new()
+            } else {
+                format!("{package}.")
+            };
+            collect_types(&prefix, &file.message_type, &mut types);
+        }
         Self {
-            bridge: Arc::new(RuntimeBridge::from_fds(descriptor_set)),
+            bridge,
+            types: Arc::new(types),
         }
     }
 
     /// Returns the validator of the messages of type `full_name`, such as `acme.v1.Request`,
-    /// compiling their rules now, so a rule that cannot compile fails at registration and not
-    /// on the first call.
+    /// compiling their rules now, by checking an empty message, so a rule that cannot compile
+    /// fails at registration and not on the first call. A rule that only fails to evaluate for
+    /// the empty message's default values, such as a division by a field that is 0 by default, is
+    /// left to each message's own check, which fails a message it cannot evaluate with
+    /// `Internal`.
     ///
     /// # Panics
     ///
@@ -66,14 +89,29 @@ impl Validator {
     #[must_use]
     #[allow(clippy::panic)] // A rule that cannot be enforced is a schema error found at startup.
     pub fn message(&self, full_name: &'static str) -> MessageValidator {
-        // An empty message is the empty encoding.
+        assert!(
+            self.types.contains(full_name),
+            "trevrpc-protovalidate: cannot validate {full_name}: no such message type in the set"
+        );
+        // An empty message is the empty encoding. prost-protovalidate also reports a rule that
+        // names a field the message lacks as a runtime error, so such a rule fails each call
+        // instead of registration; #722 tracks surfacing it at startup.
         match self.bridge.validate_wire(full_name, &[]) {
-            Ok(()) | Err(Error::Validation(_)) => MessageValidator {
+            Ok(()) | Err(Error::Validation(_) | Error::Runtime(_)) => MessageValidator {
                 bridge: Arc::clone(&self.bridge),
                 full_name,
             },
             Err(error) => panic!("trevrpc-protovalidate: cannot validate {full_name}: {error}"),
         }
+    }
+}
+
+/// Adds the full names of `messages`, and of the messages nested in them, under `prefix`.
+fn collect_types(prefix: &str, messages: &[DescriptorProto], types: &mut HashSet<String>) {
+    for message in messages {
+        let full_name = format!("{prefix}{}", message.name());
+        collect_types(&format!("{full_name}."), &message.nested_type, types);
+        types.insert(full_name);
     }
 }
 

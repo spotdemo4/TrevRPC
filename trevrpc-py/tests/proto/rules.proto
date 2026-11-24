@@ -58,7 +58,8 @@ message ChoiceRequest {
   }
 }
 
-// A rule that cannot compile.
+// A rule that names a field the message lacks, which protovalidate reports only when it evaluates
+// the rule.
 message BrokenRequest {
   option (buf.validate.message).cel = {
     id: "broken"
@@ -72,6 +73,15 @@ message SyntaxErrorRequest {
   string name = 1 [(buf.validate.field).cel = {
     id: "syntax"
     expression: "this +"
+  }];
+}
+
+// A rule that cannot be evaluated for the empty message's default values: division by zero.
+message DivisorRequest {
+  int32 count = 1 [(buf.validate.field).cel = {
+    id: "divides"
+    message: "must be at most 100"
+    expression: "100 / this > 0"
   }];
 }
 

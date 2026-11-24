@@ -26,6 +26,31 @@ message BadRule {
   }];
 }
 
+// A message rule that names a field the message lacks.
+message MissingField {
+  option (buf.validate.message).cel = {
+    id: "missing"
+    expression: "this.missing == 1"
+  };
+  string name = 1;
+}
+
+// A rule that cannot be evaluated for the empty message's default values: division by zero.
+message Divisor {
+  int32 count = 1 [(buf.validate.field).cel = {
+    id: "divides"
+    message: "must be at most 100"
+    expression: "100 / this > 0"
+  }];
+}
+
+// Rules on a nested message, registered by its full name.
+message Outer {
+  message Inner {
+    string name = 1 [(buf.validate.field).string.min_len = 1];
+  }
+}
+
 message Items {
   repeated string items = 1 [(buf.validate.field).repeated.items.string.min_len = 1];
 }

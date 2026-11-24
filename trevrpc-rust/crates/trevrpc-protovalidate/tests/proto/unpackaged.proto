@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+import "buf/validate/validate.proto";
+
+// Rules on a message in a file without a package, registered by its bare name.
+message Unpackaged {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+}

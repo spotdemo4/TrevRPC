@@ -25,6 +25,7 @@ checking them on the server, since clients can skip it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -83,9 +84,10 @@ class RequestValidator:
 
     - A message that breaks its rules fails with `INVALID_ARGUMENT` and a `buf.validate.Violations`
       detail, as the Go and Rust servers report it.
-    - A rule that cannot be evaluated for a message fails it with `INTERNAL`.
-    - A message type whose rules cannot compile, or cannot be evaluated for an empty message,
-      fails every call sending it with `INTERNAL`.
+    - A rule that cannot be evaluated for a message fails it with `INTERNAL`. protovalidate
+      reports a rule that names a field the message lacks this way too, so such a rule fails every
+      call sending the type.
+    - A message type whose rules cannot compile fails every call sending it with `INTERNAL`.
     - Message types without rules, directly or in a message they hold, are not checked and cost
       nothing.
     """
@@ -100,17 +102,18 @@ class RequestValidator:
 
     def validate_func(self, message_type: type[Message], /) -> ValidateFunc | None:
         """`None` for a type without rules. For the others it compiles the rules now, through the
-        validator's cache, by checking an empty message, and raises the `CompilationError` or
-        `EvaluationError` that fails. protovalidate reports some broken rules, such as one naming a
-        field the message lacks, only when it evaluates them."""
+        validator's cache, by checking an empty message, and raises the `CompilationError` of a
+        rule that cannot compile. A rule that only fails to evaluate for the empty message's
+        default values, such as a division by a field that is 0 by default, is left to each
+        message's own check, which fails a message it cannot evaluate with `INTERNAL`."""
         if not _has_rules(message_type.desc(), set()):
             return None
         validator = self._validator
         fail_fast = self._fail_fast
-        # As the Go, Rust and JavaScript integrations do, any error here fails the type closed,
-        # including an evaluation error that only the empty message's default values cause. #719
-        # changes that in all four together.
-        validator.collect_violations(message_type(), fail_fast=fail_fast)
+        # protovalidate reports a rule naming a missing field as an EvaluationError too, so it
+        # fails each request instead of here; #722 tracks surfacing it at startup.
+        with contextlib.suppress(EvaluationError):
+            validator.collect_violations(message_type(), fail_fast=fail_fast)
 
         def validate(message: Message) -> None:
             try:

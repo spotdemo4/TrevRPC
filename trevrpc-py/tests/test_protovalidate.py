@@ -25,6 +25,7 @@ from .gen.rules_pb import (
     BrokenRequest,
     ChoiceRequest,
     CreateUserRequest,
+    DivisorRequest,
     FragileRequest,
     LookupRequest,
     NestedRequest,
@@ -129,15 +130,28 @@ class RulesTest(unittest.TestCase):
     def test_rules_that_cannot_compile_fail_every_message(self) -> None:
         with self.assertRaises(protovalidate.CompilationError):
             RequestValidator().validate_func(SyntaxErrorRequest)
-        # protovalidate finds the missing field only when it evaluates the rule.
-        with self.assertRaises(protovalidate.EvaluationError):
-            RequestValidator().validate_func(BrokenRequest)
-        for message in (SyntaxErrorRequest(name="x"), BrokenRequest(name="x")) * 2:
+        for _ in range(2):
             with self.assertRaises(TrevRpcError) as caught:
-                validate(message)
+                validate(SyntaxErrorRequest(name="x"))
             self.assertEqual(caught.exception.code, Code.INTERNAL)
-            prefix = f"cannot validate {message.desc().type_name}: "
+            prefix = "cannot validate test.rules.SyntaxErrorRequest: "
             self.assertTrue(caught.exception.message.startswith(prefix), caught.exception.message)
+
+    def test_rules_naming_a_missing_field_fail_every_message(self) -> None:
+        # protovalidate finds the missing field only when it evaluates the rule.
+        self.assertIsNotNone(RequestValidator().validate_func(BrokenRequest))
+        for name in ("", "x"):
+            error = rejection(BrokenRequest(name=name))
+            self.assertEqual(error.code, Code.INTERNAL)
+            self.assertTrue(error.message.startswith("request validation failed: "), error.message)
+
+    def test_rules_that_cannot_be_evaluated_for_the_empty_message(self) -> None:
+        self.assertIsNotNone(RequestValidator().validate_func(DivisorRequest))
+        validate(DivisorRequest(count=5))
+        self.assertEqual(paths(rejection(DivisorRequest(count=200))), [("divides", "count")])
+        error = rejection(DivisorRequest())
+        self.assertEqual(error.code, Code.INTERNAL)
+        self.assertTrue(error.message.startswith("request validation failed: "), error.message)
 
     def test_rules_that_cannot_be_evaluated(self) -> None:
         validate(FragileRequest(number="1"))

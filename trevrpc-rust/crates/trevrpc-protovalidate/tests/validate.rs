@@ -39,6 +39,7 @@ fn validator() -> Validator {
     .unwrap();
     compiler.include_imports(true);
     compiler.open_file("rules.proto").unwrap();
+    compiler.open_file("unpackaged.proto").unwrap();
     Validator::from_descriptor_set(&compiler.encode_file_descriptor_set())
 }
 
@@ -99,6 +100,72 @@ fn cel_rules_are_enforced() {
 #[should_panic(expected = "cannot validate test.rules.BadRule")]
 fn rules_that_cannot_compile_fail_at_registration() {
     let _ = validator().message("test.rules.BadRule");
+}
+
+/// prost-protovalidate reports a rule that names a field the message lacks only when it evaluates
+/// it, so it registers and fails every call.
+#[test]
+fn rules_naming_a_missing_field_fail_every_call() {
+    let validate = validator().message("test.rules.MissingField");
+    assert_eq!(
+        validate
+            .validate(&[])
+            .expect_err("the rule cannot be evaluated")
+            .code(),
+        Code::Internal
+    );
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct Divisor {
+    #[prost(int32, tag = "1")]
+    count: i32,
+}
+
+/// A rule that cannot be evaluated for the empty message's default values registers, and fails
+/// only the messages it cannot evaluate.
+#[test]
+fn rules_that_fail_only_for_some_values_register() {
+    let validate = validator().message("test.rules.Divisor");
+    let count = |count: i32| validate.validate_message(&Divisor { count });
+    assert_eq!(count(5), Ok(()));
+    assert_eq!(
+        count(200).expect_err("broken rule").code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        count(0).expect_err("rule that cannot be evaluated").code(),
+        Code::Internal
+    );
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct Named {
+    #[prost(string, tag = "1")]
+    name: String,
+}
+
+/// Nested messages and messages of files without a package register by their full names.
+#[test]
+fn nested_and_unpackaged_types_register() {
+    for full_name in ["test.rules.Outer.Inner", "Unpackaged"] {
+        let validate = validator().message(full_name);
+        assert_eq!(
+            validate.validate_message(&Named {
+                name: "x".to_owned()
+            }),
+            Ok(()),
+            "{full_name}"
+        );
+        assert_eq!(
+            validate
+                .validate_message(&Named::default())
+                .expect_err("the name is empty")
+                .code(),
+            Code::InvalidArgument,
+            "{full_name}"
+        );
+    }
 }
 
 #[test]

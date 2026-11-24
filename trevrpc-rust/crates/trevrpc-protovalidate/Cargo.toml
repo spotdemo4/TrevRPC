@@ -19,6 +19,7 @@ workspace = true
 [dependencies]
 prost = "0.14.4"
 prost-protovalidate = "0.6.0"
+prost-types = "0.14.4"
 trevrpc = { version = "1.13.0", path = "../.." }
 
 [dev-dependencies]
