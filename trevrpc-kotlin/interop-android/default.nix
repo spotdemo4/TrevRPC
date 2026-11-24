@@ -56,9 +56,13 @@ stdenvNoCC.mkDerivation (final: {
     "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdk}/libexec/android-sdk/build-tools/37.0.0/aapt2"
     "-PtrevrpcAndroidInterop=true"
   ];
+  # The release and zstd builds are minified with R8 to check the shrinker rules core ships for
+  # zstd-jni, with and without it; neither is installed.
   gradleBuildTask = [
     ":interop-android:assembleDebug"
     ":interop-android:assembleDebugAndroidTest"
+    ":interop-android:assembleRelease"
+    ":interop-android:verifyZstdShrinking"
   ];
   gradleUpdateScript = ''
     runHook preBuild
@@ -72,7 +76,9 @@ stdenvNoCC.mkDerivation (final: {
       :transport-cronet:test \
       :protoc-gen-trevrpc-kotlin:test \
       :interop-android:assembleDebug \
-      :interop-android:assembleDebugAndroidTest
+      :interop-android:assembleDebugAndroidTest \
+      :interop-android:assembleRelease \
+      :interop-android:verifyZstdShrinking
   '';
 
   preBuild = ''

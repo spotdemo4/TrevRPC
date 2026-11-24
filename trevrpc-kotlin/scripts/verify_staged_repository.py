@@ -23,6 +23,14 @@ TARGET_JVM = {
     "transport-cronet": 17,
     "protoc-gen-trevrpc-kotlin": 21,
 }
+# R8 and ProGuard apply META-INF/proguard/*.pro from a JAR dependency. zstd-jni is optional, so
+# core's rules let an app shrink it without zstd-jni and keep what zstd-jni's native code looks up.
+CORE_SHRINKER_RULES = "META-INF/proguard/trevrpc-core.pro"
+CORE_SHRINKER_RULE_LINES = (
+    "-dontwarn com.github.luben.zstd.**",
+    "-keepnames class com.github.luben.zstd.**",
+    "-keepclassmembers class com.github.luben.zstd.** { *; }",
+)
 POM_NAMESPACE = {"m": "http://maven.apache.org/POM/4.0.0"}
 GENERATOR_LEGAL_ENTRIES = {
     "META-INF/third-party/THIRD-PARTY.txt",
@@ -98,6 +106,18 @@ def read_class_major(archive: zipfile.ZipFile, path: pathlib.Path, name: str) ->
         raise AssertionError(f"missing class {path}!{name}") from None
     require(data[:4] == b"\xca\xfe\xba\xbe", f"invalid class file {path}!{name}")
     return int.from_bytes(data[6:8], byteorder="big")
+
+
+def verify_shrinker_rules(path: pathlib.Path) -> None:
+    """Check that the core JAR at `path` ships the rules R8 and ProGuard need for zstd-jni."""
+    with zipfile.ZipFile(path) as archive:
+        try:
+            rules = archive.read(CORE_SHRINKER_RULES).decode()
+        except KeyError:
+            raise AssertionError(f"missing shrinker rules {path}!{CORE_SHRINKER_RULES}") from None
+    lines = {line.strip() for line in rules.splitlines()}
+    for rule in CORE_SHRINKER_RULE_LINES:
+        require(rule in lines, f"{path}!{CORE_SHRINKER_RULES} lacks {rule!r}")
 
 
 def dependency_rows(
@@ -327,6 +347,8 @@ def main() -> None:
         module_metadata = pathlib.Path(f"{base}.module")
 
         verify_archive(main_jar, class_major)
+        if module == "core":
+            verify_shrinker_rules(main_jar)
         if module == "transport-cronet":
             with zipfile.ZipFile(main_jar) as archive:
                 names = set(archive.namelist())

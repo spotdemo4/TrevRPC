@@ -21,6 +21,8 @@ The plugin is an executable JAR with its dependencies that runs with `java -jar`
 
 `core` compiles against the API that protobuf-javalite and protobuf-java share and depends on neither, since the two hold the same classes and clash on one classpath. The application adds the runtime its generated messages use: `com.google.protobuf:protobuf-javalite` on Android, or `com.google.protobuf:protobuf-java`, at the version TrevRPC is tested with in [`libs.versions.toml`](https://trev.zip/llc/TrevRPC/src/branch/main/trevrpc-kotlin/gradle/libs.versions.toml) or newer.
 
+Compression calls zstd-jni, which `core` doesn't depend on either; an application that configures compression adds it. `core`'s JAR carries R8 and ProGuard rules (`META-INF/proguard/trevrpc-core.pro`), which both apply on their own, so an application can shrink with R8 with or without zstd-jni. With it, the rules keep the names and members of the zstd-jni classes the application uses, which zstd-jni's native code looks up by name.
+
 ## Example
 
 Generate Java messages for protobuf-javalite with `protoc` (drop `lite:` for protobuf-java) and the client with `protoc-gen-trevrpc-kotlin`:
@@ -75,6 +77,8 @@ nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go-interop --command \
 ```
 
 `--transport http3` (the default) runs the scenarios over HTTP/3. `--transport http2` runs them with Cronet's QUIC disabled, as on a network that blocks UDP, to exercise the HTTP/2 mapping on the server's TCP listener. The `android` workflow runs both for each server.
+
+The scenarios run on the debug build. The app's two minified builds check `core`'s shrinker rules, and the Nix package builds both: `release` leaves out zstd-jni, as an application without compression does, so R8 fails on `core`'s references to it without the rules; `zstd` adds it, and `:interop-android:verifyZstdShrinking` checks in R8's output that every zstd-jni class R8 keeps keeps its name and all of its fields.
 
 The runner generates a certificate for `10.0.2.2` (the emulator's alias for the host), trusts it in the emulator's system store, turns the emulator's Wi-Fi off and waits until mobile data is its default network and reaches the host, so no network change interrupts the scenarios, and runs the server command with `server --cert <pem> --key <pem> --host 0.0.0.0 --dictionary <file>`. It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if every scenario passed and the server exited 0 once its stdin closed.
 
