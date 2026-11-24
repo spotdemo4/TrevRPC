@@ -1,8 +1,10 @@
 //// A TrevRPC server: native QUIC, and QMux over TLS on TCP for clients
-//// whose networks block UDP.
+//// whose networks block UDP, and optionally the HTTP that TrevRPC does not
+//// claim, such as a web application's pages, from the same port.
 
 import gleam/option.{type Option, None}
 import trevrpc/handler.{type Call}
+import trevrpc/http_request.{type Request}
 import trevrpc/schema.{type Method}
 import trevrpc/status.{type Status}
 
@@ -75,6 +77,11 @@ pub type Config {
     /// browser session. Browsers always send an `Origin`; clients that send
     /// none are admitted too.
     webtransport_origins: List(String),
+    /// The handler of every HTTP request TrevRPC does not claim, over
+    /// HTTP/3 on the UDP port, and HTTP/2 and HTTP/1.1 on the TCP listener,
+    /// even with `http` and `webtransport` off: see `trevrpc/http_request`.
+    /// TrevRPC claims the HTTP path while either of them is on.
+    http_fallback: Option(fn(Request) -> Nil),
     max_frame_size: Option(Int),
     max_streams_per_connection: Option(Int),
     max_concurrent_requests: Option(Int),
@@ -101,6 +108,7 @@ pub fn config(
     http: False,
     webtransport: False,
     webtransport_origins: [],
+    http_fallback: None,
     max_frame_size: None,
     max_streams_per_connection: None,
     max_concurrent_requests: None,

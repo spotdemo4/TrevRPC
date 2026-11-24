@@ -8,6 +8,8 @@
 -export([send/2, close_send/1, recv/1, recv_within/2, close_and_recv/1, headers/1, cancel/1]).
 -export([route/3, start/1, port/1, tcp_port/1, stop/1]).
 -export([handler_recv/1, handler_send/2, send_headers/2, set_trailers/2]).
+-export([http_header/2, http_peer/1, http_read_body/2]).
+-export([http_reply/4, http_stream_reply/3, http_stream_body/3]).
 
 %% Gleam's values as this module sees them: a custom type's value is a tuple
 %% tagged with its constructor's name in snake case, `Nil' is `nil'.
@@ -32,8 +34,8 @@
 -type server_config() ::
     {config, inet:port_number(), binary(), binary(), [{binary(), trevrpc_server:route()}],
         boolean(), option(inet:port_number()), boolean(), boolean(), [binary()],
-        option(pos_integer()), option(pos_integer()), option(pos_integer()),
-        option(non_neg_integer())}.
+        option(trevrpc_http_request:handler()), option(pos_integer()), option(pos_integer()),
+        option(pos_integer()), option(non_neg_integer())}.
 
 %%% Channels
 
@@ -198,8 +200,8 @@ streamed({error, Status}) -> {error, to_status(Status)}.
 
 -spec start(server_config()) -> {ok, pid()} | {error, binary()}.
 start(
-    {config, Port, CertFile, KeyFile, Routes, Tcp, TcpPort, Http, WebTransport, Origins, MaxFrame,
-        MaxStreams, MaxRequests, Grace}
+    {config, Port, CertFile, KeyFile, Routes, Tcp, TcpPort, Http, WebTransport, Origins, Fallback,
+        MaxFrame, MaxStreams, MaxRequests, Grace}
 ) ->
     Invalid = [Origin || Origin <- Origins, trevrpc_admission:normalize_origin(Origin) =:= error],
     case [Path || {Path, _} <- Routes] -- lists:usort([Path || {Path, _} <- Routes]) of
@@ -219,6 +221,7 @@ start(
                 },
                 [
                     {tcp_port, TcpPort},
+                    {http_fallback, Fallback},
                     {max_frame_size, MaxFrame},
                     {max_streams_per_connection, MaxStreams},
                     {max_concurrent_requests, MaxRequests},
@@ -286,6 +289,58 @@ send_headers(Call, Headers) -> done(trevrpc_call:send_headers(Call, Headers)).
 set_trailers(Call, Trailers) ->
     ok = trevrpc_call:set_trailers(Call, Trailers),
     nil.
+
+%%% HTTP fallback requests
+
+-spec http_header(trevrpc_http_request:req(), binary()) -> {ok, binary()} | {error, nil}.
+http_header(Req, Name) ->
+    case trevrpc_http_request:header(Name, Req) of
+        undefined -> {error, nil};
+        Value -> {ok, Value}
+    end.
+
+-spec http_peer(trevrpc_http_request:req()) ->
+    {ok, {peer, binary(), inet:port_number()}} | {error, nil}.
+http_peer(Req) ->
+    case trevrpc_http_request:peer(Req) of
+        {Address, Port} -> {ok, {peer, list_to_binary(inet:ntoa(Address)), Port}};
+        undefined -> {error, nil}
+    end.
+
+-spec http_read_body(trevrpc_http_request:req(), {read_options, integer(), integer()}) ->
+    {ok, {more | last, binary(), trevrpc_http_request:req()}} | {error, nil}.
+http_read_body(Req, {read_options, Length, Timeout}) ->
+    case
+        trevrpc_http_request:read_body(Req, #{length => max(1, Length), timeout => max(0, Timeout)})
+    of
+        {more, Data, Next} -> {ok, {more, Data, Next}};
+        {ok, Data, Next} -> {ok, {last, Data, Next}};
+        {error, _} -> {error, nil}
+    end.
+
+-spec http_reply(
+    trevrpc_http_request:req(), 100..599, trevrpc_http_request:headers(), iodata()
+) -> {ok, nil} | {error, nil}.
+http_reply(Req, Status, Headers, Body) ->
+    sent(trevrpc_http_request:reply(Req, Status, Headers, Body)).
+
+-spec http_stream_reply(trevrpc_http_request:req(), 100..599, trevrpc_http_request:headers()) ->
+    {ok, nil} | {error, nil}.
+http_stream_reply(Req, Status, Headers) ->
+    sent(trevrpc_http_request:stream_reply(Req, Status, Headers)).
+
+-spec http_stream_body(trevrpc_http_request:req(), iodata(), boolean()) ->
+    {ok, nil} | {error, nil}.
+http_stream_body(Req, Data, Fin) ->
+    IsFin =
+        case Fin of
+            true -> fin;
+            false -> nofin
+        end,
+    sent(trevrpc_http_request:stream_body(Req, Data, IsFin)).
+
+sent(ok) -> {ok, nil};
+sent({error, _}) -> {error, nil}.
 
 %%% Conversions
 

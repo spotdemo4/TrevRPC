@@ -1,11 +1,15 @@
 //// A Gleam server and client on loopback, through the code
 //// protoc-gen-trevrpc-gleam generates from test/proto: every kind of call,
 //// over native QUIC and QMux over TLS, statuses, metadata, datagrams,
-//// deadlines, cancellation, and the failures the binding reports.
+//// deadlines, cancellation, the failures the binding reports, and the HTTP
+//// fallback.
 
+import gleam/bit_array
+import gleam/bytes_tree
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import gleam/string
 import gleeunit/should
 import greet/v1/greeter.{HelloReply, HelloRequest}
@@ -13,6 +17,7 @@ import greet/v1/greeter_trevrpc
 import trevrpc/channel
 import trevrpc/client
 import trevrpc/handler
+import trevrpc/http_request
 import trevrpc/metadata
 import trevrpc/schema
 import trevrpc/server
@@ -163,6 +168,9 @@ fn remove(dir: String) -> Nil
 
 @external(erlang, "trevrpc_test_ffi", "sleep")
 fn sleep(milliseconds: Int) -> Nil
+
+@external(erlang, "trevrpc_test_ffi", "quietly")
+fn quietly(run: fn() -> a) -> a
 
 @external(erlang, "trevrpc_test_ffi", "register_self")
 fn register_self(name: String) -> Nil
@@ -577,4 +585,261 @@ pub fn server_lifecycle_test() {
   server.tcp_port(srv) |> should.equal(Error(Nil))
   server.stop(srv)
   remove(dir)
+}
+
+// The HTTP fallback
+
+fn fallback(request: http_request.Request) -> Nil {
+  let assert Ok(Nil) = case http_request.path(request) {
+    "/upload" -> upload(request, bytes_tree.new())
+    "/upload-in-two" -> upload_in_two(request)
+    "/download" -> download(request)
+    "/timeout" -> read_timeout(request)
+    "/panic" -> panic as "the test's panic"
+    _ -> describe(request)
+  }
+  Nil
+}
+
+/// The request, as the accessors see it, and its body.
+fn describe(request: http_request.Request) -> Result(Nil, Nil) {
+  let assert Ok(http_request.Last(body, request)) =
+    http_request.read_body(request, http_request.read_options())
+  let assert Ok(peer) = http_request.peer(request)
+  let test_header = result.unwrap(http_request.header(request, "x-test"), "-")
+  let listed =
+    list.contains(http_request.headers(request), #("x-test", test_header))
+  let description =
+    string.join(
+      [
+        http_request.protocol(request),
+        http_request.method(request),
+        http_request.path(request),
+        http_request.qs(request),
+        http_request.authority(request),
+        test_header,
+        string.inspect(listed),
+        peer.address,
+        string.inspect(peer.port > 0),
+      ],
+      " ",
+    )
+  http_request.reply(
+    request,
+    200,
+    [#("content-type", "text/plain")],
+    bytes_tree.from_string(description <> "\n")
+      |> bytes_tree.append(body),
+  )
+}
+
+/// Echoes the body, read in parts of at least 16 KiB.
+fn upload(
+  request: http_request.Request,
+  body: bytes_tree.BytesTree,
+) -> Result(Nil, Nil) {
+  case read_rest(request, 16_384, body) {
+    Ok(#(body, request)) -> http_request.reply(request, 200, [], body)
+    Error(Nil) -> http_request.reply(request, 408, [], bytes_tree.new())
+  }
+}
+
+/// `body` and the rest of the request body, read in parts of at least
+/// `length` bytes.
+fn read_rest(
+  request: http_request.Request,
+  length: Int,
+  body: bytes_tree.BytesTree,
+) -> Result(#(bytes_tree.BytesTree, http_request.Request), Nil) {
+  let options = http_request.ReadOptions(..http_request.read_options(), length:)
+  case http_request.read_body(request, options) {
+    Ok(http_request.More(data, request)) ->
+      read_rest(request, length, bytes_tree.append(body, data))
+    Ok(http_request.Last(data, request)) ->
+      Ok(#(bytes_tree.append(body, data), request))
+    Error(Nil) -> Error(Nil)
+  }
+}
+
+/// Reads the first part of the body, which is `More`, as the client sends
+/// the rest only once the response head arrived; then echoes the body.
+fn upload_in_two(request: http_request.Request) -> Result(Nil, Nil) {
+  let options =
+    http_request.ReadOptions(..http_request.read_options(), length: 1)
+  let assert Ok(http_request.More(first, request)) =
+    http_request.read_body(request, options)
+  use Nil <- result.try(http_request.stream_reply(request, 200, []))
+  let assert Ok(#(body, request)) =
+    read_rest(request, 16_384, bytes_tree.from_bit_array(first))
+  http_request.stream_body(request, body, fin: True)
+}
+
+/// Waits 50 ms for a body that does not come.
+fn read_timeout(request: http_request.Request) -> Result(Nil, Nil) {
+  let options =
+    http_request.ReadOptions(..http_request.read_options(), timeout: 50)
+  case http_request.read_body(request, options) {
+    Error(Nil) -> http_request.reply(request, 408, [], bytes_tree.new())
+    Ok(_) -> http_request.reply(request, 200, [], bytes_tree.new())
+  }
+}
+
+/// Streams `qs` parts of 64 KiB, the first of `a`s, the next of `b`s, and
+/// so on.
+fn download(request: http_request.Request) -> Result(Nil, Nil) {
+  let assert Ok(count) = int.parse(http_request.qs(request))
+  use Nil <- result.try(
+    http_request.stream_reply(request, 200, [
+      #("content-type", "application/octet-stream"),
+    ]),
+  )
+  use Nil <- result.try(
+    list.try_each(range(0, count - 1), fn(n) {
+      http_request.stream_body(request, download_part(n), fin: False)
+    }),
+  )
+  http_request.stream_body(request, bytes_tree.new(), fin: True)
+}
+
+fn download_part(n: Int) -> bytes_tree.BytesTree {
+  let assert Ok(letter) = bit_array.to_string(<<{ 97 + n % 26 }>>)
+  bytes_tree.from_string(string.repeat(letter, 65_536))
+}
+
+type HttpVersion {
+  H3
+  H2
+  H1
+}
+
+@external(erlang, "trevrpc_test_ffi", "http_unfinished")
+fn http_unfinished(version: HttpVersion, port: Int, path: String) -> Int
+
+@external(erlang, "trevrpc_test_ffi", "http_upload_in_two")
+fn http_upload_in_two(
+  version: HttpVersion,
+  port: Int,
+  path: String,
+  first: BitArray,
+  rest: BitArray,
+) -> #(Int, BitArray)
+
+@external(erlang, "trevrpc_test_ffi", "http_exchange")
+fn http_exchange(
+  version: HttpVersion,
+  port: Int,
+  method: String,
+  path: String,
+  headers: List(#(String, String)),
+  body: BitArray,
+) -> #(Int, List(#(String, String)), BitArray)
+
+/// Runs `run` with the UDP and TCP ports of a server with only the
+/// fallback.
+fn with_fallback(run: fn(Int, Int) -> a) -> a {
+  let #(cert, key, dir) = credentials()
+  let assert Ok(srv) =
+    server.start(
+      server.Config(
+        ..server.config(0, cert, key, []),
+        http_fallback: Some(fallback),
+      ),
+    )
+  let assert Ok(port) = server.port(srv)
+  let assert Ok(tcp_port) = server.tcp_port(srv)
+  let result = run(port, tcp_port)
+  server.stop(srv)
+  remove(dir)
+  result
+}
+
+/// Runs `run` over each of `versions`, against a server with only the
+/// fallback, with the port and the protocol `http_request.protocol` gives.
+fn each_http(
+  versions: List(HttpVersion),
+  run: fn(HttpVersion, Int, String) -> a,
+) -> Nil {
+  use port, tcp_port <- with_fallback()
+  versions
+  |> list.each(fn(version) {
+    case version {
+      H3 -> run(H3, port, "HTTP/3.0")
+      H2 -> run(H2, tcp_port, "HTTP/2.0")
+      H1 -> run(H1, tcp_port, "HTTP/1.1")
+    }
+  })
+}
+
+const all_http = [H3, H2, H1]
+
+pub fn http_fallback_request_test() {
+  use version, port, protocol <- each_http(all_http)
+  let #(status, headers, body) =
+    http_exchange(version, port, "POST", "/some/path?n=1", [#("x-test", "t")], <<
+      "hello":utf8,
+    >>)
+  status |> should.equal(200)
+  list.key_find(headers, "content-type") |> should.equal(Ok("text/plain"))
+  body
+  |> should.equal(<<
+    protocol:utf8,
+    " POST /some/path n=1 localhost t True 127.0.0.1 True\nhello":utf8,
+  >>)
+  // A request without a body, query or header.
+  let #(_, _, body) = http_exchange(version, port, "GET", "/", [], <<>>)
+  body
+  |> should.equal(<<
+    protocol:utf8,
+    " GET /  localhost - False 127.0.0.1 True\n":utf8,
+  >>)
+}
+
+pub fn http_fallback_upload_test() {
+  use version, port, _ <- each_http(all_http)
+  let upload = bit_array.from_string(string.repeat("0123456789abcdef", 16_384))
+  let #(status, _, body) =
+    http_exchange(version, port, "POST", "/upload", [], upload)
+  status |> should.equal(200)
+  body |> should.equal(upload)
+}
+
+/// A body read before it all arrived comes as `More`, then `Last`. HTTP/1.1
+/// is left out: its client sends the body whole.
+pub fn http_fallback_read_parts_test() {
+  use version, port, _ <- each_http([H3, H2])
+  let first = <<"first part":utf8>>
+  let rest = bit_array.from_string(string.repeat("rest", 16_384))
+  http_upload_in_two(version, port, "/upload-in-two", first, rest)
+  |> should.equal(#(200, bit_array.append(first, rest)))
+}
+
+/// `read_body` gives up on a body that does not come. HTTP/1.1 is left out:
+/// its client cannot hold a body back.
+pub fn http_fallback_read_timeout_test() {
+  use version, port, _ <- each_http([H3, H2])
+  http_unfinished(version, port, "/timeout") |> should.equal(408)
+}
+
+/// A handler that panics before it answered gets 500.
+pub fn http_fallback_panic_test() {
+  use <- quietly()
+  use version, port, _ <- each_http(all_http)
+  let #(status, _, _) = http_exchange(version, port, "GET", "/panic", [], <<>>)
+  status |> should.equal(500)
+}
+
+pub fn http_fallback_download_test() {
+  use version, port, _ <- each_http(all_http)
+  let #(status, headers, body) =
+    http_exchange(version, port, "GET", "/download?8", [], <<>>)
+  status |> should.equal(200)
+  list.key_find(headers, "content-type")
+  |> should.equal(Ok("application/octet-stream"))
+  body
+  |> should.equal(
+    range(0, 7)
+    |> list.map(download_part)
+    |> bytes_tree.concat
+    |> bytes_tree.to_bit_array,
+  )
 }

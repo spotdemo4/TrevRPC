@@ -1,11 +1,23 @@
 %% The HTTP fallback over HTTP/3, HTTP/2 and HTTP/1.1, against the HTTP
-%% clients of quic_h3, erlang_h2 and erlang_h1: the requests TrevRPC does
+%% clients of quic_h3, erlang_h2 and erlang_h1 (trevrpc_test_http): the requests TrevRPC does
 %% not claim, beside calls, the stream slot they take, request and response
 %% bodies, failing handlers and shutdown. The cases mirror the Go and Rust
 %% servers' fallback tests.
 -module(trevrpc_fallback_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+
+-import(trevrpc_test_http, [
+    h3_opts/0,
+    close/1,
+    open/3,
+    cancel/2,
+    exchange/3,
+    response/2,
+    response_head/2,
+    request/3,
+    header/2
+]).
 
 -define(UNARY, <<"/test.Echo/Unary">>).
 -define(MEDIA_TYPE, <<"application/trevrpc">>).
@@ -579,112 +591,9 @@ protocol(h1) -> <<"HTTP/1.1">>.
 alt_svc(h3, _Env) -> <<>>;
 alt_svc(_, #{port := Port}) -> iolist_to_binary(io_lib:format("h3=\":~b\"; ma=86400", [Port])).
 
-request(Method, Path, Extra) ->
-    [
-        {<<":method">>, Method},
-        {<<":scheme">>, <<"https">>},
-        {<<":authority">>, <<"localhost">>},
-        {<<":path">>, Path}
-        | Extra
-    ].
-
 request(Method, Path, Extra, Query) ->
     request(Method, <<Path/binary, "?", Query/binary>>, Extra).
 
-header(Name, Headers) ->
-    case lists:keyfind(Name, 1, Headers) of
-        {_, Value} -> iolist_to_binary(Value);
-        false -> <<>>
-    end.
-
-%%% Clients: quic_h3 for HTTP/3, erlang_h2 for HTTP/2 and erlang_h1 for
-%%% HTTP/1.1, all sending their events to the test process.
-
-h3_opts() ->
-    #{verify => verify_none, sync => true}.
-
-connect(#{version := h3, port := Port}) ->
-    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, h3_opts()),
-    {quic_h3, Conn};
-connect(#{version := h2, tcp_port := Port}) ->
-    {ok, Conn} = h2:connect("127.0.0.1", Port, #{verify => verify_none}),
-    %% A connection the server closes exits abnormally, and takes its linked
-    %% caller with it.
-    true = unlink(Conn),
-    ok = h2:wait_connected(Conn),
-    {h2, Conn};
-connect(#{version := h1, tcp_port := Port}) ->
-    {ok, Conn} = h1:connect("127.0.0.1", Port, #{
-        transport => ssl, ssl_opts => [{verify, verify_none}]
-    }),
-    true = unlink(Conn),
-    ok = h1:wait_connected(Conn),
-    {h1, Conn}.
-
-close({quic_h3, Conn}) -> quic_h3:close(Conn);
-close({h2, Conn}) -> h2:close(Conn);
-close({h1, Conn}) -> h1:close(Conn).
-
-%% Opens a request; `Ended' says the request has no body.
-open({quic_h3, Conn}, Headers, Ended) -> quic_h3:request(Conn, Headers, #{end_stream => Ended});
-open({h2, Conn}, Headers, Ended) -> h2:request(Conn, Headers, #{end_stream => Ended});
-open({h1, Conn}, Headers, true) -> h1:request(Conn, Headers, #{}).
-
-cancel({quic_h3, Conn}, Id) -> quic_h3:cancel(Conn, Id);
-cancel({h2, Conn}, Id) -> h2:cancel(Conn, Id).
-
-%% Sends a request with `Body' and reads the whole response.
-exchange({h1, Conn} = Client, Headers, Body) ->
-    Opts =
-        case Body of
-            <<>> -> #{};
-            _ -> #{body => Body}
-        end,
-    {ok, Id} = h1:request(Conn, Headers, Opts),
-    response(Client, Id);
-exchange(Client, Headers, <<>>) ->
-    {ok, Id} = open(Client, Headers, true),
-    response(Client, Id);
-exchange(Client, Headers, Body) ->
-    {ok, Id} = open(Client, Headers, false),
-    ok = send_body(Client, Id, Body),
-    response(Client, Id).
-
-%% The body in chunks, so that HTTP/2 flow control holds the client back
-%% while the server reads.
-send_body({Tag, Conn}, Id, Body) when byte_size(Body) > ?CHUNK ->
-    <<Chunk:?CHUNK/binary, Rest/binary>> = Body,
-    ok = send_data(Tag, Conn, Id, Chunk, false),
-    send_body({Tag, Conn}, Id, Rest);
-send_body({Tag, Conn}, Id, Body) ->
-    send_data(Tag, Conn, Id, Body, true).
-
-send_data(quic_h3, Conn, Id, Data, Fin) -> quic_h3:send_data(Conn, Id, Data, Fin);
-send_data(h2, Conn, Id, Data, Fin) -> h2:send_data(Conn, Id, Data, Fin).
-
-response(Client, Id) ->
-    case response_head(Client, Id) of
-        {Status, Headers, Data, true} ->
-            {Status, Headers, Data};
-        {Status, Headers, Data, false} ->
-            {Rest, true} = body(Client, Id, Data),
-            {Status, Headers, Rest}
-    end.
-
-response_head({Tag, Conn}, Id) ->
-    receive
-        {Tag, Conn, {response, Id, Status, Headers}} ->
-            {Status, Headers, <<>>, false};
-        {Tag, Conn, {stream_reset, Id, Code}} ->
-            error({reset, Code})
-    after 10000 -> error(no_response)
-    end.
-
-body({Tag, Conn} = Client, Id, Acc) ->
-    receive
-        {Tag, Conn, {data, Id, Data, true}} -> {<<Acc/binary, Data/binary>>, true};
-        {Tag, Conn, {data, Id, Data, false}} -> body(Client, Id, <<Acc/binary, Data/binary>>);
-        {Tag, Conn, {trailers, Id, _}} -> {Acc, true};
-        {Tag, Conn, {stream_reset, Id, Code}} -> error({reset, Code})
-    after 10000 -> error({no_body, byte_size(Acc)})
-    end.
+%% A client of the test's version, on the server's port for it.
+connect(#{version := h3, port := Port}) -> trevrpc_test_http:connect(h3, Port);
+connect(#{version := Version, tcp_port := Port}) -> trevrpc_test_http:connect(Version, Port).
