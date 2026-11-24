@@ -103,8 +103,8 @@ cachePackages = [
     hash = 'sha256-xaxHnTKIZt1cHK5ZqTuSTOt5RNSjQB37GlrIgEGBskM='
 
   [mod.'github.com/quic-go/quic-go']
-    version = 'v0.65.0'
-    hash = 'sha256-G132ivNnNjxWsjjvNjWCiSfvnxsF6gTXKpcwWum9XbU='
+    version = 'v0.66.0'
+    hash = 'sha256-WzAvasnCbPzIJSToutLtl8ZEYC2UFX/vawXZqmb8Kw0='
 
   [mod.'golang.org/x/crypto']
     version = 'v0.59.0'
