@@ -182,27 +182,27 @@ def enter_namespace(script: Path, argv: list[str], environment: dict[str, str]) 
 
 
 def link_commands() -> list[list[str]]:
-    """Brings up the namespace's loopback link with an Ethernet MTU, the segmenting tbf, and the
-    prio qdisc whose bands hold each direction's netem."""
+    """Brings up the namespace's loopback link with an Ethernet MTU and the segmenting tbf."""
     return [
         ["ip", "link", "set", "lo", "mtu", str(MTU), "up"],
         [
             "tc", "qdisc", "add", "dev", "lo", "root", "handle", "1:",
             "tbf", "rate", "100gbit", "burst", str(FRAME_BYTES), "limit", "100mb",
         ],
-        [
-            "tc", "qdisc", "add", "dev", "lo", "parent", "1:1", "handle", PRIO,
-            "prio", "bands", "2", "priomap", *["0"] * 16,
-        ],
     ]  # fmt: skip
 
 
-def netem_commands(netem: Profile) -> list[list[str]]:
-    """Sets each band's netem to the profile's arguments for its direction, adding it on first
-    use."""
-    return [
+def tree_commands(netem: Profile, ports: Iterable[int]) -> list[list[str]]:
+    """Builds the profile's qdiscs under the tbf: the prio qdisc, each band's netem with the
+    profile's arguments for its direction, and, if the profile splits the directions, a filter
+    for each server port."""
+    prio = [
+        "tc", "qdisc", "add", "dev", "lo", "parent", "1:1", "handle", PRIO,
+        "prio", "bands", "2", "priomap", *["0"] * 16,
+    ]  # fmt: skip
+    netems = [
         [
-            "tc", "qdisc", "replace", "dev", "lo", "parent", band, "handle", handle,
+            "tc", "qdisc", "add", "dev", "lo", "parent", band, "handle", handle,
             "netem", "limit", str(NETEM_LIMIT), *arguments,
         ]
         for band, handle, arguments in (
@@ -210,6 +210,14 @@ def netem_commands(netem: Profile) -> list[list[str]]:
             (DOWN_BAND, DOWN_NETEM, netem.down),
         )
     ]  # fmt: skip
+    filters = [direction_command(port) for port in ports] if netem.split else []
+    return [prio, *netems, *filters]
+
+
+# Removes the prio qdisc with its netems and filters. A profile's qdiscs are built anew rather
+# than changed, since changing a netem keeps every option the new arguments leave out: a rate
+# or a slot would carry over to a profile that has none.
+REMOVE_TREE = ["tc", "qdisc", "del", "dev", "lo", "parent", "1:1", "handle", PRIO]
 
 
 def direction_command(port: int) -> list[str]:
@@ -253,8 +261,8 @@ class Link:
         self._run = run
         self._reserve = reserve if reserve is not None else _reserve_ports
         self._ports: list[int] = []
-        self._split = False
-        self._filtered = False
+        # The profile whose qdiscs are built, if any.
+        self._profile: str | None = None
 
     def configure(self, profiles: Sequence[str]) -> None:
         """Sets up the link and checks that tc accepts every profile, so a bad one fails before
@@ -266,6 +274,9 @@ class Link:
         parsed = [parse(netem) for netem in profiles]
         for command in link_commands():
             self._run(command)
+        for netem in profiles:
+            self.apply(netem)
+        # No server has started, so the last profile's qdiscs have no direction filter yet.
         if any(netem.split for netem in parsed):
             self._reserve([])
             self._run(direction_command(PROBE_PORT))
@@ -273,31 +284,23 @@ class Link:
         if any(netem.outage is not None for netem in parsed):
             self._run(OUTAGE_START)
             self._run(OUTAGE_END)
-        for netem in profiles:
-            self.apply(netem)
 
     def serve(self, ports: Iterable[int]) -> None:
         """Points the direction filters at a newly started server's ports."""
         self._ports = sorted(set(ports))
         self._reserve(self._ports)
-        self._filter()
+        if self._profile is not None:
+            self.apply(self._profile)
 
     def apply(self, netem: str) -> None:
-        """Switches to a profile."""
+        """Switches to a profile, building its qdiscs anew."""
         parsed = parse(netem)
-        for command in netem_commands(parsed):
+        if self._profile is not None:
+            self._run(REMOVE_TREE)
+        self._profile = None
+        for command in tree_commands(parsed, self._ports):
             self._run(command)
-        self._split = parsed.split
-        self._filter()
-
-    def _filter(self) -> None:
-        if self._filtered:
-            self._run(delete_filters_command(DIRECTION_PRIORITY))
-            self._filtered = False
-        if self._split and self._ports:
-            for port in self._ports:
-                self._run(direction_command(port))
-            self._filtered = True
+        self._profile = netem
 
     @contextmanager
     def outages(self, netem: str, until: float) -> Generator[None]:

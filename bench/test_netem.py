@@ -79,25 +79,36 @@ class CommandTest(unittest.TestCase):
             [sys.executable, "-I", "/bench/run.py", "--netem", "delay 1ms"], command[5:]
         )
 
-    def test_segments_frames_to_the_mtu_before_the_directions_split(self) -> None:
-        link, tbf, prio = netem.link_commands()
+    def test_segments_frames_to_the_mtu(self) -> None:
+        link, tbf = netem.link_commands()
 
         self.assertEqual(["ip", "link", "set", "lo", "mtu", "1500", "up"], link)
         self.assertEqual(["root", "handle", "1:", "tbf"], tbf[5:9])
         self.assertEqual("1514", tbf[tbf.index("burst") + 1])
-        self.assertEqual(["parent", "1:1", "handle", "10:", "prio", "bands", "2"], prio[5:12])
+
+    def test_the_directions_split_under_the_tbf(self) -> None:
+        prio, *_ = netem.tree_commands(netem.parse("delay 10ms"), [])
+
+        self.assertEqual(["add", "dev", "lo", "parent", "1:1", "handle", "10:"], prio[2:9])
+        self.assertEqual(["prio", "bands", "2"], prio[9:12])
         # Everything goes to the first band unless a filter says otherwise.
         self.assertEqual(["priomap", *["0"] * 16], prio[12:])
 
     def test_profile_follows_the_default_limit_so_its_own_limit_wins(self) -> None:
-        up, down = netem.netem_commands(netem.parse("delay 10ms limit 50 down rate 1mbit"))
+        _, up, down = netem.tree_commands(netem.parse("delay 10ms limit 50 down rate 1mbit"), [])
 
-        self.assertEqual(["parent", "10:1", "handle", "20:", "netem"], up[5:10])
+        self.assertEqual(["add", "dev", "lo", "parent", "10:1", "handle", "20:", "netem"], up[2:10])
         self.assertEqual(["limit", "1000000", "delay", "10ms", "limit", "50"], up[10:])
         self.assertEqual(["parent", "10:2", "handle", "30:", "netem"], down[5:10])
         self.assertEqual(
             ["limit", "1000000", "delay", "10ms", "limit", "50", "rate", "1mbit"], down[10:]
         )
+        # A split profile filters the server ports it is given.
+        self.assertEqual(
+            [netem.direction_command(4433)],
+            netem.tree_commands(netem.parse("delay 1ms up rate 1mbit"), [4433])[3:],
+        )
+        self.assertEqual([], netem.tree_commands(netem.parse("delay 1ms"), [4433])[3:])
 
     def test_direction_filter_matches_the_source_port_whatever_the_protocol(self) -> None:
         command = netem.direction_command(4433)
@@ -122,12 +133,24 @@ class LinkTest(unittest.TestCase):
     def test_configure_sets_up_the_link_and_tries_every_profile(self) -> None:
         self.link.configure(["delay 1ms", "delay 2ms"])
 
-        self.assertEqual(netem.link_commands(), self.commands[:3])
         self.assertEqual(
-            [*netem.netem_commands(netem.parse("delay 1ms")),
-             *netem.netem_commands(netem.parse("delay 2ms"))],
-            self.commands[3:],
+            [*netem.link_commands(),
+             *netem.tree_commands(netem.parse("delay 1ms"), []),
+             netem.REMOVE_TREE,
+             *netem.tree_commands(netem.parse("delay 2ms"), [])],
+            self.commands,
         )  # fmt: skip
+
+    def test_each_profile_builds_its_qdiscs_anew(self) -> None:
+        # Changing a netem in place would keep the rate and the slot for the second profile.
+        self.link.apply("delay 10ms rate 100mbit slot 1ms 8ms")
+        self.commands.clear()
+        self.link.apply("delay 10ms")
+
+        self.assertEqual(
+            [netem.REMOVE_TREE, *netem.tree_commands(netem.parse("delay 10ms"), [])],
+            self.commands,
+        )
 
     def test_configure_tries_the_filters_the_profiles_need_once(self) -> None:
         self.link.configure(
@@ -141,8 +164,6 @@ class LinkTest(unittest.TestCase):
             self.filters(),
         )  # fmt: skip
         self.assertEqual([[]], self.reserved)
-        # The probe leaves no filter behind for apply to delete.
-        self.assertNotIn(delete, self.commands[self.commands.index(netem.OUTAGE_END) :])
 
     def test_configure_tries_no_filter_for_shared_profiles(self) -> None:
         self.link.configure(["delay 1ms rate 1mbit"])
@@ -166,18 +187,22 @@ class LinkTest(unittest.TestCase):
             [netem.direction_command(4433), netem.direction_command(4434)], self.filters()
         )
 
-    def test_switching_profiles_and_servers_replaces_the_filters(self) -> None:
+    def test_a_new_server_rebuilds_the_profile_with_its_ports(self) -> None:
         self.link.serve([4433])
         self.link.apply("delay 10ms up rate 5mbit")
+        self.commands.clear()
         self.link.serve([5000])
-        self.link.apply("delay 10ms")
-        self.link.apply("delay 10ms")
 
-        delete = netem.delete_filters_command(netem.DIRECTION_PRIORITY)
         self.assertEqual(
-            [netem.direction_command(4433), delete, netem.direction_command(5000), delete],
-            self.filters(),
-        )
+            [netem.REMOVE_TREE,
+             *netem.tree_commands(netem.parse("delay 10ms up rate 5mbit"), [5000])],
+            self.commands,
+        )  # fmt: skip
+
+    def test_a_server_before_any_profile_builds_nothing(self) -> None:
+        self.link.serve([4433])
+
+        self.assertEqual([], self.commands)
 
     def test_a_profile_without_outages_runs_none(self) -> None:
         with self.link.outages("delay 10ms", 10.0):
