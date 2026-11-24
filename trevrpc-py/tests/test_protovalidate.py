@@ -145,6 +145,18 @@ class RulesTest(unittest.TestCase):
             self.assertEqual(error.code, Code.INTERNAL)
             self.assertTrue(error.message.startswith("request validation failed: "), error.message)
 
+    def test_rules_that_cannot_be_evaluated_for_the_empty_message_are_logged(self) -> None:
+        validator = RequestValidator()
+        with self.assertLogs("trevrpc.protovalidate", "WARNING") as logged:
+            for message_type in (CreateUserRequest, BrokenRequest, DivisorRequest):
+                validator.validate_func(message_type)
+            # Each type warns once, however many channels use the validator.
+            validator.validate_func(BrokenRequest)
+            validator.validate_func(DivisorRequest)
+        self.assertEqual(len(logged.records), 2, logged.output)
+        self.assertIn("rules of test.rules.BrokenRequest cannot be", logged.output[0])
+        self.assertIn("rules of test.rules.DivisorRequest cannot be", logged.output[1])
+
     def test_rules_that_cannot_be_evaluated_for_the_empty_message(self) -> None:
         self.assertIsNotNone(RequestValidator().validate_func(DivisorRequest))
         validate(DivisorRequest(count=5))

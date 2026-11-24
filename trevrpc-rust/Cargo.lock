@@ -3268,6 +3268,8 @@ dependencies = [
  "prost-protovalidate",
  "prost-types",
  "protox",
+ "tracing",
+ "tracing-subscriber",
  "trevrpc",
 ]
 

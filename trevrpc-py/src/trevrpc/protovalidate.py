@@ -25,8 +25,8 @@ checking them on the server, since clients can skip it.
 
 from __future__ import annotations
 
-import contextlib
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 import protovalidate
@@ -66,6 +66,8 @@ Its message names the first violation and counts the rest."""
 VIOLATIONS_TYPE = ViolationsPb.desc().type_name
 """`buf.validate.Violations`, the type of the status detail that lists a request's violations."""
 
+_logger = logging.getLogger(__name__)
+
 # The options that carry rules, from protovalidate's own descriptor of buf/validate/validate.proto.
 _EXTENSIONS: dict[str, Extension[Any, Any]] = {
     extension.type_name: extension.type  # pyright: ignore[reportUnknownMemberType]
@@ -86,34 +88,51 @@ class RequestValidator:
       detail, as the Go and Rust servers report it.
     - A rule that cannot be evaluated for a message fails it with `INTERNAL`. protovalidate
       reports a rule that names a field the message lacks this way too, so such a rule fails every
-      call sending the type.
+      call sending the type. A type whose rules cannot be evaluated for an empty message is logged
+      as a warning on the `trevrpc.protovalidate` logger, to make such a rule visible at startup.
     - A message type whose rules cannot compile fails every call sending it with `INTERNAL`.
     - Message types without rules, directly or in a message they hold, are not checked and cost
       nothing.
     """
 
-    __slots__ = ("_fail_fast", "_validator")
+    __slots__ = ("_fail_fast", "_validator", "_warned")
 
     def __init__(
         self, validator: protovalidate.Validator | None = None, *, fail_fast: bool = False
     ) -> None:
         self._validator = validator if validator is not None else protovalidate.Validator()
         self._fail_fast = fail_fast
+        self._warned: set[str] = set()
+        """The request types warned about, so that each warns once however many channels use
+        this validator."""
 
     def validate_func(self, message_type: type[Message], /) -> ValidateFunc | None:
         """`None` for a type without rules. For the others it compiles the rules now, through the
         validator's cache, by checking an empty message, and raises the `CompilationError` of a
         rule that cannot compile. A rule that only fails to evaluate for the empty message's
         default values, such as a division by a field that is 0 by default, is left to each
-        message's own check, which fails a message it cannot evaluate with `INTERNAL`."""
+        message's own check, which fails a message it cannot evaluate with `INTERNAL`, and logged
+        as a warning on the `trevrpc.protovalidate` logger, once per type for this validator:
+        protovalidate reports a rule that names a field the message lacks the same way, and it
+        fails every request of the type."""
         if not _has_rules(message_type.desc(), set()):
             return None
         validator = self._validator
         fail_fast = self._fail_fast
-        # protovalidate reports a rule naming a missing field as an EvaluationError too, so it
-        # fails each request instead of here; #722 tracks surfacing it at startup.
-        with contextlib.suppress(EvaluationError):
+        try:
             validator.collect_violations(message_type(), fail_fast=fail_fast)
+        except EvaluationError as error:
+            type_name = message_type.desc().type_name
+            if type_name not in self._warned:
+                self._warned.add(type_name)
+                _logger.warning(
+                    "the buf.validate rules of %s cannot be evaluated for an empty message (%s). "
+                    "This is expected of a rule that fails for default values, such as a division "
+                    "by a field that is 0 by default, but a rule that names a field the message "
+                    "lacks fails every request of the type with INTERNAL.",
+                    type_name,
+                    error,
+                )
 
         def validate(message: Message) -> None:
             try:

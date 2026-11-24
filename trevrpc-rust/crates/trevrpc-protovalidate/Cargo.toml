@@ -20,7 +20,10 @@ workspace = true
 prost = "0.14.4"
 prost-protovalidate = "0.6.0"
 prost-types = "0.14.4"
+tracing = "0.1.44"
 trevrpc = { version = "1.13.0", path = "../.." }
 
 [dev-dependencies]
 protox = "0.10.0"
+# Captures the warning of a rule that cannot be evaluated for an empty message.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

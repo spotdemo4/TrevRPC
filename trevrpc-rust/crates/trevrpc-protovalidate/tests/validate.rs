@@ -9,12 +9,13 @@
     clippy::indexing_slicing
 )]
 
-use std::path::Path;
+mod common;
 
+use common::validator;
 use prost::Message;
 use prost_protovalidate::types::Violations;
 use trevrpc::Code;
-use trevrpc_protovalidate::{MAX_DETAIL_VIOLATIONS, VIOLATIONS_TYPE, Validator};
+use trevrpc_protovalidate::{MAX_DETAIL_VIOLATIONS, VIOLATIONS_TYPE};
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct Request {
@@ -28,19 +29,6 @@ struct Request {
 struct Inner {
     #[prost(string, tag = "1")]
     label: String,
-}
-
-fn validator() -> Validator {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut compiler = protox::Compiler::new([
-        manifest_dir.join("tests/proto"),
-        manifest_dir.join("../../../interop/proto"),
-    ])
-    .unwrap();
-    compiler.include_imports(true);
-    compiler.open_file("rules.proto").unwrap();
-    compiler.open_file("unpackaged.proto").unwrap();
-    Validator::from_descriptor_set(&compiler.encode_file_descriptor_set())
 }
 
 fn request(name: &str, label: &str) -> Vec<u8> {

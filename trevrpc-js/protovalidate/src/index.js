@@ -14,6 +14,8 @@ import { Code, TrevRpcError } from "@trevrpc/trevrpc-js";
  * one that `createValidator()` makes when it is undefined.
  */
 export function createRequestValidator(validator = createValidator()) {
+  // The request types warned about, so that each warns once however many methods take it.
+  const warned = new Set();
   return {
     validateFunc(schema) {
       if (!hasRules(schema, new Set())) {
@@ -23,10 +25,15 @@ export function createRequestValidator(validator = createValidator()) {
       // rule that cannot compile fails createClient instead of the first call. A rule that only
       // fails to evaluate for the empty message's default values, such as a division by a field
       // that is 0 by default, is left to each message's own check, which fails it with Internal.
-      // protovalidate-es reports a rule naming a missing field that way too, so it fails each
-      // request instead of createClient; #722 tracks surfacing it at startup.
+      // protovalidate-es reports a rule naming a missing field that way too, and that rule fails
+      // every request of the type, so it is logged as a warning.
       const compiled = validator.validate(schema, create(schema));
-      if (compiled.kind === "error" && !(compiled.error instanceof RuntimeError)) {
+      if (compiled.kind === "error" && compiled.error instanceof RuntimeError) {
+        if (!warned.has(schema.typeName)) {
+          warned.add(schema.typeName);
+          warnUnevaluated(schema.typeName, compiled.error);
+        }
+      } else if (compiled.kind === "error") {
         throw new TrevRpcError(
           Code.Internal,
           `cannot validate ${schema.typeName}: ${compiled.error.message}`,
@@ -42,6 +49,21 @@ export function createRequestValidator(validator = createValidator()) {
       };
     },
   };
+}
+
+/**
+ * Warns that the rules of `typeName` cannot be evaluated for an empty message. A rule that fails
+ * only for default values is fine, but protovalidate-es also reports a rule that names a field the
+ * message lacks this way, which fails every request of the type: the warning makes that visible
+ * when the client is created.
+ */
+function warnUnevaluated(typeName, error) {
+  console.warn(
+    `@trevrpc/protovalidate: the buf.validate rules of ${typeName} cannot be evaluated for an ` +
+      `empty message (${error.message}). This is expected of a rule that fails for default ` +
+      `values, such as a division by a field that is 0 by default, but a rule that names a field ` +
+      `the message lacks fails every request of the type with Internal.`,
+  );
 }
 
 /**

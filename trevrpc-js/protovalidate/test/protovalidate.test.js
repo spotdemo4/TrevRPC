@@ -151,7 +151,8 @@ test("rules that cannot compile fail createClient", () => {
   );
 });
 
-test("rules that name a missing field fail every request with Internal", () => {
+test("rules that name a missing field fail every request with Internal", (t) => {
+  t.mock.method(console, "warn", () => {});
   const check = createRequestValidator().validateFunc(BrokenRequestSchema);
   for (const name of ["", "x"]) {
     assert.throws(
@@ -162,6 +163,21 @@ test("rules that name a missing field fail every request with Internal", () => {
         error.statusMessage.startsWith("request validation failed: "),
     );
   }
+});
+
+test("rules that cannot be evaluated for the empty message are logged, and only those", (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const validator = createRequestValidator();
+  for (const schema of [CreateUserRequestSchema, BrokenRequestSchema, DivisorRequestSchema]) {
+    validator.validateFunc(schema);
+  }
+  // Each type warns once, however many methods take it.
+  validator.validateFunc(BrokenRequestSchema);
+  validator.validateFunc(DivisorRequestSchema);
+  const warned = warn.mock.calls.map((call) => call.arguments[0]);
+  assert.equal(warned.length, 2);
+  assert.match(warned[0], /buf\.validate rules of protovalidate\.v1\.BrokenRequest cannot be/);
+  assert.match(warned[1], /buf\.validate rules of protovalidate\.v1\.DivisorRequest cannot be/);
 });
 
 test("rules that cannot be evaluated fail the request with Internal", () => {
@@ -182,7 +198,8 @@ test("rules that cannot be evaluated fail the request with Internal", () => {
   );
 });
 
-test("rules that cannot be evaluated for the empty message do not fail createClient", () => {
+test("rules that cannot be evaluated for the empty message do not fail createClient", (t) => {
+  t.mock.method(console, "warn", () => {});
   const check = createRequestValidator().validateFunc(DivisorRequestSchema);
   assert.ok(check !== undefined);
   check(create(DivisorRequestSchema, { count: 5 }));

@@ -19,7 +19,7 @@
 //! executor thread while it runs.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use prost::Message;
 use prost_protovalidate::bridge::RuntimeBridge;
@@ -45,6 +45,8 @@ pub struct Validator {
     /// The full names of the set's message types. prost-protovalidate reports a type it lacks
     /// as a runtime error, like a rule that cannot be evaluated, so registration looks it up here.
     types: Arc<HashSet<String>>,
+    /// The request types whose rules registration has warned about, so that each warns once.
+    warned: Arc<Mutex<HashSet<&'static str>>>,
 }
 
 impl Validator {
@@ -73,6 +75,7 @@ impl Validator {
         Self {
             bridge,
             types: Arc::new(types),
+            warned: Arc::default(),
         }
     }
 
@@ -81,7 +84,9 @@ impl Validator {
     /// fails at registration and not on the first call. A rule that only fails to evaluate for
     /// the empty message's default values, such as a division by a field that is 0 by default, is
     /// left to each message's own check, which fails a message it cannot evaluate with
-    /// `Internal`.
+    /// `Internal`. Such a rule is logged as a `tracing` warning, once per request type for a
+    /// validator and its clones: prost-protovalidate reports a rule that names a field the message
+    /// lacks the same way, and it fails every request of the type.
     ///
     /// # Panics
     ///
@@ -93,17 +98,41 @@ impl Validator {
             self.types.contains(full_name),
             "trevrpc-protovalidate: cannot validate {full_name}: no such message type in the set"
         );
-        // An empty message is the empty encoding. prost-protovalidate also reports a rule that
-        // names a field the message lacks as a runtime error, so such a rule fails each call
-        // instead of registration; #722 tracks surfacing it at startup.
+        // An empty message is the empty encoding.
         match self.bridge.validate_wire(full_name, &[]) {
-            Ok(()) | Err(Error::Validation(_) | Error::Runtime(_)) => MessageValidator {
-                bridge: Arc::clone(&self.bridge),
-                full_name,
-            },
+            Ok(()) | Err(Error::Validation(_)) => {}
+            Err(Error::Runtime(error)) => {
+                let first = self
+                    .warned
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(full_name);
+                if first {
+                    warn_unevaluated(full_name, &error);
+                }
+            }
             Err(error) => panic!("trevrpc-protovalidate: cannot validate {full_name}: {error}"),
         }
+        MessageValidator {
+            bridge: Arc::clone(&self.bridge),
+            full_name,
+        }
     }
+}
+
+/// Logs that the rules of `full_name` cannot be evaluated for an empty message. A rule that fails
+/// only for default values, such as a division by a field that is 0 by default, is fine, but
+/// prost-protovalidate also reports a rule that names a field the message lacks this way, which
+/// fails every request of the type: the warning makes that visible at startup.
+fn warn_unevaluated(full_name: &str, error: &impl std::fmt::Display) {
+    tracing::warn!(
+        message_type = full_name,
+        %error,
+        "the buf.validate rules of a request type cannot be evaluated for an empty message; this \
+         is expected of a rule that fails for default values, such as a division by a field that \
+         is 0 by default, but a rule that names a field the message lacks fails every request of \
+         the type with Internal"
+    );
 }
 
 /// Adds the full names of `messages`, and of the messages nested in them, under `prefix`.
