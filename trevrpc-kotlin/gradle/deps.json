@@ -375,12 +375,12 @@
    "jar": "sha256-aJ9b6V+bs2nWwOjbmamfkwsMSNamm0YVF4K1gWx+qCA=",
    "pom": "sha256-JKVfFDkGATHf1ilDJFv995xTauQ3L+9flEa4oBIaOUU="
   },
-  "com/github/luben#zstd-jni/1.5.7-29": {
-   "jar": "sha256-n4X40U2ozI1fnlFz4vwy0p7gSAL1ptuHd82paz/YIXo=",
-   "pom": "sha256-51W+R1KZ+bDCSNuSQBihz7z4o4UgiaO7BCLBNdl+wGY="
+  "com/github/luben#zstd-jni/1.6.0-1": {
+   "jar": "sha256-B/6BVgB+aCF7c3t1hFrx1rKph9eJralmscMRuiocZ5s=",
+   "pom": "sha256-CwKd4SRx8OV/EG1xL3GOu/FtduyxXlhAeE0ZEsu7Dig="
   },
-  "com/github/luben/zstd-jni/1.5.7-29/zstd-jni-1.5.7-29": {
-   "aar": "sha256-nmp8BjZXW0v3OMdoRb4lObgZO5JNcQTptr4TFSPsKYY="
+  "com/github/luben/zstd-jni/1.6.0-1/zstd-jni-1.6.0-1": {
+   "aar": "sha256-+YjftIUG6wvnBzR9XwSvMGbuPOD4v/GdcNGKgR7IpRA="
   },
   "com/google/auto#auto-parent/6": {
    "pom": "sha256-BfdAxmSBZdsAz2GN1WwgDEcl41jm1U9YU+C+wVc06go="
