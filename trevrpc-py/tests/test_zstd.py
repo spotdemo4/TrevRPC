@@ -136,18 +136,18 @@ class MessageTest(unittest.TestCase):
         )
 
 
-def stream_shape(payload: bytes, at_frame_start: bool) -> tuple[int, bytes, bool]:
+def stream_shape(payload: bytes, at_frame_start: bool) -> tuple[int, bool, bytes, bool]:
     """What a compressor's parameters fix in a stream payload, whichever libzstd version writes its
-    blocks: the message size, the frame header when the chunk starts a frame, and whether the chunk
-    ends the frame."""
+    blocks: the message size, whether the chunk is empty, the frame header when the chunk starts a
+    frame, and whether the chunk ends the frame."""
     decoded = decode_varint(payload, 0)
     assert decoded is not None
     size, pos = decoded
     chunk = memoryview(payload)[pos:]
     if not chunk:
-        return size, b"", False
+        return size, True, b"", False
     header = _frame_header(chunk).size if at_frame_start else 0
-    return size, bytes(chunk[:header]), _walk_blocks(chunk, header)
+    return size, False, bytes(chunk[:header]), _walk_blocks(chunk, header)
 
 
 class StreamTest(unittest.TestCase):
@@ -192,7 +192,7 @@ class StreamTest(unittest.TestCase):
                 self.assertEqual(stream_shape(payload, at_frame_start), expected, f"{stream}.{i}")
                 self.assertEqual(decompressor.decompress(payload, MAX), message, f"{stream}.{i}")
                 if expected[0]:
-                    at_frame_start = expected[2]
+                    at_frame_start = expected[3]
                 i += 1
 
     def test_frames_end_at_the_limit_and_restart_from_the_dictionary(self) -> None:

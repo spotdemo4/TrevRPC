@@ -122,15 +122,15 @@ test("the stream golden vectors decode in order, and invalid chunks are rejected
 
 /**
  * What an encoder's parameters fix in a stream payload, whichever libzstd version writes its
- * blocks: the message size, the frame header when the chunk starts a frame, and what the chunk
- * reveals about its frame.
+ * blocks: the message size, whether the chunk is empty, the frame header when the chunk starts a
+ * frame, and what the chunk reveals about its frame.
  */
 function streamShape(payload, atFrameStart) {
   const { value: size, next } = readVarint(payload, 0);
   const chunk = payload.subarray(next);
   const info = parseStreamChunk(chunk, atFrameStart, 16);
   const header = info.startsFrame ? hex(chunk.subarray(0, 2 + [0, 1, 2, 4][chunk[0] & 0x03])) : "";
-  return { size, header, ...info };
+  return { size, empty: chunk.byteLength === 0, header, ...info };
 }
 
 test("the stream encoder writes the golden frame headers and chunks", () => {

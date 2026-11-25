@@ -879,9 +879,9 @@ mod tests {
     }
 
     /// What a sender's parameters fix in a stream payload, whichever libzstd version writes its
-    /// blocks: the message size, the frame header when the chunk starts a frame, and what the
-    /// chunk reveals about its frame.
-    fn shape(payload: &[u8], at_frame_start: bool) -> (u64, Vec<u8>, StreamChunk) {
+    /// blocks: the message size, whether the chunk is empty, the frame header when the chunk starts
+    /// a frame, and what the chunk reveals about its frame.
+    fn shape(payload: &[u8], at_frame_start: bool) -> (u64, bool, Vec<u8>, StreamChunk) {
         let (size, size_len) = varint::decode(payload).unwrap();
         let chunk = &payload[size_len..];
         let info = parse_stream_chunk(chunk, at_frame_start).unwrap();
@@ -890,7 +890,7 @@ mod tests {
         } else {
             Vec::new()
         };
-        (size, header, info)
+        (size, chunk.is_empty(), header, info)
     }
 
     #[test]
@@ -921,7 +921,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{name}.{i}: {error:?}"));
                 assert_eq!(decoded.as_ref(), message.as_slice(), "{name}.{i}");
                 if expected.0 != 0 {
-                    at_frame_start = expected.2.ends_frame;
+                    at_frame_start = expected.3.ends_frame;
                 }
             }
         }

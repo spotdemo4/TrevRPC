@@ -134,11 +134,12 @@ func TestStreamBadVectorsAreRejected(t *testing.T) {
 }
 
 // streamShape is what an encoder's parameters fix in a stream payload,
-// whichever libzstd version writes its blocks: the message size, the frame
-// header when the chunk starts a frame, and what the chunk reveals about its
-// frame.
+// whichever libzstd version writes its blocks: the message size, whether the
+// chunk is empty, the frame header when the chunk starts a frame, and what the
+// chunk reveals about its frame.
 type streamShape struct {
 	size   int
+	empty  bool
 	header string
 	chunk  StreamChunk
 }
@@ -150,7 +151,7 @@ func shapeOf(t testing.TB, payload []byte, atFrameStart bool) streamShape {
 	if err != nil {
 		t.Fatalf("%x: %v", payload, err)
 	}
-	shape := streamShape{size: size, chunk: info}
+	shape := streamShape{size: size, empty: len(chunk) == 0, chunk: info}
 	if info.StartsFrame {
 		shape.header = fmt.Sprintf("%x", chunk[:2+[4]int{0, 1, 2, 4}[chunk[0]&0x03]])
 	}

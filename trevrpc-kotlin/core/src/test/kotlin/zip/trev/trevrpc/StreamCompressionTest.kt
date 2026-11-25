@@ -86,7 +86,7 @@ class StreamCompressionTest {
 
     @Test
     fun `the encoder writes the shared frame headers and chunks`() {
-        for ((name, seed) in listOf("plain" to null, "seeded" to ConfiguredDictionary(dictionary, 1).codec)) {
+        for ((name, seed) in listOf("plain" to null, "seeded" to ConfiguredDictionary(dictionary, 1).codec, "empty" to null)) {
             val encoder = ZstdStreamEncoder(1, seed)
             val streams = responseStreams()
             var atFrameStart = true
@@ -362,9 +362,11 @@ class StreamCompressionTest {
 
 /**
  * What an encoder's parameters fix in a stream chunk, whichever libzstd version writes its blocks:
- * the frame header when the chunk starts a frame, and what the chunk reveals about its frame.
+ * whether the chunk is empty, the frame header when the chunk starts a frame, and what the chunk
+ * reveals about its frame.
  */
 private data class ChunkShape(
+    val empty: Boolean,
     val header: List<Byte>,
     val startsFrame: Boolean,
     val dictionaryId: UInt,
@@ -377,7 +379,7 @@ private data class ChunkShape(
         ): ChunkShape {
             val info = checkNotNull(parseZstdStreamChunk(chunk, atFrameStart))
             val headerSize = if (info.startsFrame) 2 + intArrayOf(0, 1, 2, 4)[chunk[0].toInt() and 0x03] else 0
-            return ChunkShape(chunk.copyOf(headerSize).toList(), info.startsFrame, info.dictionaryId, info.endsFrame)
+            return ChunkShape(chunk.isEmpty(), chunk.copyOf(headerSize).toList(), info.startsFrame, info.dictionaryId, info.endsFrame)
         }
     }
 }
