@@ -164,7 +164,8 @@ IMPAIRED = {
 # model alternates between a good state that loses nothing and a bad one, entered with
 # probability p per packet and left with probability r, that loses 1-h of its packets. These
 # lose about 1% (p 0.5%, r 25%, half the packets of 4-packet bad runs) and about 3% (p 1%,
-# r 20%, 60% of 5-packet bad runs). The random 1% profile stays for comparison.
+# r 20%, 60% of 5-packet bad runs). The access networks below are the realistic case; these
+# stress loss recovery.
 GILBERT_ELLIOTT = [
     "delay 10ms loss gemodel 0.5% 25% 50% 0%",
     "delay 10ms loss gemodel 1% 20% 60% 0%",
@@ -172,7 +173,7 @@ GILBERT_ELLIOTT = [
 
 # Access networks as their measurements describe them, where what users see is delay, a
 # bottleneck with a deep queue, and outages, more than random loss: Wi-Fi and cellular
-# retransmit below IP. A prototype; see the issue that proposed it for the sources.
+# retransmit below IP.
 ACCESS = [
     # Wi-Fi: one medium, so one queue for both directions, at 100 Mbit/s. Pareto slots add 2 ms
     # to the round trip at the median and 19 ms at p90, as Sui et al. (MobiSys 2016) measured on
@@ -234,7 +235,6 @@ TABLES: dict[str, Table] = {
             **IMPAIRED,
             "netem": [
                 "delay 10ms",
-                "delay 10ms loss 1%",
                 *GILBERT_ELLIOTT,
             ],
         },
@@ -242,7 +242,9 @@ TABLES: dict[str, Table] = {
     ),
     "access": Table(
         "Access networks",
-        {**IMPAIRED, "netem": ACCESS},
+        # Deep queues take seconds to fill and settle, and outages every 5 s need several per
+        # window: in 10 s windows, cells swung by up to a quarter between runs.
+        {**IMPAIRED, "duration": 20.0, "warmup": 3.0, "netem": ACCESS},
         lossy,
     ),
     "browser": Table(

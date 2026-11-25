@@ -451,11 +451,15 @@ class TableTest(unittest.TestCase):
             {("rust", "quic"): 12, ("grpc", "grpc"): 9, ("connect", "connect"): 3},
             self.cells("link"),
         )
-        self.assertEqual(24, self.cells("lossy")[("go", "quic")])
-        self.assertEqual(20, self.cells("lossy")[("go", "tcp")])
-        self.assertEqual(16, self.cells("lossy")[("grpc", "grpc")])
-        # The access networks run the same cells as the lossy links, over other profiles.
-        self.assertEqual(self.cells("lossy"), self.cells("access"))
+        # Six cells per profile for Go over QUIC, five over TCP, four for gRPC.
+        self.assertEqual(18, self.cells("lossy")[("go", "quic")])
+        self.assertEqual(15, self.cells("lossy")[("go", "tcp")])
+        self.assertEqual(12, self.cells("lossy")[("grpc", "grpc")])
+        # The access networks run the same cells as the lossy links, over four profiles.
+        lossy = self.cells("lossy")
+        self.assertEqual(
+            {lane: count // 3 * 4 for lane, count in lossy.items()}, self.cells("access")
+        )
         self.assertEqual(
             {("go", "quic"): 12, ("go", "tcp"): 3, ("rust", "quic"): 12, ("rust", "tcp"): 3},
             self.cells("datagrams"),
@@ -517,6 +521,14 @@ class TableTest(unittest.TestCase):
         self.assertEqual(["delay 1ms"], args.netem)
         self.assertEqual([64], args.sizes)
         self.assertEqual(10.0, args.duration)
+
+    def test_impaired_tables_run_long_windows(self) -> None:
+        lossy = run.parse_args(["--table", "lossy", "--baseline", "b"])
+        access = run.parse_args(["--table", "access", "--baseline", "b"])
+
+        self.assertEqual((10.0, 1.0), (lossy.duration, lossy.warmup))
+        # Deep queues and outages every 5 s need longer windows than loss alone.
+        self.assertEqual((20.0, 3.0), (access.duration, access.warmup))
 
 
 class RepeatTest(unittest.TestCase):

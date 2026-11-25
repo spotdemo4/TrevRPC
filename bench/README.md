@@ -72,9 +72,8 @@ reads, with that table's options (scenarios, sizes, concurrency, payload,
 compression modes, netem profiles, messages, duration) as defaults; explicit
 flags still override them. The tables are in [`tables.py`](tables.py):
 `comparison`, `compression`, `link`, `lossy`, `metadata`, `datagrams`,
-`validation`, `browser`, `browser-compression`, and `browser-lossy`, plus
-`access`, a prototype of access-network profiles that is not on the page yet
-(#734). They refer to the packaged servers and clients
+`validation`, `browser`, `browser-compression`, `browser-lossy`, and `access`.
+They refer to the packaged servers and clients
 by name (`go`, `rust`, the baseline's `grpc` and `connect`, and `chromium`) and
 run each native TrevRPC client against its own runtime's server only. Nothing in CI gates on these numbers: the flake
 check runs a very short matrix only to keep the tool working.
@@ -154,7 +153,7 @@ one table per profile, and each JSON record carries the profile as `netem`.
   1-H 1-K`, drops in bursts: it enters a bad state with probability `P` per
   packet, leaves it with probability `R`, and loses `1-H` of the packets in it
   (`1-K` in the good state). The `lossy` table runs two such profiles, of
-  about 1% and 3% loss, beside `loss 1%` for comparison.
+  about 1% and 3% loss, as stress tests of loss recovery.
 - The link has a 1500-byte MTU. A `tbf` qdisc in front of netem segments TCP
   and UDP offload (TSO and GSO) super-packets into frames, as a NIC does, so
   loss applies to each frame. Otherwise netem would drop up to 64 KB of TCP,
@@ -179,7 +178,9 @@ one table per profile, and each JSON record carries the profile as `netem`.
   Outages that would end after the measured window are left out.
 - The `access` table runs profiles of Wi-Fi, roaming Wi-Fi, LTE and 5G on the
   move ([`tables.py`](tables.py) cites the measurements behind each), with the
-  same cells as `lossy`.
+  same cells as `lossy`, in 20 s windows after 3 s of warmup: deep queues take
+  seconds to settle, and in 10 s windows, cells with outages swung by up to a
+  quarter between runs.
 - Size streaming operations to the link. Only operations that finish inside
   the measured window count, and with loss one connection carries far less:
   at a 20 ms round trip and 1% loss, roughly 1 MB/s. The default 100
