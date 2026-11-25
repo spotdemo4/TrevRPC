@@ -3,8 +3,10 @@
 # this file in addition to wire-golden-vectors.txt.
 #
 # The payloads were written by libzstd 1.5.7 at level 1, streams with a 64 KiB
-# window. They lock decoding only: other encoders may write different, equally
-# valid payloads.
+# window. Receivers must decode them as they are. Senders using libzstd are
+# held only to what their parameters fix, the frame headers and where chunks
+# and frames end: other libzstd versions and other encoders may write
+# different, equally valid blocks.
 #
 # Entry kinds (values are lowercase hex; an empty value means zero bytes):
 #   dict.<name>.id           the Dictionary_ID as an unsigned integer in hex

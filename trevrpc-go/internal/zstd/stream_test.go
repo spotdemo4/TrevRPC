@@ -133,9 +133,34 @@ func TestStreamBadVectorsAreRejected(t *testing.T) {
 	}
 }
 
-// TestStreamEncoderWritesTheVectors checks the encoder's parameters: the
-// vectors came from libzstd 1.5.7 at level 1 with a 64 KiB window, which this
-// encoder runs too, so it reproduces them byte for byte.
+// streamShape is what an encoder's parameters fix in a stream payload,
+// whichever libzstd version writes its blocks: the message size, the frame
+// header when the chunk starts a frame, and what the chunk reveals about its
+// frame.
+type streamShape struct {
+	size   int
+	header string
+	chunk  StreamChunk
+}
+
+func shapeOf(t testing.TB, payload []byte, atFrameStart bool) streamShape {
+	t.Helper()
+	size, chunk := splitStreamPayload(t, payload)
+	info, err := ParseStreamChunk(chunk, atFrameStart, StreamWindowLog)
+	if err != nil {
+		t.Fatalf("%x: %v", payload, err)
+	}
+	shape := streamShape{size: size, chunk: info}
+	if info.StartsFrame {
+		shape.header = fmt.Sprintf("%x", chunk[:2+[4]int{0, 1, 2, 4}[chunk[0]&0x03]])
+	}
+	return shape
+}
+
+// TestStreamEncoderWritesTheVectors checks the encoder's parameters: libzstd
+// at level 1 with a 64 KiB window writes the vectors' frame headers and chunk
+// boundaries, though another version may write other blocks, and a fresh
+// decoder decodes what it writes.
 func TestStreamEncoderWritesTheVectors(t *testing.T) {
 	v := loadVectors(t)
 	d1 := newD1(t, v)
@@ -149,11 +174,18 @@ func TestStreamEncoderWritesTheVectors(t *testing.T) {
 		}
 		payloads, messages := streamSequence(v, test.name)
 		var written [][]byte
+		atFrameStart := true
 		for i, message := range messages {
 			got := appendStreamPayload(t, encoder, message)
+			want := shapeOf(t, payloads[i], atFrameStart)
 			// Other encoders write other, equally valid, chunks.
-			if libzstd && !bytes.Equal(got, payloads[i]) {
-				t.Fatalf("stream.%s.%d payload = %x, want %x", test.name, i, got, payloads[i])
+			if libzstd {
+				if shape := shapeOf(t, got, atFrameStart); shape != want {
+					t.Fatalf("stream.%s.%d payload %x is %+v, want %+v", test.name, i, got, shape, want)
+				}
+			}
+			if want.size != 0 {
+				atFrameStart = want.chunk.EndsFrame
 			}
 			written = append(written, got)
 		}

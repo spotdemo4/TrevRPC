@@ -16,6 +16,10 @@
 %% back when they end.
 -module(trevrpc_zstd_stream).
 
+-ifdef(TEST).
+-export([parse_chunk/2]).
+-endif.
+
 -export([
     budget/1,
     reserve/2,

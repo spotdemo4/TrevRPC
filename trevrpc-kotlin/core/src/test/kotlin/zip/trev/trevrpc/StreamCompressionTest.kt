@@ -85,17 +85,28 @@ class StreamCompressionTest {
     }
 
     @Test
-    fun `the encoder writes the shared payloads byte for byte`() {
+    fun `the encoder writes the shared frame headers and chunks`() {
         for ((name, seed) in listOf("plain" to null, "seeded" to ConfiguredDictionary(dictionary, 1).codec)) {
             val encoder = ZstdStreamEncoder(1, seed)
+            val streams = responseStreams()
+            var atFrameStart = true
             var index = 0
             while (vectors.containsKey("stream.$name.$index.payload")) {
                 val message = vectors.getValue("stream.$name.$index.message")
-                val payload = QuicVarint.encode(message.size.toLong()) + encoder.compress(message)
-                assertArrayEquals(vectors.getValue("stream.$name.$index.payload"), payload, "$name $index")
+                val shared = vectors.getValue("stream.$name.$index.payload")
+                val prefix = QuicVarint.encode(message.size.toLong())
+                assertArrayEquals(prefix, shared.copyOf(prefix.size), "$name $index")
+                // Other libzstd versions may write other blocks than the vectors' libzstd did.
+                val expected = ChunkShape.of(shared.copyOfRange(prefix.size, shared.size), atFrameStart)
+                val chunk = encoder.compress(message)
+                assertEquals(expected, ChunkShape.of(chunk, atFrameStart), "$name $index")
+                val received = streams.inflate(streamMessage(prefix + chunk), DEFAULT_MAX_FRAME_SIZE)
+                assertArrayEquals(message, received.body, "$name $index")
+                if (message.isNotEmpty()) atFrameStart = expected.endsFrame
                 index++
             }
             encoder.close()
+            streams.close()
         }
         val encoder = ZstdStreamEncoder(1, null)
         assertEquals(0, encoder.compress(ByteArray(0)).size)
@@ -347,4 +358,26 @@ class StreamCompressionTest {
         message: String? = null,
     ) = org.junit.jupiter.api.Assertions
         .assertTrue(condition, message)
+}
+
+/**
+ * What an encoder's parameters fix in a stream chunk, whichever libzstd version writes its blocks:
+ * the frame header when the chunk starts a frame, and what the chunk reveals about its frame.
+ */
+private data class ChunkShape(
+    val header: List<Byte>,
+    val startsFrame: Boolean,
+    val dictionaryId: UInt,
+    val endsFrame: Boolean,
+) {
+    companion object {
+        fun of(
+            chunk: ByteArray,
+            atFrameStart: Boolean,
+        ): ChunkShape {
+            val info = checkNotNull(parseZstdStreamChunk(chunk, atFrameStart))
+            val headerSize = if (info.startsFrame) 2 + intArrayOf(0, 1, 2, 4)[chunk[0].toInt() and 0x03] else 0
+            return ChunkShape(chunk.copyOf(headerSize).toList(), info.startsFrame, info.dictionaryId, info.endsFrame)
+        }
+    }
 }

@@ -1474,7 +1474,12 @@ server_compression_test(Env) ->
     %% Compressed with the dictionary the client accepts.
     [{zstd_message, Payload}, {status, #{code := ok}}] =
         raw_frames(Channel, [Request(#{accept_dictionaries => [1]}), Body]),
-    ?assertEqual(golden(<<"ok.small.payload">>), Payload),
+    %% It decompresses with that dictionary, though another libzstd version may
+    %% write other blocks than ok.small.payload holds.
+    ?assertEqual(
+        {ok, Message, 1},
+        trevrpc_zstd:inflate(trevrpc_zstd_tests:config(), [1], Payload, 1 bsl 20)
+    ),
     ?assertMatch(
         [{message, Message}, {status, _}], raw_frames(Channel, [Request(#{}), Body])
     ),

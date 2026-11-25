@@ -18,8 +18,8 @@ import (
 	kzstd "github.com/klauspost/compress/zstd"
 )
 
-// libzstd reports that the codec is libzstd, whose output the golden vectors
-// hold byte for byte.
+// libzstd reports that the codec is libzstd, which writes the frame headers
+// and chunk boundaries the golden vectors hold.
 const libzstd = false
 
 // frameMagic is the Magic_Number that starts every zstd frame klauspost

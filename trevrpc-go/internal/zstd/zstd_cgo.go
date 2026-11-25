@@ -37,7 +37,7 @@ import (
 	_ "github.com/DataDog/zstd" // links libzstd
 )
 
-// Parameter IDs and values from zstd.h 1.5.7.
+// Parameter IDs and values from zstd.h, which keeps them across versions.
 const (
 	cParamChecksum    = 201  // ZSTD_c_checksumFlag
 	cParamDictID      = 202  // ZSTD_c_dictIDFlag
@@ -47,8 +47,8 @@ const (
 	formatMagicless   = 1    // ZSTD_f_zstd1_magicless
 )
 
-// libzstd reports that the codec is libzstd, whose output the golden vectors
-// hold byte for byte.
+// libzstd reports that the codec is libzstd, which writes the frame headers
+// and chunk boundaries the golden vectors hold.
 const libzstd = true
 
 // Dict is a dictionary digested for both directions, or, from NewPlain, the

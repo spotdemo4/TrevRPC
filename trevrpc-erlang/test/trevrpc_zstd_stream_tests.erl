@@ -77,22 +77,48 @@ a_chunk_must_decompress_to_its_size_test() ->
     [_, {Second, _} | _] = sequence(<<"plain">>),
     ?assertMatch({error, {invalid, _}}, trevrpc_zstd_stream:decode(Decoder, Second, ?MAX)).
 
-senders_write_the_golden_payloads_test_() ->
-    %% OTP compresses with libzstd 1.5.7 at level 1, as the vectors do.
+%% What an encoder's parameters fix in a stream payload, whichever libzstd
+%% version writes its blocks: the message size, the frame header when the
+%% chunk starts a frame, and what the chunk reveals about its frame.
+shape(Payload, AtFrameStart) ->
+    {Size, Chunk} = qmux_varint:decode(Payload),
+    Parsed = trevrpc_zstd_stream:parse_chunk(Chunk, AtFrameStart),
+    Header =
+        case {Parsed, Chunk} of
+            {{true, _, _}, <<_:6, DictFlag:2, _/binary>>} ->
+                binary:part(Chunk, 0, 2 + element(DictFlag + 1, {0, 1, 2, 4}));
+            _ ->
+                <<>>
+        end,
+    {Size, Header, Parsed}.
+
+senders_write_the_golden_frame_headers_and_chunks_test_() ->
+    %% Other libzstd versions may write other blocks than the vectors'
+    %% libzstd did, so the encoder is held to what its parameters fix, and a
+    %% fresh decoder must decode its chunks.
     [
         {binary_to_list(Name), fun() ->
             {ok, Encoder} = trevrpc_zstd_stream:encoder(config(), Seed, 1),
+            Decoder = trevrpc_zstd_stream:decoder(config(), all),
             lists:foldl(
-                fun({Payload, Message}, Enc) ->
-                    {Out, Next} = trevrpc_zstd_stream:encode(Enc, Message),
-                    ?assertEqual(Payload, iolist_to_binary(Out)),
-                    Next
+                fun({Payload, Message}, {Enc, Dec, AtFrameStart}) ->
+                    {Out, NextEnc} = trevrpc_zstd_stream:encode(Enc, Message),
+                    Written = iolist_to_binary(Out),
+                    Expected = shape(Payload, AtFrameStart),
+                    ?assertEqual(Expected, shape(Written, AtFrameStart)),
+                    {ok, Message, NextDec} = trevrpc_zstd_stream:decode(Dec, Written, ?MAX),
+                    Next =
+                        case Expected of
+                            {0, _, _} -> AtFrameStart;
+                            {_, _, {_, _, Ends}} -> Ends
+                        end,
+                    {NextEnc, NextDec, Next}
                 end,
-                Encoder,
+                {Encoder, Decoder, true},
                 sequence(Name)
             )
         end}
-     || {Name, Seed} <- [{<<"plain">>, 0}, {<<"seeded">>, 1}]
+     || {Name, Seed} <- [{<<"plain">>, 0}, {<<"seeded">>, 1}, {<<"empty">>, 0}]
     ].
 
 message(I) ->

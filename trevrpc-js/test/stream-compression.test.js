@@ -26,7 +26,7 @@ import {
   MaxReplayBytes,
   StreamBudget,
 } from "../src/stream-compression.js";
-import { varintLength, writeVarint } from "../src/varint.js";
+import { readVarint, varintLength, writeVarint } from "../src/varint.js";
 import { StreamCompression } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import {
@@ -120,19 +120,40 @@ test("the stream golden vectors decode in order, and invalid chunks are rejected
   );
 });
 
-test("the stream encoder writes the golden payloads", () => {
+/**
+ * What an encoder's parameters fix in a stream payload, whichever libzstd version writes its
+ * blocks: the message size, the frame header when the chunk starts a frame, and what the chunk
+ * reveals about its frame.
+ */
+function streamShape(payload, atFrameStart) {
+  const { value: size, next } = readVarint(payload, 0);
+  const chunk = payload.subarray(next);
+  const info = parseStreamChunk(chunk, atFrameStart, 16);
+  const header = info.startsFrame ? hex(chunk.subarray(0, 2 + [0, 1, 2, 4][chunk[0] & 0x03])) : "";
+  return { size, header, ...info };
+}
+
+test("the stream encoder writes the golden frame headers and chunks", () => {
   for (const [group, start] of [
     ["stream.plain", undefined],
     ["stream.seeded", dictionary],
     ["stream.empty", undefined],
   ]) {
     const encoder = withDictionary.streamEncoder(start, 16);
+    const receiver = responseReceiver();
+    let atFrameStart = true;
     for (const [index, { payload, message }] of sequence(group).entries()) {
       const body = fromHex(message);
       const chunk = encoder.encode(body);
       const written = new Uint8Array(varintLength(body.byteLength) + chunk.byteLength);
       written.set(chunk, writeVarint(written, 0, body.byteLength));
-      assert.equal(hex(written), hex(payload), `${group}.${index}`);
+      // Other libzstd versions may write other blocks than the vectors' libzstd did.
+      const expected = streamShape(payload, atFrameStart);
+      assert.deepEqual(streamShape(written, atFrameStart), expected, `${group}.${index}`);
+      assert.equal(hex(receiver.receive(written, 4096)), message, `${group}.${index}`);
+      if (expected.size !== 0) {
+        atFrameStart = expected.endsFrame;
+      }
     }
     encoder.close();
   }

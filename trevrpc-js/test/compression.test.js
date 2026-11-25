@@ -126,10 +126,40 @@ test("golden payloads decompress, and invalid ones are rejected", () => {
   assert.throws(() => inflateMessage(new Map(), small, 4096), isStatus(Code.Internal));
 });
 
-test("compressing writes the golden frame, and only when it is shorter", () => {
+/**
+ * The frame header of a ZSTD_MESSAGE payload, which the compression parameters fix whichever
+ * libzstd version writes the blocks after it: Frame_Header_Descriptor, Window_Descriptor unless
+ * Single_Segment_flag is set, Dictionary_ID and Frame_Content_Size.
+ */
+function frameHeader(payload) {
+  const descriptor = payload[0];
+  const singleSegment = (descriptor & 0x20) !== 0;
+  const contentSizeLength = [singleSegment ? 1 : 0, 2, 4, 8][descriptor >> 6];
+  return payload.subarray(
+    0,
+    1 + (singleSegment ? 0 : 1) + [0, 1, 2, 4][descriptor & 0x03] + contentSizeLength,
+  );
+}
+
+test("compressing writes the golden frame header, and only when it is shorter", () => {
   const message = fromHex(vectors.get("ok.small.message"));
+  const compressed = encodeMessage(message, dictionary);
+  assert.equal(compressed.type, FrameType.ZstdMessage);
+  assert.equal(compressed.size, message.byteLength);
   assert.equal(
-    hex(encodeOutgoingFrame(encodeMessage(message, dictionary))),
+    hex(frameHeader(compressed.payload)),
+    hex(frameHeader(fromHex(vectors.get("ok.small.payload")))),
+  );
+  assert.equal(hex(inflateMessage(accepting(dictionary), compressed.payload, 4096)), hex(message));
+  const golden = fromHex(vectors.get("zstd_message.small.payload"));
+  assert.equal(
+    hex(
+      encodeOutgoingFrame({
+        type: FrameType.ZstdMessage,
+        payload: golden,
+        size: message.byteLength,
+      }),
+    ),
     vectors.get("zstd_message.small.frame"),
   );
   const random = Uint8Array.from({ length: 64 }, (_, index) => (index * 151 + 7) % 256);

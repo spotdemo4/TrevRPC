@@ -878,24 +878,51 @@ mod tests {
         ));
     }
 
+    /// What a sender's parameters fix in a stream payload, whichever libzstd version writes its
+    /// blocks: the message size, the frame header when the chunk starts a frame, and what the
+    /// chunk reveals about its frame.
+    fn shape(payload: &[u8], at_frame_start: bool) -> (u64, Vec<u8>, StreamChunk) {
+        let (size, size_len) = varint::decode(payload).unwrap();
+        let chunk = &payload[size_len..];
+        let info = parse_stream_chunk(chunk, at_frame_start).unwrap();
+        let header = if info.starts_frame {
+            chunk[..parse_frame_header(chunk).unwrap().0].to_vec()
+        } else {
+            Vec::new()
+        };
+        (size, header, info)
+    }
+
     #[test]
-    fn senders_write_the_golden_payloads() {
-        // Both runtimes compress with libzstd 1.5.7 at level 1, so they write the same bytes.
+    fn senders_write_the_golden_frame_headers_and_chunks() {
+        // Other libzstd versions may write other blocks than the vectors' libzstd did, so the
+        // sender is held to what its parameters fix, and a fresh receiver must decode its chunks.
         let config = config();
         let dict = config.dict(1).unwrap();
-        for (name, dict) in [("plain", None), ("seeded", Some(dict.as_ref()))] {
+        for (name, dict) in [
+            ("plain", None),
+            ("seeded", Some(dict.as_ref())),
+            ("empty", None),
+        ] {
             let budget = StreamBudget::new(usize::MAX).unwrap();
             let mut encoder = StreamEncoder {
                 context: StreamEncoder::context(1, dict).unwrap(),
                 in_frame: 0,
                 _reservation: budget.reserve(0).unwrap(),
             };
+            let mut receiver = inflater();
+            let mut at_frame_start = true;
             for (i, (payload, message)) in sequence(name).iter().enumerate() {
-                assert_eq!(
-                    encoder.encode(message).unwrap().as_ref(),
-                    payload.as_slice(),
-                    "{name}.{i}"
-                );
+                let written = encoder.encode(message).unwrap();
+                let expected = shape(payload, at_frame_start);
+                assert_eq!(shape(&written, at_frame_start), expected, "{name}.{i}");
+                let decoded = receiver
+                    .decode(&written, crate::framing::DEFAULT_MAX_FRAME_SIZE)
+                    .unwrap_or_else(|error| panic!("{name}.{i}: {error:?}"));
+                assert_eq!(decoded.as_ref(), message.as_slice(), "{name}.{i}");
+                if expected.0 != 0 {
+                    at_frame_start = expected.2.ends_frame;
+                }
             }
         }
     }

@@ -237,6 +237,15 @@
       "separateMajorMinor": false
     },
 
+    // group the zstd-rs crates, whose bundled libzstd both trevrpc-rust and the JS wasm module
+    // (trevrpc-js/zstd-wasm) compile, so the two move to a new libzstd in one PR
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["zstd-safe", "zstd-sys"],
+      "groupName": "zstd-rs",
+      "separateMajorMinor": false
+    },
+
     // group connectrpc (go & js)
     {
       "matchManagers": ["gomod", "npm"],

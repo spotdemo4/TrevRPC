@@ -82,14 +82,22 @@ nothing_is_accepted_without_negotiation_test() ->
     %% A client accepts only the dictionaries it listed.
     ?assertMatch({error, {invalid, _}}, trevrpc_zstd:inflate(config(), [0], Payload, 1 bsl 20)).
 
+%% The frame header of a ZSTD_MESSAGE payload, which the compression
+%% parameters fix whichever libzstd version writes the blocks after it.
+frame_header(<<FcsFlag:2, Single:1, _:3, DictFlag:2, _/binary>> = Payload) ->
+    SizeLength = element(FcsFlag + 1, {Single, 2, 4, 8}),
+    DictLength = element(DictFlag + 1, {0, 1, 2, 4}),
+    binary:part(Payload, 0, 2 - Single + DictLength + SizeLength).
+
 compression_round_trips_and_skips_incompressible_messages_test() ->
     Vectors = vectors(),
     Config = config(),
     Message = maps:get(<<"ok.small.message">>, Vectors),
     {ok, Payload} = trevrpc_zstd:compress(Config, 1, Message),
     ?assertEqual({ok, 1, 71}, trevrpc_zstd:parse_header(Payload)),
-    %% libzstd writes what the vectors hold: no magic number, no checksum.
-    ?assertEqual(maps:get(<<"ok.small.payload">>, Vectors), Payload),
+    %% libzstd writes the vectors' frame header: no magic number, no checksum.
+    %% Other versions may write other blocks after it.
+    ?assertEqual(frame_header(maps:get(<<"ok.small.payload">>, Vectors)), frame_header(Payload)),
     ?assertEqual(0, binary:first(Payload) band 16#04),
     ?assertEqual({ok, Message, 1}, trevrpc_zstd:inflate(Config, [1], Payload, 1 bsl 20)),
     ?assertEqual(

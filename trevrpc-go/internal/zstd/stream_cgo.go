@@ -83,7 +83,7 @@ import (
 	"unsafe"
 )
 
-// Parameter IDs and values from zstd.h 1.5.7, beside those of zstd_cgo.go.
+// Parameter IDs and values from zstd.h, beside those of zstd_cgo.go.
 const (
 	cParamLevel     = 100 // ZSTD_c_compressionLevel
 	cParamWindowLog = 101 // ZSTD_c_windowLog

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from trevrpc._frames import FrameType, encode_frame
+from trevrpc._varint import decode_varint
 from trevrpc._wire import DictionaryInfo, RpcAnswer, RpcRequest, RpcStatus, StreamCompression
 from trevrpc._zstd import (
     STREAM_FRAME_LIMIT,
@@ -18,6 +19,8 @@ from trevrpc._zstd import (
     MessageCompressor,
     StreamCompressor,
     StreamDecompressor,
+    _frame_header,  # pyright: ignore[reportPrivateUsage]
+    _walk_blocks,  # pyright: ignore[reportPrivateUsage]
     decompress_message,
     load_dictionary,
 )
@@ -122,6 +125,8 @@ class MessageTest(unittest.TestCase):
             payload = compressor.compress(message)
             assert payload is not None
             self.assertEqual(decompress_message(payload, accepting(plain=False), MAX), message)
+            # The parameters fix the frame header; other libzstd versions may write other blocks.
+            self.assertEqual(_frame_header(payload), _frame_header(b("ok.small.payload")))
         self.assertIsNone(MessageCompressor(None, 1).compress(b("ok.raw_block.message")))
 
     def test_frames(self) -> None:
@@ -129,6 +134,20 @@ class MessageTest(unittest.TestCase):
             encode_frame(FrameType.ZSTD_MESSAGE, b("zstd_message.small.payload")),
             b("zstd_message.small.frame"),
         )
+
+
+def stream_shape(payload: bytes, at_frame_start: bool) -> tuple[int, bytes, bool]:
+    """What a compressor's parameters fix in a stream payload, whichever libzstd version writes its
+    blocks: the message size, the frame header when the chunk starts a frame, and whether the chunk
+    ends the frame."""
+    decoded = decode_varint(payload, 0)
+    assert decoded is not None
+    size, pos = decoded
+    chunk = memoryview(payload)[pos:]
+    if not chunk:
+        return size, b"", False
+    header = _frame_header(chunk).size if at_frame_start else 0
+    return size, bytes(chunk[:header]), _walk_blocks(chunk, header)
 
 
 class StreamTest(unittest.TestCase):
@@ -159,13 +178,21 @@ class StreamTest(unittest.TestCase):
                 decompressor.decompress(b(f"stream_too_large.{name}.payload"), MAX)
             self.assertEqual(caught.exception.kind, "too_large", name)
 
-    def test_compressor_writes_the_vectors(self) -> None:
-        for stream, dictionary in (("plain", None), ("seeded", D1)):
+    def test_compressor_writes_the_frame_headers_and_chunks_of_the_vectors(self) -> None:
+        # Other libzstd versions may write other blocks than the vectors' libzstd did.
+        for stream, dictionary in (("plain", None), ("seeded", D1), ("empty", None)):
             compressor = StreamCompressor(dictionary, 1)
+            decompressor = StreamDecompressor(accepting(plain=True))
+            at_frame_start = True
             i = 0
             while f"stream.{stream}.{i}.payload" in GOLDEN:
-                payload = compressor.compress(b(f"stream.{stream}.{i}.message"))
-                self.assertEqual(payload, b(f"stream.{stream}.{i}.payload"), f"{stream}.{i}")
+                message = b(f"stream.{stream}.{i}.message")
+                payload = compressor.compress(message)
+                expected = stream_shape(b(f"stream.{stream}.{i}.payload"), at_frame_start)
+                self.assertEqual(stream_shape(payload, at_frame_start), expected, f"{stream}.{i}")
+                self.assertEqual(decompressor.decompress(payload, MAX), message, f"{stream}.{i}")
+                if expected[0]:
+                    at_frame_start = expected[2]
                 i += 1
 
     def test_frames_end_at_the_limit_and_restart_from_the_dictionary(self) -> None:
