@@ -6,6 +6,7 @@
 -export([run_tests/0]).
 -export([credentials/0, remove/1, sleep/1, register_self/1, is_alive/1, monitor/1, wait_down/2]).
 -export([quietly/1]).
+-export([inbox/0, send/2, receive_within/1]).
 -export([http_exchange/6, http_status_for/4, http_unfinished/3, http_upload_in_two/5]).
 
 %% Runs the tests in trevrpc_test, with eunit's timeouts scaled as gleeunit
@@ -61,6 +62,20 @@ wait_down(Ref, Timeout) ->
     after Timeout ->
         erlang:demonitor(Ref, [flush]),
         false
+    end.
+
+%% The calling process, to which `send/2' sends what `receive_within/1'
+%% takes there, as the hooks of the server's calls report to the test.
+inbox() -> self().
+
+send(Inbox, Message) ->
+    Inbox ! {trevrpc_test, Message},
+    nil.
+
+receive_within(Timeout) ->
+    receive
+        {trevrpc_test, Message} -> {ok, Message}
+    after Timeout -> {error, nil}
     end.
 
 %% Sends a request over `Version' (`h3', `h2' or `h1') to the server on

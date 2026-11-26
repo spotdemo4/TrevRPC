@@ -34,6 +34,13 @@
 %% the race between a call that finishes and a deadline or cancellation
 %% that ends it: exactly one of them writes the call's end.
 %%
+%% The finish functions a call's interceptors registered are kept here
+%% too, as the call process sends each ({@link intercepted/5}), and run
+%% from here once, in a process of their own: with the status the call
+%% process reports after it wrote its STATUS ({@link finished/4}), or with
+%% the status of whatever else ended it, since a call process that was
+%% stopped cannot run them itself.
+%%
 %% A native QUIC connection, a QMux session and a WebTransport session keep
 %% the connection metadata sets their client offered, at most four, in an
 %% ETS table this process creates with the first and alone writes, so that
@@ -45,6 +52,7 @@
 -behaviour(gen_server).
 
 -export([start/2, start_qmux/3, start_http/3, serve_h3/4, shutdown/1, admit/4, finish/3, reserve/4]).
+-export([intercepted/5, finished/4]).
 -export([store_connection_metadata/3, connection_metadata/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -74,7 +82,13 @@
     %% Stream compression memory the call holds, given back when it ends.
     reserved = 0 :: non_neg_integer(),
     %% The call's datagram flow, registered until the stream is forgotten.
-    flow :: pos_integer() | undefined
+    flow :: pos_integer() | undefined,
+    %% When the stream opened, in native time units.
+    started :: integer(),
+    %% The finish functions the call's interceptors registered, the last
+    %% first, until they run, and what they get of the call's method.
+    finishes = [] :: [trevrpc_server:finish()],
+    method :: map() | undefined
 }).
 
 -record(state, {
@@ -92,8 +106,8 @@
     %% Processes waiting for the send queue to drain.
     send_waiters = [] :: [{pid(), reference()}],
     stopping = false :: boolean(),
-    %% The client's address, for the HTTP admission: looked up at the first
-    %% request over HTTP/3.
+    %% The client's address, for the HTTP admission and the calls: looked
+    %% up at the first request or stream over native QUIC and HTTP/3.
     peer :: {inet:ip_address(), inet:port_number()} | undefined | unknown,
     %% The TLS server name the client sent, which its HTTP requests must
     %% name (see trevrpc_http:misdirected/2), or `undefined' when they are
@@ -192,6 +206,20 @@ start_http(Kind, Socket, Config) ->
 serve_h3(Pid, H3, Quic, ServerName) ->
     gen_server:call(Pid, {h3, H3, Quic, ServerName}).
 
+%% @doc Keeps `Finish', a finish function that an interceptor of the call
+%% on stream `Id' registered, to run once the call ends, with `Method', what
+%% it gets of the call's method (see {@link trevrpc_server:finished()}).
+%% Called by the call process, which may be stopped at any moment.
+-spec intercepted(pid(), non_neg_integer(), reference(), trevrpc_server:finish(), map()) -> ok.
+intercepted(Pid, Id, Ref, Finish, Method) ->
+    gen_server:cast(Pid, {intercepted, Id, Ref, Finish, Method}).
+
+%% @doc Runs the finish functions of the call on stream `Id', which ended
+%% with `Status' once it wrote its end.
+-spec finished(pid(), non_neg_integer(), reference(), trevrpc_status:status()) -> ok.
+finished(Pid, Id, Ref, Status) ->
+    gen_server:cast(Pid, {finished, Id, Ref, Status}).
+
 %% @doc Cancels every call, waits for their handlers up to the graceful
 %% shutdown timeout, then closes the connection.
 -spec shutdown(pid()) -> ok.
@@ -275,8 +303,17 @@ connection_metadata({_Pid, Table}, Id) ->
 
 %%% gen_server
 
--spec init({trevrpc_transport:t() | undefined, trevrpc_server:config()}) -> {ok, #state{}}.
+-spec init(
+    {trevrpc_transport:t() | undefined, trevrpc_server:config()}
+    | {
+        trevrpc_transport:t() | undefined,
+        trevrpc_server:config(),
+        {inet:ip_address(), inet:port_number()} | undefined | unknown
+    }
+) -> {ok, #state{}}.
 init({Transport, Config}) ->
+    init({Transport, Config, undefined});
+init({Transport, Config, Peer}) ->
     %% Call processes are linked, so they die with this process however it
     %% exits; their own exits arrive as messages, and as the monitors' DOWN.
     process_flag(trap_exit, true),
@@ -286,7 +323,7 @@ init({Transport, Config}) ->
     %% Exits with the server.
     monitor(process, maps:get(server, Config)),
     Flows = trevrpc_datagram_flows:new(server, 2 * maps:get(max_streams_per_connection, Config)),
-    {ok, #state{transport = Transport, config = Config, flows = Flows}}.
+    {ok, #state{transport = Transport, config = Config, flows = Flows, peer = Peer}}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
 handle_call({h3, H3, Quic, ServerName}, _From, #state{transport = {quic, Quic}} = State) ->
@@ -341,7 +378,27 @@ handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
 handle_cast({connection_metadata, Id, Set}, State) ->
     {noreply, store_metadata(Id, Set, State)};
-handle_cast({qmux, Socket, Opts}, #state{config = Config} = State) ->
+handle_cast({intercepted, Id, Ref, Finish, Method}, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Id := #entry{ref = Ref, finishes = Finishes} = Entry} ->
+            Intercepted = Entry#entry{finishes = [Finish | Finishes], method = Method},
+            {noreply, State#state{streams = Streams#{Id := Intercepted}}};
+        _ ->
+            {noreply, State}
+    end;
+handle_cast({finished, Id, Ref, Status}, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Id := #entry{state = finishing, ref = Ref} = Entry} ->
+            {noreply, State#state{streams = Streams#{Id := run_finishes(Entry, Status)}}};
+        _ ->
+            {noreply, State}
+    end;
+handle_cast({qmux, Socket, Opts}, #state{config = Config} = State0) ->
+    State =
+        case ssl:peername(Socket) of
+            {ok, Peer} -> State0#state{peer = Peer};
+            {error, _} -> State0#state{peer = unknown}
+        end,
     case qmux:start({qmux_ssl, Socket}, server, self(), maps:merge(maps:get(qmux, Config), Opts)) of
         {ok, Session, Queue} ->
             {noreply, State#state{
@@ -450,6 +507,7 @@ terminate(_Reason, #state{streams = Streams, sessions = Sessions} = State) ->
     %% Calls still in flight, as when the connection closes under them,
     %% give their slots in the server's request limit back.
     _ = maps:fold(fun release/3, State, Streams),
+    _ = [run_finishes(Entry, ended_status(State)) || Entry <- maps:values(Streams)],
     %% Writers waiting for the send queue that outlive their call, as a
     %% call's datagram sender may, stop waiting.
     _ = [Pid ! {trevrpc_stream, Ref, closed} || {Pid, Ref} <- State#state.send_waiters],
@@ -539,17 +597,19 @@ full(#state{active = Active, config = #{max_streams_per_connection := Max}}) ->
     Active >= Max.
 
 %% Starts the call of the stream that opened, which reads its REQUEST.
-open_stream(Id, #state{active = Active, config = Config} = State) ->
+open_stream(Id, #state{active = Active, config = Config} = State0) ->
     Ref = make_ref(),
+    {Peer, State} = peer(State0),
     {Pid, Monitor} = trevrpc_server_call:start(#{
         transport => State#state.transport,
         id => Id,
         ref => Ref,
         router => self(),
         config => Config,
-        connection_metadata => State#state.metadata_sets
+        connection_metadata => State#state.metadata_sets,
+        peer => Peer
     }),
-    Entry = #entry{ref = Ref, pid = Pid, monitor = Monitor},
+    Entry = #entry{ref = Ref, pid = Pid, monitor = Monitor, started = erlang:monotonic_time()},
     State#state{
         streams = (State#state.streams)#{Id => Entry},
         monitors = (State#state.monitors)#{Monitor => Id},
@@ -702,7 +762,12 @@ start_fallback(Id, Method, Target, Headers, Peer, State) ->
                 }
             }),
             Entry = #entry{
-                kind = fallback, state = running, ref = Ref, pid = Pid, monitor = Monitor
+                kind = fallback,
+                state = running,
+                ref = Ref,
+                pid = Pid,
+                monitor = Monitor,
+                started = erlang:monotonic_time()
             },
             State#state{
                 streams = (State#state.streams)#{Id => Entry},
@@ -818,10 +883,11 @@ connect(Id, Target, Headers, #state{config = #{webtransport := WebTransport}} = 
 %% refused or reset the request, and `{ok, Session}' once the session's
 %% `init/3' ran and the `200' went out. A session that ends later takes
 %% its connection process with it, which ends its entry here.
-accept_session(Id, Headers, #{session := SessionOpts}, State) ->
-    #state{transport = {h3, H3, Quic}, config = Config, sessions = Sessions} = State,
+accept_session(Id, Headers, #{session := SessionOpts}, State0) ->
+    #state{transport = {h3, H3, Quic}, config = Config, sessions = Sessions} = State0,
     #{max_frame_size := MaxFrame, max_streams_per_connection := MaxStreams} = Config,
-    {ok, Conn} = gen_server:start(?MODULE, {undefined, Config}, []),
+    {Peer, State} = peer(State0),
+    {ok, Conn} = gen_server:start(?MODULE, {undefined, Config, Peer}, []),
     Monitor = monitor(process, Conn),
     Opts = SessionOpts#{
         transport => h3,
@@ -843,19 +909,23 @@ accept_session(Id, Headers, #{session := SessionOpts}, State) ->
             State
     end.
 
-%% The client's address: from the socket over HTTP/2, from the QUIC
-%% connection over HTTP/3, the first time it is asked.
+%% The client's address: from the socket over HTTP/2, HTTP/1.1 and QMux,
+%% from the QUIC connection over native QUIC and HTTP/3, the first time it
+%% is asked, and from the HTTP/3 connection for its WebTransport session.
+peer(#state{peer = undefined, transport = {Kind, Quic}} = State) when Kind =:= quic ->
+    peer(State#state{peer = quic_peer(Quic)});
 peer(#state{peer = undefined, transport = {h3, _H3, Quic}} = State) ->
-    Peer =
-        case quic:peername(Quic) of
-            {ok, Address} -> Address;
-            {error, _} -> unknown
-        end,
-    peer(State#state{peer = Peer});
+    peer(State#state{peer = quic_peer(Quic)});
 peer(#state{peer = Peer} = State) when is_tuple(Peer) ->
     {Peer, State};
 peer(State) ->
     {undefined, State}.
+
+quic_peer(Quic) ->
+    case quic:peername(Quic) of
+        {ok, Address} -> Address;
+        {error, _} -> unknown
+    end.
 
 %% HTTP/2 and HTTP/1.1 responses advertise HTTP/3; HTTP/3 ones need not.
 http_options(#state{transport = {h3, _, _}, config = #{http := Http}}) ->
@@ -1171,20 +1241,25 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
         #{Id := #entry{state = starting} = Entry} when Reason =:= normal ->
             %% Its stream went before its REQUEST did.
             maybe_close(remove(Id, release(Id, Entry, State)));
-        #{Id := #entry{state = finishing}} ->
+        #{Id := #entry{state = finishing} = Entry} ->
+            %% A call stopped while it wrote its end, which it could not
+            %% report.
+            _ = run_finishes(Entry, ended_status(State)),
             maybe_close(remove(Id, State));
-        #{Id := #entry{state = expiring, fin = Fin}} ->
-            State1 = lone_status(
-                Id, Fin, trevrpc_status:new(deadline_exceeded, <<"deadline exceeded">>), State
-            ),
-            maybe_close(remove(Id, State1));
-        #{Id := #entry{state = overflowing, fin = Fin}} ->
-            Status = trevrpc_status:new(resource_exhausted, <<"requests read too slowly">>),
+        #{Id := #entry{state = expiring, fin = Fin} = Entry} ->
+            Status = trevrpc_status:new(deadline_exceeded, <<"deadline exceeded">>),
+            _ = run_finishes(Entry, Status),
             maybe_close(remove(Id, lone_status(Id, Fin, Status, State)));
-        #{Id := #entry{state = cancelling}} ->
+        #{Id := #entry{state = overflowing, fin = Fin} = Entry} ->
+            Status = trevrpc_status:new(resource_exhausted, <<"requests read too slowly">>),
+            _ = run_finishes(Entry, Status),
+            maybe_close(remove(Id, lone_status(Id, Fin, Status, State)));
+        #{Id := #entry{state = cancelling} = Entry} ->
+            _ = run_finishes(Entry, trevrpc_status:new(cancelled, <<"RPC cancelled">>)),
             maybe_close(remove(Id, State));
-        #{Id := #entry{state = shutdown}} ->
+        #{Id := #entry{state = shutdown} = Entry} ->
             cut_off(Id, State),
+            _ = run_finishes(Entry, shutdown_status()),
             maybe_close(remove(Id, State));
         #{Id := #entry{state = Running, fin = Fin} = Entry} when
             Running =:= starting; Running =:= running
@@ -1193,16 +1268,44 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
             %% handler failures itself.
             logger:error("trevrpc call process on stream ~b exited: ~p", [Id, Reason]),
             cancel_timer(Entry),
-            State1 = lone_status(
-                Id,
-                Fin,
-                trevrpc_status:new(internal, <<"internal server error">>),
-                release(Id, Entry, State)
-            ),
+            Status = trevrpc_status:new(internal, <<"internal server error">>),
+            _ = run_finishes(Entry, Status),
+            State1 = lone_status(Id, Fin, Status, release(Id, Entry, State)),
             maybe_close(remove(Id, State1));
         _ ->
             maybe_close(State)
     end.
+
+%% Runs the finish functions of a call that ended with `Status', once, in a
+%% process of their own, so that a slow or failing one cannot hold this
+%% process back, and returns the entry without them.
+run_finishes(#entry{finishes = []} = Entry, _Status) ->
+    Entry;
+run_finishes(#entry{finishes = Finishes, method = Method, started = Started} = Entry, Status) ->
+    Elapsed = erlang:convert_time_unit(erlang:monotonic_time() - Started, native, microsecond),
+    Finished = Method#{status => Status, elapsed => Elapsed},
+    _ = spawn(fun() -> lists:foreach(fun(Finish) -> run_finish(Finish, Finished) end, Finishes) end),
+    Entry#entry{finishes = []}.
+
+run_finish(Finish, #{method := Method} = Finished) ->
+    try
+        Finish(Finished)
+    catch
+        Class:Reason:Stack ->
+            logger:error("trevrpc finish function of ~ts failed: ~p", [
+                Method, {Class, Reason, Stack}
+            ])
+    end.
+
+%% The status of a call whose stream ended under it: the server's shutdown,
+%% or the client's or the connection's end.
+ended_status(#state{stopping = true}) ->
+    shutdown_status();
+ended_status(_State) ->
+    trevrpc_status:new(cancelled, <<"RPC cancelled">>).
+
+shutdown_status() ->
+    trevrpc_status:new(unavailable, <<"server is shutting down">>).
 
 server_down(Monitor, State) ->
     %% The only other monitor is the server's.

@@ -5,6 +5,7 @@
 import gleam/option.{type Option, None}
 import trevrpc/handler.{type Call}
 import trevrpc/http_request.{type Request}
+import trevrpc/metadata.{type Metadata}
 import trevrpc/schema.{type Method}
 import trevrpc/status.{type Status}
 import trevrpc/validator.{type Validator}
@@ -56,6 +57,50 @@ fn route(
   handler: handler,
 ) -> Route
 
+/// What an authorizer and the interceptors know of a call: its method's
+/// path (`/package.Service/Method`), split into its service and method
+/// names, and its request metadata, the connection metadata merged in.
+pub type CallInfo {
+  CallInfo(
+    method: String,
+    service: String,
+    method_name: String,
+    metadata: Metadata,
+  )
+}
+
+/// How a call ended: its method, as in `CallInfo`, the status it ended
+/// with, and the microseconds since its stream opened. An `Internal`
+/// status keeps the message the client does not see.
+pub type Finished {
+  Finished(
+    method: String,
+    service: String,
+    method_name: String,
+    status: Status,
+    elapsed: Int,
+  )
+}
+
+/// Authorizes a call before the server looks up its method, so that a
+/// caller it rejects learns nothing about which methods exist: `Ok(Nil)`
+/// lets the call go on, `Error(status)` ends it with that status, usually
+/// `Unauthenticated` or `PermissionDenied`. A call the server refuses for
+/// optimistic stream compression is replayed by the client and authorized
+/// again, so put side effects, such as counting calls against a rate limit,
+/// in an interceptor. See `trevrpc_server` for the details.
+pub type Authorizer =
+  fn(CallInfo) -> Result(Nil, Status)
+
+/// Runs before the handler of every call that was authorized and whose
+/// method the server has, once per handler invocation: `Ok(Some(finish))`
+/// registers a function the server calls once with how the call ended,
+/// however it ended, in a process of its own, `Ok(None)` none, and
+/// `Error(status)` ends the call instead, without running the handler or
+/// later interceptors, whose earlier ones still finish.
+pub type Interceptor =
+  fn(CallInfo) -> Result(Option(fn(Finished) -> Nil), Status)
+
 pub type Config {
   Config(
     /// The UDP port, 0 for any free one.
@@ -98,6 +143,11 @@ pub type Config {
     /// Checks request messages before handlers see them: see
     /// `trevrpc/validator`.
     validator: Option(Validator),
+    /// Authorizes every call before its method is looked up.
+    authorizer: Option(Authorizer),
+    /// Run in order before the handler of every call, the first registering
+    /// the finish function that runs last.
+    interceptors: List(Interceptor),
   )
 }
 
@@ -126,6 +176,8 @@ pub fn config(
     max_concurrent_requests: None,
     graceful_shutdown_timeout: None,
     validator: None,
+    authorizer: None,
+    interceptors: [],
   )
 }
 

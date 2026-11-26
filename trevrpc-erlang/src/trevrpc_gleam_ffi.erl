@@ -41,7 +41,13 @@
         boolean(), option(inet:port_number()), boolean(), boolean(), [binary()],
         option(trevrpc_http_request:handler()), boolean(), option(pos_integer()),
         option(pos_integer()), option(pos_integer()), option(non_neg_integer()),
-        option(validator())}.
+        option(validator()), option(gleam_authorizer()), [gleam_interceptor()]}.
+%% What a Gleam authorizer and interceptors see of a call, and how it ended.
+-type call_info() :: {call_info, binary(), binary(), binary(), trevrpc_metadata:metadata()}.
+-type finished() :: {finished, binary(), binary(), binary(), status(), non_neg_integer()}.
+-type gleam_authorizer() :: fun((call_info()) -> result(nil)).
+-type gleam_interceptor() ::
+    fun((call_info()) -> {ok, option(fun((finished()) -> nil))} | {error, status()}).
 
 %%% Channels
 
@@ -221,7 +227,8 @@ streamed({error, Status}) -> {error, to_status(Status)}.
 -spec start(server_config()) -> {ok, pid()} | {error, binary()}.
 start(
     {config, Port, CertFile, KeyFile, Routes, Tcp, TcpPort, Http, WebTransport, Origins, Fallback,
-        MisdirectedCheck, MaxFrame, MaxStreams, MaxRequests, Grace, Validator}
+        MisdirectedCheck, MaxFrame, MaxStreams, MaxRequests, Grace, Validator, Authorizer,
+        Interceptors}
 ) ->
     Invalid = [Origin || Origin <- Origins, trevrpc_admission:normalize_origin(Origin) =:= error],
     case [Path || {Path, _} <- Routes] -- lists:usort([Path || {Path, _} <- Routes]) of
@@ -238,7 +245,8 @@ start(
                     http => Http,
                     webtransport => WebTransport,
                     webtransport_admission => trevrpc_admission:same_origin(Origins),
-                    misdirected_request_check => MisdirectedCheck
+                    misdirected_request_check => MisdirectedCheck,
+                    interceptors => [interceptor(Interceptor) || Interceptor <- Interceptors]
                 },
                 [
                     {tcp_port, TcpPort},
@@ -247,7 +255,8 @@ start(
                     {max_streams_per_connection, MaxStreams},
                     {max_concurrent_requests, MaxRequests},
                     {graceful_shutdown_timeout, Grace},
-                    {validator, map_option(Validator, fun validator/1)}
+                    {validator, map_option(Validator, fun validator/1)},
+                    {authorizer, map_option(Authorizer, fun authorizer/1)}
                 ]
             ),
             %% Linked, so that the server stops with the process that started
@@ -260,6 +269,33 @@ start(
         [Path | _] ->
             {error, <<"two routes for ", Path/binary>>}
     end.
+
+%% A Gleam authorizer and interceptor as the server takes them.
+-spec authorizer(gleam_authorizer()) -> trevrpc_server:authorizer().
+authorizer(Authorizer) ->
+    fun(Info) ->
+        case Authorizer(call_info(Info)) of
+            {ok, nil} -> ok;
+            {error, Status} -> {error, to_status(Status)}
+        end
+    end.
+
+-spec interceptor(gleam_interceptor()) -> trevrpc_server:interceptor().
+interceptor(Interceptor) ->
+    fun(Info) ->
+        case Interceptor(call_info(Info)) of
+            {ok, none} -> ok;
+            {ok, {some, Finish}} -> {ok, fun(Finished) -> Finish(finished(Finished)) end};
+            {error, Status} -> {error, to_status(Status)}
+        end
+    end.
+
+call_info(#{method := Method, service := Service, method_name := Name, metadata := Metadata}) ->
+    {call_info, Method, Service, Name, Metadata}.
+
+finished(#{method := Method, service := Service, method_name := Name} = Finished) ->
+    #{status := Status, elapsed := Elapsed} = Finished,
+    {finished, Method, Service, Name, status(Status), Elapsed}.
 
 -spec port(pid()) -> {ok, inet:port_number()} | {error, nil}.
 port(Server) ->

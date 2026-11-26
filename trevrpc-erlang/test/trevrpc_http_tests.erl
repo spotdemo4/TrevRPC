@@ -11,6 +11,7 @@
 -define(SINK, <<"/test.Echo/Sink">>).
 -define(TRAP, <<"/test.Echo/Trap">>).
 -define(FLOOD, <<"/test.Echo/Flood">>).
+-define(PEER, <<"/test.Echo/Peer">>).
 -define(MAX_FRAME, 1 bsl 22).
 -define(MEDIA_TYPE, <<"application/trevrpc">>).
 
@@ -55,6 +56,7 @@ http_test_() ->
          || Version <- [h3, h2],
             {Name, Test} <- [
                 {"a unary call", fun unary_test/1},
+                {"the call knows the client's address", fun peer_test/1},
                 {"connection metadata is not kept", fun connection_metadata_test/1},
                 {"a bidirectional call", fun bidi_test/1},
                 {"other paths get 404", fun not_found_test/1},
@@ -154,6 +156,11 @@ routes() ->
             end
         },
         ?BIDI => #{kind => bidirectional_streaming, handler => fun echo/1},
+        %% Answers with the client's address, as the call knows it.
+        ?PEER => #{
+            kind => unary,
+            handler => fun(_Request, Call) -> {ok, term_to_binary(trevrpc_call:peer(Call))} end
+        },
         %% Reports its start, then reads nothing.
         ?SINK => #{
             kind => client_streaming,
@@ -236,6 +243,14 @@ unary_test(Env) ->
     Frames = frames(Body),
     ?assertEqual([<<"hello">>], [M || {message, M} <- Frames]),
     ?assertMatch(#{code := ok}, status(Frames)),
+    close(Client).
+
+peer_test(Env) ->
+    Client = connect(Env),
+    {200, _, Body} = call(Client, ?PEER, [<<>>]),
+    Frames = frames(Body),
+    [Peer] = [binary_to_term(M) || {message, M} <- Frames],
+    ?assertMatch({{127, 0, 0, 1}, Port} when is_integer(Port), Peer),
     close(Client).
 
 %% A proxy may carry many clients' requests on one HTTP connection, so an

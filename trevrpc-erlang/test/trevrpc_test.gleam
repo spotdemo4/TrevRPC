@@ -183,6 +183,17 @@ fn register_self(name: String) -> Nil
 @external(erlang, "trevrpc_test_ffi", "is_alive")
 fn is_alive(name: String) -> Bool
 
+type Inbox
+
+@external(erlang, "trevrpc_test_ffi", "inbox")
+fn inbox() -> Inbox
+
+@external(erlang, "trevrpc_test_ffi", "send")
+fn send(inbox: Inbox, message: a) -> Nil
+
+@external(erlang, "trevrpc_test_ffi", "receive_within")
+fn receive_within(milliseconds: Int) -> Result(a, Nil)
+
 type Monitor
 
 @external(erlang, "trevrpc_test_ffi", "monitor")
@@ -1007,6 +1018,69 @@ pub fn violations_test() {
   |> should.equal("labels[\"a\"].items[2]: [unknown]")
   violations.from_status(status.new(status.InvalidArgument, "no detail"))
   |> should.equal(Error(Nil))
+}
+
+/// A server's authorizer rejects calls without the bearer token, methods
+/// the server has or not alike, and its interceptors see the calls it lets
+/// through and report how they ended.
+pub fn authorizer_interceptors_test() {
+  let #(cert, key, dir) = credentials()
+  let test_inbox = inbox()
+  let authorizer = fn(info: server.CallInfo) {
+    case bearer.token(info.metadata) {
+      Ok("s3cret") -> Ok(Nil)
+      Ok(_) -> Error(status.new(status.PermissionDenied, "wrong token"))
+      Error(failed) -> Error(failed)
+    }
+  }
+  let interceptor = fn(info: server.CallInfo) {
+    send(test_inbox, #("intercepted", info.method_name))
+    Ok(Some(fn(finished: server.Finished) { send(test_inbox, finished) }))
+  }
+  let config =
+    server.Config(
+      ..server.config(0, cert, key, greeter_trevrpc.routes(handlers())),
+      authorizer: Some(authorizer),
+      interceptors: [interceptor],
+    )
+  let assert Ok(srv) = server.start(config)
+  let assert Ok(port) = server.port(srv)
+  let assert Ok(ch) =
+    channel.connect(
+      channel.Config(
+        ..channel.config("127.0.0.1", port),
+        transport: channel.Quic,
+        server_name: Some("localhost"),
+        ca_file: Some(cert),
+      ),
+      10_000,
+    )
+  let assert Error(missing) =
+    greeter_trevrpc.say_hello(ch, hello("ada"), client.options())
+  missing.code |> should.equal(status.Unauthenticated)
+  let assert Ok(authorization) = bearer.metadata("s3cret")
+  let options = client.Options(..client.options(), metadata: authorization)
+  let assert Ok(reply) = greeter_trevrpc.say_hello(ch, hello("ada"), options)
+  reply.message.message |> should.equal("hello ada")
+  let assert Ok(#("intercepted", "SayHello")) = receive_within(5000)
+  let assert Ok(finished) = receive_within(5000)
+  let server.Finished(method:, service:, method_name:, status: ended, elapsed:) =
+    finished
+  method |> should.equal("/greet.v1.Greeter/SayHello")
+  service |> should.equal("greet.v1.Greeter")
+  method_name |> should.equal("SayHello")
+  ended.code |> should.equal(status.Ok)
+  { elapsed >= 0 } |> should.be_true
+  // A failing handler reports its status.
+  let request = HelloRequest(..hello("x"), fail: Some("no thanks"))
+  let assert Error(_) = greeter_trevrpc.say_hello(ch, request, options)
+  let assert Ok(#("intercepted", "SayHello")) = receive_within(5000)
+  let assert Ok(server.Finished(status: failed, ..)) = receive_within(5000)
+  failed.code |> should.equal(status.InvalidArgument)
+  failed.message |> should.equal("no thanks")
+  channel.close(ch)
+  server.stop(srv)
+  remove(dir)
 }
 
 /// A server's validator fails a request that breaks its rules before the

@@ -14,6 +14,9 @@
 -define(FLOOD, <<"/test.Echo/Flood">>).
 -define(DATAGRAMS, <<"/test.Echo/Datagrams">>).
 -define(SLEEP, <<"/test.Echo/Sleep">>).
+-define(PEER, <<"/test.Echo/Peer">>).
+%% The name a test registers under to hear from the server's interceptor.
+-define(HOOKS, trevrpc_webtransport_tests_hooks).
 %% Small frames, so that a stream's window is small too: 64 KiB.
 -define(MAX_FRAME, 65536).
 -define(CHUNK, 16384).
@@ -39,6 +42,7 @@ webtransport_test_() ->
                 {"a session holds about a window of a slow reader's stream", fun bounded_test/1},
                 {"a blocked call's deadline frees the session", fun deadline_test/1},
                 {"a call far behind on reading while it writes fails", fun overflow_test/1},
+                {"a call knows the client's address", fun peer_test/1},
                 {"a stop waits for the client to read the status", fun stop_test/1},
                 {"a stop comes after a mebibyte the status left unread", fun stop_limit_test/1},
                 {"responses travel as session datagrams", fun datagrams_test/1},
@@ -66,6 +70,7 @@ setup() ->
         max_frame_size => ?MAX_FRAME,
         webtransport => true,
         webtransport_admission => Admission,
+        interceptors => [fun interceptor/1],
         routes => #{
             ?UNARY => #{kind => unary, handler => fun(Request, _Call) -> {ok, Request} end},
             ?BIDI => #{kind => kind(?BIDI), handler => fun echo/1},
@@ -73,6 +78,10 @@ setup() ->
             ?FAIL => #{kind => kind(?FAIL), handler => fun fail/1},
             ?STUCK => #{kind => kind(?STUCK), handler => fun(_Call) -> timer:sleep(infinity) end},
             ?FLOOD => #{kind => kind(?FLOOD), handler => fun flood/1},
+            ?PEER => #{
+                kind => kind(?PEER),
+                handler => fun(_Request, Call) -> {ok, term_to_binary(trevrpc_call:peer(Call))} end
+            },
             ?DATAGRAMS => #{
                 kind => kind(?DATAGRAMS),
                 unreliable => #{responses => true},
@@ -93,7 +102,15 @@ kind(?FAIL) -> bidirectional_streaming;
 kind(?STUCK) -> client_streaming;
 kind(?FLOOD) -> bidirectional_streaming;
 kind(?DATAGRAMS) -> server_streaming;
-kind(?SLEEP) -> unary.
+kind(?SLEEP) -> unary;
+kind(?PEER) -> unary.
+
+%% Tells the test registered as ?HOOKS, if any, how each call ended.
+interceptor(_Info) ->
+    case whereis(?HOOKS) of
+        undefined -> ok;
+        Test -> {ok, fun(#{status := Status}) -> Test ! {finished, Status} end}
+    end.
 
 cleanup(#{server := Server}) ->
     trevrpc_server:stop(Server),
@@ -343,9 +360,25 @@ overflow_test(#{port := Port}) ->
         request, trevrpc_wire:encode_request(#{method => ?FLOOD, kind => kind(?FLOOD)})
     ),
     Chunk = trevrpc_frame:encode(message, binary:copy(<<1>>, ?CHUNK)),
-    ok = send(Session, Stream, [Request | lists:duplicate(128, Chunk)], nofin),
-    Frames = response(Session, Stream, trevrpc_frame:reader(?MAX_FRAME), []),
-    ?assertMatch(#{code := resource_exhausted}, status(Frames)),
+    true = register(?HOOKS, self()),
+    try
+        ok = send(Session, Stream, [Request | lists:duplicate(128, Chunk)], nofin),
+        Frames = response(Session, Stream, trevrpc_frame:reader(?MAX_FRAME), []),
+        ?assertMatch(#{code := resource_exhausted}, status(Frames)),
+        %% Its interceptor hears the same.
+        receive
+            {finished, Status} -> ?assertMatch(#{code := resource_exhausted}, Status)
+        after 5000 -> error(no_finish)
+        end
+    after
+        unregister(?HOOKS)
+    end,
+    close(Session).
+
+peer_test(#{port := Port}) ->
+    Session = connect(Port, #{compat_mode => legacy_browser_compat}),
+    {ok, [Peer]} = call(Session, ?PEER, [<<>>]),
+    ?assertMatch({{127, 0, 0, 1}, _}, binary_to_term(Peer)),
     close(Session).
 
 %% Firefox tears down a stream it gets STOP_SENDING on, with the status it

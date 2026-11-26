@@ -16,7 +16,12 @@
     codec :: trevrpc_codec:codec() | undefined,
     %% What checks the route's decoded requests, if anything; see
     %% trevrpc_validator.
-    validate :: trevrpc_validator:validate() | undefined
+    validate :: trevrpc_validator:validate() | undefined,
+    %% What the server's authorizer and interceptors passed on to the
+    %% handler; see trevrpc_server:authorizer().
+    context = #{} :: map(),
+    %% The client's address, if the transport knows it.
+    peer :: {inet:ip_address(), inet:port_number()} | undefined
 }).
 
 %% What changes as the call runs, kept in the call process's dictionary

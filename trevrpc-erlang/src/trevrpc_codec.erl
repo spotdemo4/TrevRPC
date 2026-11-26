@@ -68,9 +68,10 @@ failed(Level, Op, Class, Reason, Stack) ->
     ]),
     error.
 
-%% @private What an exception raised on a message was, and where, for a
-%% log that must not hold the message: its reason's tag, and the function
-%% that raised it, without its arguments.
+%% @private What an exception raised on a message, or in a server's hook,
+%% was, and where, for a log that must not hold the message or the call's
+%% metadata: its reason's tag, and the function that raised it, without its
+%% arguments.
 -spec exception(term(), [tuple()]) -> {term(), term()}.
 exception(Reason, Stack) ->
     {cause(Reason), location(Stack)}.
@@ -95,10 +96,15 @@ path(Path) when is_atom(Path) -> Path;
 path(Path) when is_list(Path) -> unicode:characters_to_binary(Path);
 path(_Path) -> unknown.
 
-%% The function that raised, without its arguments.
-location([{Module, Function, Arity, _} | _]) when is_integer(Arity) ->
-    {Module, Function, Arity};
-location([{Module, Function, Args, _} | _]) when is_list(Args) ->
-    {Module, Function, length(Args)};
+%% The function that raised, without its arguments, and its file and line.
+location([{Module, Function, Arity, Info} | _]) when is_integer(Arity) ->
+    {Module, Function, Arity, place(Info)};
+location([{Module, Function, Args, Info} | _]) when is_list(Args) ->
+    {Module, Function, length(Args), place(Info)};
 location(_Stack) ->
     unknown.
+
+place(Info) when is_list(Info) ->
+    [Entry || {Key, _} = Entry <- Info, Key =:= file orelse Key =:= line];
+place(_Info) ->
+    [].

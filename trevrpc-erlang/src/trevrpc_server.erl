@@ -61,6 +61,15 @@
 %% `buf.validate.Violations' detail: see {@link trevrpc_validator}. Without
 %% one, requests are not checked.
 %%
+%% With an `authorizer', every call that passed the protocol's checks is
+%% authorized before the server looks up its method, so that a caller the
+%% authorizer rejects learns nothing about which methods exist. With
+%% `interceptors', each runs around the handler of every call that reached
+%% it, once per handler invocation, and can register a function the server
+%% calls once with how the call ended. See {@link authorizer()} and {@link
+%% interceptor()}, and {@link trevrpc_authorizer} for ready-made
+%% authorizers.
+%%
 %% Every connection is owned by a `trevrpc_server_conn' process, which
 %% reads each stream's REQUEST, checks it and runs its handler in a call
 %% process of its own. That process can be stopped at any moment, which is
@@ -78,12 +87,105 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, routes/0, route/0, handler/0, result/0, config/0]).
+-export_type([authorizer/0, interceptor/0, finish/0, call_info/0, finished/0]).
 
 %% A handler's outcome. `ok' (streaming responses) and `{ok, Response}'
 %% (single responses) end the call with OK; `{error, Status}' with that
 %% status. A response is the message's bytes, or a term the route's codec
 %% encodes.
 -type result() :: ok | {ok, term()} | {error, trevrpc_status:status()}.
+
+%% What an authorizer and the interceptors know of a call: its method path
+%% (`/package.Service/Method'), split into its service and method names,
+%% its kind, its request metadata (the connection metadata merged in), the
+%% client's address if the transport knows it, and its deadline in
+%% `erlang:monotonic_time(millisecond)' units. Interceptors also get the
+%% `context' that the authorizer and the interceptors before them passed
+%% on.
+-type call_info() :: #{
+    method := binary(),
+    service := binary(),
+    method_name := binary(),
+    kind := trevrpc_wire:kind(),
+    metadata := trevrpc_metadata:metadata(),
+    peer := {inet:ip_address(), inet:port_number()} | undefined,
+    deadline := trevrpc_stream:deadline(),
+    context => map()
+}.
+
+%% Authorizes a call, after the protocol's checks and before the server
+%% looks up the call's method, so that it treats a method the server does
+%% not have like every other: a caller it rejects learns nothing about
+%% which methods exist. It does not see request messages. `ok' and `{ok,
+%% Context}' authorize the call; a context is what the authorizer passes on
+%% to the interceptors and the handler ({@link trevrpc_call:context/1}),
+%% such as the user it found for the request's credentials, so that the
+%% handler need not look it up again. `{error, Status}' rejects the call
+%% with that status, usually `unauthenticated' or `permission_denied'.
+%%
+%% It runs in the call's process, once the server admitted the call, so the
+%% call's deadline, its cancellation and the server's shutdown stop it as
+%% they stop a handler. One that crashes, or returns anything else, fails
+%% the call with `internal', and the cause goes to the logger. A call that
+%% the server refuses for optimistic stream compression is replayed by the
+%% client and authorized again, so an authorizer must not have side effects
+%% that a second authorization of the same call would repeat: put those,
+%% such as counting calls against a rate limit, in an interceptor, which
+%% runs once per handler invocation.
+-type authorizer() ::
+    fun((call_info()) -> ok | {ok, map()} | {error, trevrpc_status:status()}).
+
+%% Runs around the handler of every call that the authorizer accepted and
+%% whose method the server has, for what each call needs once, such as a
+%% log line, a trace span or a rate limit. Interceptors run in order, in
+%% the call's process, immediately before the handler, so once per handler
+%% invocation: a call replayed after a refusal of optimistic stream
+%% compression reaches them once. They do not see messages.
+%%
+%% `ok' lets the call go on; `{ok, Finish}' also registers a function the
+%% server calls once when the call ends, with how it ended (`undefined' for
+%% none), and `{ok, Finish, Context}' adds to the context the handler gets,
+%% as an authorizer's does. `{error, Status}' ends the call with that status
+%% instead, without running the handler or later interceptors; the finish
+%% functions of the earlier ones still run. One that crashes, or returns
+%% anything else, ends the call with `internal', and the cause goes to the
+%% logger.
+-type interceptor() ::
+    fun(
+        (call_info()) ->
+            ok
+            | {ok, finish() | undefined}
+            | {ok, finish() | undefined, map()}
+            | {error, trevrpc_status:status()}
+    ).
+
+%% Called once when a call that registered it ends, however it ends: after
+%% its terminal status went out, or when its deadline, the client, the
+%% server's shutdown or the connection's end stopped it. The finish
+%% functions of a call run in a process of their own, the last registered
+%% first, so a function cannot hold the connection back, and must capture
+%% what it needs, such as a trace span, rather than read the call's process
+%% dictionary. One that crashes is logged, and the others still run.
+%%
+%% Each call that registered any starts such a process when it ends, so
+%% finish functions must not block: one that waits on the network, such as
+%% an exporter, would let a process pile up for every call under load. Hand
+%% slow work to a process of the application's own, which can bound and
+%% batch it.
+-type finish() :: fun((finished()) -> term()).
+
+%% How a call ended: its method, as in {@link call_info()}, the status it
+%% ended with, and the microseconds since its stream opened. The status is
+%% the one the server decided on, which is what the client got, except that
+%% an `internal' status keeps the message the client does not see.
+-type finished() :: #{
+    method := binary(),
+    service := binary(),
+    method_name := binary(),
+    kind := trevrpc_wire:kind(),
+    status := trevrpc_status:status(),
+    elapsed := non_neg_integer()
+}.
 
 %% Unary and server-streaming handlers get the request message;
 %% client-streaming and bidirectional ones read requests from the call.
@@ -154,7 +256,9 @@
     http_path => binary(),
     http_fallback => trevrpc_http_request:handler(),
     misdirected_request_check => boolean(),
-    validator => trevrpc_validator:validator()
+    validator => trevrpc_validator:validator(),
+    authorizer => authorizer(),
+    interceptors => [interceptor()]
 }.
 
 %% What each connection process needs, shared by all of them.
@@ -207,7 +311,9 @@
     h1_idle_timeout := timeout(),
     %% Whether HTTP requests for another name than their connection's TLS
     %% server name are answered `421'.
-    misdirected_request_check := boolean()
+    misdirected_request_check := boolean(),
+    authorizer := authorizer() | undefined,
+    interceptors := [interceptor()]
 }.
 
 -record(state, {
@@ -283,6 +389,7 @@ init(Opts) ->
         {ok, Compression} ?= compression(Opts),
         ok ?= check_routes(maps:get(routes, Opts)),
         ok ?= check_browsers(Opts),
+        ok ?= check_hooks(Opts),
         ok ?= trevrpc_socket:check_user_timeout(Opts),
         {ok, Validators} ?= validators(Opts),
         ok = webtransport_routers(Opts),
@@ -337,6 +444,21 @@ check_browsers(Opts) ->
             ok;
         #{http_path := _} ->
             {error, {invalid_option, http_path}};
+        #{} ->
+            ok
+    end.
+
+check_hooks(Opts) ->
+    case Opts of
+        #{authorizer := Authorizer} when not is_function(Authorizer, 1) ->
+            {error, {invalid_option, authorizer}};
+        #{interceptors := Interceptors} when not is_list(Interceptors) ->
+            {error, {invalid_option, interceptors}};
+        #{interceptors := Interceptors} ->
+            case lists:all(fun(I) -> is_function(I, 1) end, Interceptors) of
+                true -> ok;
+                false -> {error, {invalid_option, interceptors}}
+            end;
         #{} ->
             ok
     end.
@@ -642,7 +764,9 @@ config(Opts, Compression, Validators) ->
         %% request's head, after the handshake or the request before, as
         %% from the Rust server.
         h1_idle_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
-        misdirected_request_check => maps:get(misdirected_request_check, Opts, true)
+        misdirected_request_check => maps:get(misdirected_request_check, Opts, true),
+        authorizer => maps:get(authorizer, Opts, undefined),
+        interceptors => maps:get(interceptors, Opts, [])
     }.
 
 http_options(#{http := true} = Opts) ->

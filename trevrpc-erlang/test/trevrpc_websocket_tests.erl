@@ -6,6 +6,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(UNARY, <<"/test.Echo/Unary">>).
+-define(PEER, <<"/test.Echo/Peer">>).
 -define(MAX_RECORD, 65536).
 
 %%% Fixture
@@ -63,7 +64,14 @@ start_server(#{cert := Cert, key := Key}, Opts) ->
                 key => Key,
                 webtransport => true,
                 routes => #{
-                    ?UNARY => #{kind => unary, handler => fun(Request, _Call) -> {ok, Request} end}
+                    ?UNARY => #{kind => unary, handler => fun(Request, _Call) -> {ok, Request} end},
+                    %% Answers with the client's address, as the call knows it.
+                    ?PEER => #{
+                        kind => unary,
+                        handler => fun(_Request, Call) ->
+                            {ok, term_to_binary(trevrpc_call:peer(Call))}
+                        end
+                    }
                 }
             },
             Opts
@@ -118,6 +126,23 @@ session_test(#{port := Port}) ->
      || {answer, Answer} <- response(Session, Offering, trevrpc_frame:reader(1 bsl 22), [])
     ],
     ?assertMatch([{ok, #{connection_metadata := 1}}], Answers),
+    %% Its calls know the client's address, the HTTP/1.1 connection's.
+    {ok, Asking} = qmux:open_stream(Session),
+    ok = qmux:send_data(
+        Session,
+        Queue,
+        Asking,
+        [
+            trevrpc_frame:encode(request, trevrpc_wire:encode_request(#{method => ?PEER})),
+            trevrpc_frame:encode(message, <<>>)
+        ],
+        true
+    ),
+    [Peer] = [
+        binary_to_term(M)
+     || {message, M} <- response(Session, Asking, trevrpc_frame:reader(1 bsl 22), [])
+    ],
+    ?assertMatch({{127, 0, 0, 1}, _}, Peer),
     qmux:close(Session, 0).
 
 %% The frames of a stream's response, up to its FIN.

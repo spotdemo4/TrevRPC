@@ -28,6 +28,8 @@
     method/1,
     metadata/1,
     deadline/1,
+    context/1,
+    peer/1,
     recv/1,
     send/2,
     send_headers/2,
@@ -59,6 +61,19 @@ metadata(#call{metadata = Metadata}) -> Metadata.
 %% or `infinity'.
 -spec deadline(call()) -> trevrpc_stream:deadline().
 deadline(#call{deadline = Deadline}) -> Deadline.
+
+%% @doc What the server's authorizer and interceptors passed on to the
+%% handler, such as the user an authorizer found for the request's
+%% credentials: the maps they returned, merged in the order they ran, so
+%% a later one wins for a key both have. Empty without them; see
+%% {@link trevrpc_server:authorizer()}.
+-spec context(call()) -> map().
+context(#call{context = Context}) -> Context.
+
+%% @doc The client's address: the source address of its QUIC or TCP
+%% connection, or `undefined' when the transport does not know it.
+-spec peer(call()) -> {inet:ip_address(), inet:port_number()} | undefined.
+peer(#call{peer = Peer}) -> Peer.
 
 %% @doc Reads the next request message of a client-streaming or
 %% bidirectional call, decoded with the route's codec if it has one.

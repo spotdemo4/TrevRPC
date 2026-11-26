@@ -1,6 +1,13 @@
 %% @private The process of one server call: reads and checks the stream's
 %% REQUEST, runs the handler, and writes the response.
 %%
+%% Once admitted, a call is authorized, if the server has an authorizer,
+%% before its method is looked up, so that a call the authorizer rejects
+%% learns nothing about which methods exist; then the interceptors run,
+%% immediately before the handler. The finish functions they register are
+%% kept by the connection, which runs them once the call ended, however it
+%% ended: this process reports the status it wrote.
+%%
 %% `trevrpc_server_conn' starts it as soon as the stream opens and routes
 %% the stream's events to it. Once the REQUEST passed its checks, the call
 %% asks the connection to admit it ({@link trevrpc_server_conn:admit/4}),
@@ -42,7 +49,7 @@ run(#{transport := Transport, id := Id, ref := Ref, router := Router, config := 
     Sets = connection_sets(Transport, Router, maps:get(connection_metadata, Spec, undefined)),
     case request(Stream, deadline(Initial), Config, Sets) of
         {ok, Checked, Next} ->
-            admit(Checked, Next, Router, Config);
+            admit(Checked#{peer => maps:get(peer, Spec, undefined)}, Next, Router, Config);
         {error, Status, Next} ->
             case trevrpc_server_conn:finish(Router, Id, Ref) of
                 ok -> lone_status(Status, Next, MaxFrame);
@@ -123,7 +130,8 @@ request(Stream, Deadline, Config, Sets) ->
     end.
 
 %% Checks a REQUEST in the order the Go and Rust servers do, with their
-%% messages.
+%% messages. Its route is looked up here, but a method the server does not
+%% have fails the call only once it was authorized.
 check_request(Payload, #{routes := Routes}, Sets) ->
     maybe
         {ok, Request} ?= decode_request(Payload),
@@ -134,10 +142,9 @@ check_request(Payload, #{routes := Routes}, Sets) ->
         {ok, Metadata, Confirmed} ?= merge_metadata(Request, Sets),
         ok ?= validate_metadata(Metadata),
         {ok, Timeout} ?= timeout(Request),
-        {ok, Route} ?= route(Method, Kind, Routes),
         {ok, #{
             request => Request,
-            route => Route,
+            route => route(Method, Kind, Routes),
             metadata => Metadata,
             timeout => Timeout,
             connection_metadata => Confirmed
@@ -253,9 +260,20 @@ invalid_status(Message) ->
 %% Asks the connection to admit the call, then serves it; the connection
 %% may refuse it, and then it ends with the lone STATUS of that refusal.
 admit(Checked, Stream, Router, Config) ->
-    #{request := Request, route := Route, timeout := Timeout} = Checked,
-    #{kind := Kind, stream_compression := Offer} = Request,
-    {Requests, _} = trevrpc_zstd:directions(maps:get(compression, Route, none)),
+    #{request := Request, route := Routed, timeout := Timeout} = Checked,
+    #{kind := Kind} = Request,
+    %% A call to a method the server does not have ends once authorized,
+    %% without decoding anything.
+    {Requests, Offer} =
+        case Routed of
+            {ok, Found} ->
+                {
+                    element(1, trevrpc_zstd:directions(maps:get(compression, Found, none))),
+                    maps:get(stream_compression, Request)
+                };
+            {error, _} ->
+                {none, none}
+        end,
     Admission = #{
         flow => maps:get(datagram_flow, Request, 0),
         kind => Kind,
@@ -271,19 +289,143 @@ admit(Checked, Stream, Router, Config) ->
     ),
     case trevrpc_server_conn:admit(Router, Id, trevrpc_stream:ref(Stream), Admission) of
         {ok, #{flow := Flow, stream_requests := Decode}} ->
-            serve(Checked#{
-                stream => Stream,
-                router => Router,
-                deadline => deadline(Timeout),
-                config => Config,
-                flow => Flow,
-                stream_requests => Decode
-            });
+            Deadline = deadline(Timeout),
+            %% Built only for a server with hooks, which alone read it.
+            Info =
+                case Config of
+                    #{authorizer := undefined, interceptors := []} -> undefined;
+                    #{} -> call_info(Checked, Deadline)
+                end,
+            case authorize(maps:get(authorizer, Config), Info, Routed) of
+                {ok, Route, Context} ->
+                    serve(Checked#{
+                        route := Route,
+                        info => Info,
+                        context => Context,
+                        stream => Stream,
+                        router => Router,
+                        deadline => Deadline,
+                        config => Config,
+                        flow => Flow,
+                        stream_requests => Decode
+                    });
+                {error, Status} ->
+                    case trevrpc_server_conn:finish(Router, Id, trevrpc_stream:ref(Stream)) of
+                        ok -> lone_status(Status, Stream, maps:get(max_frame_size, Config));
+                        cancelled -> ok
+                    end
+            end;
         {refuse, Status} ->
             lone_status(Status, Stream, maps:get(max_frame_size, Config));
         cancelled ->
             ok
     end.
+
+%% What the authorizer and the interceptors know of the call.
+call_info(#{request := #{method := Method, kind := Kind}} = Checked, Deadline) ->
+    %% check_method/1 checked the path's form.
+    <<$/, Path/binary>> = Method,
+    [Service, Name] = binary:split(Path, <<"/">>),
+    #{
+        method => Method,
+        service => Service,
+        method_name => Name,
+        kind => Kind,
+        metadata => maps:get(metadata, Checked),
+        peer => maps:get(peer, Checked),
+        deadline => Deadline
+    }.
+
+%% Authorizes the call, then lets its route's lookup fail it: the route and
+%% the context the authorizer passed on, or the status that ends the call.
+authorize(undefined, _Info, {ok, Route}) ->
+    {ok, Route, #{}};
+authorize(undefined, _Info, {error, Status}) ->
+    {error, Status};
+authorize(Authorizer, #{method := Method} = Info, Routed) ->
+    Authorized =
+        try Authorizer(Info) of
+            ok -> {ok, #{}};
+            {ok, Context} when is_map(Context) -> {ok, Context};
+            {error, #{code := Code} = Status} when Code =/= ok -> {error, Status};
+            Other -> invalid_hook(<<"authorizer">>, Method, Other)
+        catch
+            Class:Reason:Stack -> failed_hook(<<"authorizer">>, Method, {Class, Reason, Stack})
+        end,
+    case {Authorized, Routed} of
+        {{ok, Context1}, {ok, Route}} ->
+            {ok, Route, Context1};
+        {{ok, _}, {error, Status1}} ->
+            {error, Status1};
+        {{error, Status1}, _} ->
+            log_internal(Method, Status1),
+            {error, Status1}
+    end.
+
+%% Runs the interceptors in order, each with the context the ones before it
+%% passed on, and has the connection keep the finish functions they
+%% register: the context the handler gets, or the status that ends the call
+%% instead. Also says whether any registered a finish function, so that the
+%% call reports how it ended.
+intercept([], #{context := Context}, _Register, Registered) ->
+    {ok, Context, Registered};
+intercept([Interceptor | Rest], #{method := Method} = Info, Register, Registered) ->
+    Result =
+        try Interceptor(Info) of
+            ok -> {ok, undefined, #{}};
+            {ok, Finish} -> {ok, Finish, #{}};
+            {ok, Finish, Context} when is_map(Context) -> {ok, Finish, Context};
+            {error, #{code := Code} = Status} when Code =/= ok -> {error, Status};
+            Other -> invalid_hook(<<"interceptor">>, Method, Other)
+        catch
+            Class:Reason:Stack -> failed_hook(<<"interceptor">>, Method, {Class, Reason, Stack})
+        end,
+    case Result of
+        {ok, undefined, Added} ->
+            intercept(Rest, merge_context(Info, Added), Register, Registered);
+        {ok, Finish1, Added} when is_function(Finish1, 1) ->
+            ok = Register(Finish1),
+            intercept(Rest, merge_context(Info, Added), Register, true);
+        {ok, Other1, _} ->
+            {invalid_hook(<<"interceptor">>, Method, {ok, Other1}), Registered};
+        {error, Status1} ->
+            {{error, Status1}, Registered}
+    end.
+
+run_interceptors([], #{context := Context}, _Router, _Id, _Ref) ->
+    {ok, Context, false};
+run_interceptors(Interceptors, #{info := Info, context := Context}, Router, Id, Ref) ->
+    Method = maps:with([method, service, method_name, kind], Info),
+    Register = fun(Finish) -> trevrpc_server_conn:intercepted(Router, Id, Ref, Finish, Method) end,
+    intercept(Interceptors, Info#{context => Context}, Register, false).
+
+merge_context(#{context := Context} = Info, Added) ->
+    Info#{context := maps:merge(Context, Added)}.
+
+%% A hook gets the call's metadata, credentials included, so what it
+%% returned or raised is logged by its shape, never its terms.
+invalid_hook(Hook, Method, Result) ->
+    logger:error("trevrpc ~s of ~ts returned ~p", [Hook, Method, shape(Result)]),
+    {error, trevrpc_status:new(internal, <<"internal server error">>)}.
+
+failed_hook(Hook, Method, {Class, Reason, Stack}) ->
+    {Cause, Location} = trevrpc_codec:exception(Reason, Stack),
+    logger:error("trevrpc ~s of ~ts failed: ~p:~p at ~p", [Hook, Method, Class, Cause, Location]),
+    {error, trevrpc_status:new(internal, <<"internal server error">>)}.
+
+%% What a term is, without what it holds: an atom, or the tag and size of a
+%% tuple, or its type.
+shape(Term) when is_atom(Term) -> Term;
+shape(Term) when tuple_size(Term) > 0, is_atom(element(1, Term)) ->
+    {element(1, Term), tuple_size(Term)};
+shape(Term) when is_tuple(Term) -> {tuple, tuple_size(Term)};
+shape(Term) when is_map(Term) -> map;
+shape(Term) when is_list(Term) -> list;
+shape(Term) when is_binary(Term) -> binary;
+shape(Term) when is_function(Term) -> function;
+shape(Term) when is_number(Term) -> number;
+shape(_Term) ->
+    other.
 
 %% Ends a call refused before it ran: its STATUS, and, if the peer has not
 %% finished the request side, a stop to it.
@@ -305,7 +447,12 @@ serve(#{stream := Stream0, router := Router, route := Route, config := Config} =
     Id = trevrpc_stream:id(Stream0),
     Ref = trevrpc_stream:ref(Stream0),
     #{kind := Kind, handler := Handler} = Route,
-    #{request := #{method := Method} = Request, metadata := Metadata, deadline := Deadline} = Spec,
+    #{
+        request := #{method := Method} = Request,
+        metadata := Metadata,
+        deadline := Deadline,
+        context := Context
+    } = Spec,
     #{
         max_frame_size := MaxFrame,
         max_stream_messages := MaxMessages,
@@ -335,7 +482,9 @@ serve(#{stream := Stream0, router := Router, route := Route, config := Config} =
         deadline = Deadline,
         owner = self(),
         codec = maps:get(codec, Route, undefined),
-        validate = maps:get(Method, maps:get(validators, Config), undefined)
+        validate = maps:get(Method, maps:get(validators, Config), undefined),
+        context = Context,
+        peer = maps:get(peer, Spec)
     },
     trevrpc_call:put_state(Call, #call_state{
         stream = Stream,
@@ -360,16 +509,23 @@ serve(#{stream := Stream0, router := Router, route := Route, config := Config} =
             trevrpc_server_conn:reserve(Router, Id, Ref, trevrpc_zstd_stream:encoder_cost())
         end
     }),
-    %% A client streaming requests learns at once which dictionaries it may
-    %% compress them with; other calls carry the ANSWER with their first
-    %% response frame.
-    _ =
-        case trevrpc_wire:streams_requests(Kind) of
-            true -> trevrpc_call:send_answer(Call);
-            false -> ok
-        end,
-    Result = handle(Kind, Handler, Call, Config),
-    finish(Call, Kind, Result, Router, Id).
+    case run_interceptors(maps:get(interceptors, Config), Spec, Router, Id, Ref) of
+        {ok, Intercepted, Report} ->
+            Handled = Call#call{context = Intercepted},
+            %% A client streaming requests learns at once which dictionaries
+            %% it may compress them with; other calls carry the ANSWER with
+            %% their first response frame.
+            _ =
+                case trevrpc_wire:streams_requests(Kind) of
+                    true -> trevrpc_call:send_answer(Handled);
+                    false -> ok
+                end,
+            Result = handle(Kind, Handler, Handled, Config),
+            finish(Handled, Kind, Result, Router, Id, Report);
+        {{error, Status}, Report} ->
+            %% finish/6 logs an internal status.
+            finish(Call, Kind, {error, Status}, Router, Id, Report)
+    end.
 
 flow(undefined, _Kind, _Route, Stream) ->
     {Stream, undefined, undefined};
@@ -496,33 +652,52 @@ earliest(Deadline, infinity) -> Deadline;
 earliest(Deadline, Timeout) -> min(Deadline, erlang:monotonic_time(millisecond) + Timeout).
 
 %% Writes the call's end: its single response message, if it has one, and
-%% its terminal STATUS, once the connection released its slots.
-finish(Call, Kind, Result, Router, Id) ->
+%% its terminal STATUS, once the connection released its slots. With
+%% `Report', it then tells the connection how the call ended, for the finish
+%% functions of its interceptors.
+finish(Call, Kind, Result, Router, Id, Report) ->
     State = trevrpc_call:state(Call),
     #call_state{trailers = Trailers, max_frame_size = Max, answer = Answer} = State,
     %% A call that sent response datagrams announces them before its STATUS.
     Count = trevrpc_datagram_sender:finish(
         earliest(Call#call.deadline, ?STATUS_TIMEOUT), State#call_state.datagram_sender
     ),
-    Frames =
+    {Frames, Ended} =
         case response(Kind, Result, Max) of
             {ok, Message} ->
-                [
-                    Answer,
-                    element(1, trevrpc_call:encode_message(State, Message)),
-                    status_frame(#{metadata => Trailers}, Max)
-                ];
+                {
+                    [
+                        Answer,
+                        element(1, trevrpc_call:encode_message(State, Message)),
+                        status_frame(#{metadata => Trailers}, Max)
+                    ],
+                    trevrpc_status:ok()
+                };
             ok ->
-                [Answer, Count | status_frame(#{metadata => Trailers}, Max)];
+                {[Answer, Count | status_frame(#{metadata => Trailers}, Max)], trevrpc_status:ok()};
             {error, Status} ->
-                log_internal(Call, Status),
-                [Answer, Count | status_frame(maps:merge(#{metadata => Trailers}, Status), Max)]
+                log_internal(Call#call.method, Status),
+                {
+                    [
+                        Answer,
+                        Count
+                        | status_frame(maps:merge(#{metadata => Trailers}, Status), Max)
+                    ],
+                    Status
+                }
         end,
     case trevrpc_server_conn:finish(Router, Id, Call#call.ref) of
         ok ->
             Deadline = erlang:monotonic_time(millisecond) + ?STATUS_TIMEOUT,
             Stream = State#call_state.stream,
-            _ = trevrpc_stream:send(Stream, Frames, true, Deadline),
+            Sent = trevrpc_stream:send(Stream, Frames, true, Deadline),
+            _ =
+                case Report of
+                    true ->
+                        trevrpc_server_conn:finished(Router, Id, Call#call.ref, sent(Sent, Ended));
+                    false ->
+                        ok
+                end,
             %% Release a client still uploading, even before it reads the
             %% status.
             _ =
@@ -542,6 +717,11 @@ finish(Call, Kind, Result, Router, Id) ->
         cancelled ->
             ok
     end.
+
+%% How a call ended once its end was written: as it decided, unless the
+%% client did not get it.
+sent({ok, _Stream}, Ended) -> Ended;
+sent(_Failed, _Ended) -> trevrpc_status:new(cancelled, <<"response stream closed">>).
 
 %% A handler's result, checked against what the method's kind responds with.
 response(Kind, {ok, Message}, Max) when Kind =:= unary; Kind =:= client_streaming ->
@@ -565,14 +745,14 @@ response(_Kind, Other, _Max) ->
     logger:error("trevrpc handler returned ~p", [Other]),
     {error, trevrpc_status:new(internal, <<"internal server error">>)}.
 
-log_internal(Call, #{code := internal} = Status) ->
+log_internal(Method, #{code := internal} = Status) ->
     case trevrpc_status:message(Status) of
         <<"internal server error">> ->
             ok;
         Message ->
-            logger:error("trevrpc handler of ~ts failed: ~ts", [trevrpc_call:method(Call), Message])
+            logger:error("trevrpc call of ~ts failed: ~ts", [Method, Message])
     end;
-log_internal(_Call, _Status) ->
+log_internal(_Method, _Status) ->
     ok.
 
 %% @doc The STATUS frame of a call's end. An `internal' status reaches the
