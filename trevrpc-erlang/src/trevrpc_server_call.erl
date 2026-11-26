@@ -339,12 +339,9 @@ admit(Checked, Stream, Router, Config) ->
                     });
                 {error, Status} ->
                     Ref = trevrpc_stream:ref(Stream),
-                    case trevrpc_server_conn:finish(Router, Id, Ref) of
-                        ok ->
-                            lone_status(Status, Stream, maps:get(max_frame_size, Config)),
-                            ended(Router, Id, Ref, Status, {0, 0});
-                        cancelled ->
-                            ok
+                    case trevrpc_server_conn:finish(Router, Id, Ref, {Status, {0, 0}}) of
+                        ok -> lone_status(Status, Stream, maps:get(max_frame_size, Config));
+                        cancelled -> ok
                     end
             end;
         {refuse, Status} ->
@@ -353,14 +350,6 @@ admit(Checked, Stream, Router, Config) ->
         cancelled ->
             ok
     end.
-
-%% Tells the connection how an admitted call ended, and the bytes of its
-%% single request and response messages: the connection, which emitted the
-%% call's telemetry start when it admitted it, alone emits its stop and runs
-%% its finish functions, whether the call tells it or something stops the
-%% call first, so that each is reported once.
-ended(Router, Id, Ref, Status, Bytes) ->
-    trevrpc_server_conn:ended(Router, Id, Ref, Status, Bytes).
 
 %% What the authorizer and the interceptors know of the call.
 call_info(#{request := #{method := Method, kind := Kind}} = Checked, Deadline) ->
@@ -687,8 +676,11 @@ earliest(Deadline, infinity) -> Deadline;
 earliest(Deadline, Timeout) -> min(Deadline, erlang:monotonic_time(millisecond) + Timeout).
 
 %% Writes the call's end: its single response message, if it has one, and
-%% its terminal STATUS, once the connection released its slots, then tells
-%% the connection how it ended, and the sizes of its messages.
+%% its terminal STATUS, once the connection released its slots. The
+%% connection, which emitted the call's telemetry start when it admitted
+%% it, alone emits its stop and runs its finish functions, with the status
+%% and message sizes given here once this process exits, or with whatever
+%% stopped it first, so that each is reported once.
 finish(Call, Kind, Result, Router, Id) ->
     State = trevrpc_call:state(Call),
     #call_state{trailers = Trailers, max_frame_size = Max, answer = Answer} = State,
@@ -698,7 +690,7 @@ finish(Call, Kind, Result, Router, Id) ->
     ),
     {Frames, Ended, ResponseBytes} =
         case response(Call#call.method, Kind, Result, Max) of
-            {ok, Message} ->
+            {ok, Message, Size} ->
                 {
                     [
                         Answer,
@@ -706,7 +698,7 @@ finish(Call, Kind, Result, Router, Id) ->
                         status_frame(#{metadata => Trailers}, Max)
                     ],
                     trevrpc_status:ok(),
-                    iolist_size(Message)
+                    Size
                 };
             ok ->
                 {
@@ -726,18 +718,16 @@ finish(Call, Kind, Result, Router, Id) ->
                     0
                 }
         end,
-    case trevrpc_server_conn:finish(Router, Id, Call#call.ref) of
+    Bytes = {State#call_state.request_bytes, ResponseBytes},
+    case trevrpc_server_conn:finish(Router, Id, Call#call.ref, {Ended, Bytes}) of
         ok ->
             Deadline = erlang:monotonic_time(millisecond) + ?STATUS_TIMEOUT,
             Stream = State#call_state.stream,
-            Sent = trevrpc_stream:send(Stream, Frames, true, Deadline),
-            ended(
-                Router,
-                Id,
-                Call#call.ref,
-                sent(Sent, Ended),
-                {State#call_state.request_bytes, ResponseBytes}
-            ),
+            _ =
+                case trevrpc_stream:send(Stream, Frames, true, Deadline) of
+                    {ok, _} -> ok;
+                    _Failed -> trevrpc_server_conn:unsent(Router, Id, Call#call.ref)
+                end,
             %% Release a client still uploading, even before it reads the
             %% status.
             _ =
@@ -758,11 +748,6 @@ finish(Call, Kind, Result, Router, Id) ->
             ok
     end.
 
-%% How a call ended once its end was written: as it decided, unless the
-%% client did not get it.
-sent({ok, _Stream}, Ended) -> Ended;
-sent(_Failed, _Ended) -> trevrpc_status:new(cancelled, <<"response stream closed">>).
-
 %% A handler's result, checked against what the method's kind responds with.
 response(_Method, Kind, {ok, Message}, Max) when Kind =:= unary; Kind =:= client_streaming ->
     case iolist_size(Message) of
@@ -774,8 +759,8 @@ response(_Method, Kind, {ok, Message}, Max) when Kind =:= unary; Kind =:= client
                         io_lib:format("frame length ~b exceeds maximum ~b", [Size, Max])
                     )
                 )};
-        _ ->
-            {ok, Message}
+        Size ->
+            {ok, Message, Size}
     end;
 response(_Method, Kind, ok, _Max) when
     Kind =:= server_streaming; Kind =:= bidirectional_streaming

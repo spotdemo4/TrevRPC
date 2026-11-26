@@ -2146,7 +2146,7 @@ shutdown_waits_for_finishing_call(Credentials) ->
         1 = erlang:trace(Handler, true, [send]),
         Handler ! go,
         receive
-            {trace, Handler, send, {'$gen_call', _, {finish, _, _}}, Conn} -> ok
+            {trace, Handler, send, {'$gen_call', _, {finish, _, _, _}}, Conn} -> ok
         after 5000 -> error(no_finish)
         end,
         1 = erlang:trace(Server, true, [send]),
