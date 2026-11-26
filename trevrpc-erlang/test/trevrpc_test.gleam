@@ -16,6 +16,7 @@ import gleam/string
 import gleeunit/should
 import greet/v1/greeter.{HelloReply, HelloRequest}
 import greet/v1/greeter_trevrpc
+import trevrpc/bearer
 import trevrpc/channel
 import trevrpc/client
 import trevrpc/handler
@@ -928,6 +929,45 @@ fn check_hello(
     Ok(_) -> Ok(Nil)
     Error(_) -> Error(status.new(status.Internal, "not a HelloRequest"))
   }
+}
+
+/// A RetryInfo detail round-trips, replacing an earlier one and keeping
+/// other details, and its bytes are the ones every runtime's tests use.
+pub fn retry_delay_test() {
+  let other = status.Detail(type_url: "other", value: <<1, 2>>)
+  let busy =
+    status.Status(..status.new(status.ResourceExhausted, "busy"), details: [
+      other,
+    ])
+    |> status.with_retry_delay(30_000)
+    |> status.with_retry_delay(1500)
+  busy.details
+  |> should.equal([
+    other,
+    status.Detail(type_url: "google.rpc.RetryInfo", value: <<
+      0x0a, 0x08, 0x08, 0x01, 0x10, 0x80, 0xca, 0xb5, 0xee, 0x01,
+    >>),
+  ])
+  status.retry_delay(busy) |> should.equal(Ok(1500))
+  status.retry_delay(status.new(status.NotFound, "missing"))
+  |> should.equal(Error(Nil))
+}
+
+/// Bearer metadata carries the token a handler reads back, and malformed or
+/// missing credentials are told apart.
+pub fn bearer_test() {
+  let assert Ok(authorization) = bearer.metadata("abc.DEF-123_~+/==")
+  metadata.get(authorization, "authorization")
+  |> should.equal(Ok("Bearer abc.DEF-123_~+/=="))
+  bearer.token(authorization) |> should.equal(Ok("abc.DEF-123_~+/=="))
+  let assert Error(invalid) = bearer.metadata("to ken")
+  invalid.code |> should.equal(status.InvalidArgument)
+  let assert Error(missing) = bearer.token(metadata.new())
+  missing.code |> should.equal(status.Unauthenticated)
+  missing.message |> should.equal("missing bearer token")
+  let assert Error(malformed) =
+    bearer.token(metadata.from_list([#("authorization", "Basic dXNlcjpwYXNz")]))
+  malformed.message |> should.equal("malformed bearer token")
 }
 
 pub fn violations_test() {

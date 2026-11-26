@@ -2,12 +2,17 @@
 -module(trevrpc_status).
 
 -export([to_int/1, from_int/1, codes/0, new/2, ok/0, code/1, message/1, find_details/2]).
+-export([with_retry_delay/2, with_retry_delay/3, retry_delay/1, retry_delay/2]).
 
 -export_type([code/0, status/0]).
 
 %% A status: a code, and optionally a message, trailing metadata and
 %% details, as an `RpcStatus' carries them.
 -type status() :: trevrpc_wire:status().
+
+-define(RETRY_INFO, <<"google.rpc.RetryInfo">>).
+-define(NANOS_PER_SECOND, 1000000000).
+-define(INT64_MAX, 16#7FFFFFFFFFFFFFFF).
 
 -type code() ::
     ok
@@ -56,6 +61,96 @@ find_details(Status, Type) when is_binary(Type) ->
      || Detail <- maps:get(details, Status, []),
         maps:get(type, Detail, <<>>) =:= Type
     ].
+
+%% @doc Tells the client to wait `Milliseconds' before it retries, with a
+%% `google.rpc.RetryInfo' detail; see {@link with_retry_delay/3}.
+-spec with_retry_delay(status(), integer()) -> status().
+with_retry_delay(Status, Milliseconds) ->
+    with_retry_delay(Status, Milliseconds, millisecond).
+
+%% @doc Tells the client to wait `Delay', in `Unit', before it retries,
+%% with a `google.rpc.RetryInfo' detail, the standard detail a rate limit
+%% answers with. The detail replaces any `RetryInfo' the status had and
+%% leaves its other details alone. A negative delay is zero, and one too
+%% long for a `google.protobuf.Duration' is the longest one. Clients read
+%% the delay with {@link retry_delay/1}, or the equivalent in their
+%% language.
+%%
+%% TrevRPC encodes the message itself, so that it does not depend on
+%% googleapis; the encoding is the one every protobuf library produces.
+-spec with_retry_delay(status(), integer(), erlang:time_unit()) -> status().
+with_retry_delay(Status, Delay, Unit) when is_map(Status), is_integer(Delay) ->
+    Nanos = erlang:convert_time_unit(max(Delay, 0), Unit, nanosecond),
+    Details = [
+        Detail
+     || Detail <- maps:get(details, Status, []),
+        maps:get(type, Detail, <<>>) =/= ?RETRY_INFO
+    ],
+    Status#{details => Details ++ [#{type => ?RETRY_INFO, value => encode_retry_info(Nanos)}]}.
+
+%% @doc How many milliseconds the status tells the client to wait before
+%% it retries; see {@link retry_delay/2}.
+-spec retry_delay(status()) -> {ok, non_neg_integer()} | error.
+retry_delay(Status) ->
+    retry_delay(Status, millisecond).
+
+%% @doc How long, in `Unit', the status tells the client to wait before it
+%% retries, from its first well-formed `google.rpc.RetryInfo' detail, such
+%% as that of a call a server's rate limit rejected; `error' when it has
+%% none. A detail that does not decode, or whose delay is negative or not a
+%% valid `google.protobuf.Duration' (its nanos must be below a second), is
+%% ignored. Fields the message does not know are skipped, and a repeated
+%% field takes its last value, as protobuf decoders do. The delay is
+%% rounded down to a whole `Unit'.
+-spec retry_delay(status(), erlang:time_unit()) -> {ok, non_neg_integer()} | error.
+retry_delay(Status, Unit) when is_map(Status) ->
+    first_retry_delay(maps:get(details, Status, []), Unit).
+
+first_retry_delay([#{type := ?RETRY_INFO} = Detail | Rest], Unit) ->
+    case decode_retry_info(maps:get(value, Detail, <<>>)) of
+        {ok, Nanos} -> {ok, erlang:convert_time_unit(Nanos, nanosecond, Unit)};
+        error -> first_retry_delay(Rest, Unit)
+    end;
+first_retry_delay([_ | Rest], Unit) ->
+    first_retry_delay(Rest, Unit);
+first_retry_delay([], _Unit) ->
+    error.
+
+%% A `RetryInfo' whose `retry_delay' is `Nanos'. Like any protobuf encoder,
+%% it leaves out a zero `seconds' or `nanos'.
+encode_retry_info(Nanos) ->
+    {Seconds, Subsecond} =
+        case Nanos div ?NANOS_PER_SECOND of
+            Whole when Whole > ?INT64_MAX -> {?INT64_MAX, ?NANOS_PER_SECOND - 1};
+            Whole -> {Whole, Nanos rem ?NANOS_PER_SECOND}
+        end,
+    Duration = [uint_field(1, Seconds), uint_field(2, Subsecond)],
+    iolist_to_binary(trevrpc_pb:bytes_field(1, Duration)).
+
+uint_field(_Number, 0) -> <<>>;
+uint_field(Number, Value) -> trevrpc_pb:varint_field(Number, Value).
+
+%% The delay of a `RetryInfo' in nanoseconds: `retry_delay' (field 1) is a
+%% `google.protobuf.Duration' of `seconds' (1, int64) and `nanos' (2,
+%% int32).
+decode_retry_info(Value) ->
+    maybe
+        {ok, {delay, Duration}} ?= trevrpc_pb:decode_message(Value, fun retry_info_field/3, none),
+        {ok, {Seconds, Nanos}} ?= trevrpc_pb:decode_message(Duration, fun duration_field/3, {0, 0}),
+        true ?= Seconds >= 0 andalso Nanos >= 0 andalso Nanos < ?NANOS_PER_SECOND,
+        {ok, Seconds * ?NANOS_PER_SECOND + Nanos}
+    else
+        _ -> error
+    end.
+
+retry_info_field(1, {bytes, Duration}, _) -> {delay, Duration};
+retry_info_field(1, _, _) -> error;
+retry_info_field(_, _, Message) -> Message.
+
+duration_field(1, {varint, Value}, {_, Nanos}) -> {trevrpc_pb:to_int64(Value), Nanos};
+duration_field(2, {varint, Value}, {Seconds, _}) -> {Seconds, trevrpc_pb:to_int32(Value)};
+duration_field(Number, _, _) when Number =:= 1; Number =:= 2 -> error;
+duration_field(_, _, Duration) -> Duration.
 
 %% @doc Every code, in numeric order.
 -spec codes() -> [code(), ...].

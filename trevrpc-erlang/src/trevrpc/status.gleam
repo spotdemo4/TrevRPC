@@ -39,3 +39,19 @@ pub type Status {
 pub fn new(code: Code, message: String) -> Status {
   Status(code:, message:, metadata: metadata.new(), details: [])
 }
+
+/// Tells the client to wait `milliseconds` before it retries, with a
+/// `google.rpc.RetryInfo` detail, the standard detail a rate limit answers
+/// with. The detail replaces any `RetryInfo` the status had and leaves its
+/// other details alone. A negative delay is zero. Clients read the delay
+/// with `retry_delay`, or the equivalent in their language.
+@external(erlang, "trevrpc_gleam_ffi", "with_retry_delay")
+pub fn with_retry_delay(status: Status, milliseconds: Int) -> Status
+
+/// How many milliseconds the status tells the client to wait before it
+/// retries, from its first well-formed `google.rpc.RetryInfo` detail, such
+/// as that of a call a server's rate limit rejected, rounded down to a
+/// millisecond. A detail that does not decode, or whose delay is negative
+/// or not a valid `google.protobuf.Duration`, is ignored.
+@external(erlang, "trevrpc_gleam_ffi", "retry_delay")
+pub fn retry_delay(status: Status) -> Result(Int, Nil)

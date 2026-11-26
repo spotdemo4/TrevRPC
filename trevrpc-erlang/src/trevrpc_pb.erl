@@ -1,8 +1,9 @@
 %% @doc The protobuf wire format primitives of the messages the runtime
 %% encodes and decodes by hand.
 %%
-%% Only what {@link trevrpc_wire} (the control messages) and {@link
-%% trevrpc_violations} (`buf.validate.Violations' status details) use:
+%% Only what {@link trevrpc_wire} (the control messages), {@link
+%% trevrpc_violations} (`buf.validate.Violations' status details) and
+%% {@link trevrpc_status} (`google.rpc.RetryInfo' details) use:
 %% base-128 varints, tags, and length-delimited fields, plus reading any
 %% field so unknown ones can be skipped. Application messages never pass
 %% through here; they are opaque bytes to the runtime.

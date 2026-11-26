@@ -360,11 +360,7 @@ trailers(Call) ->
 failure(#{fail_code := 0}) ->
     none;
 failure(#{fail_code := 8, fail_message := Message}) ->
-    #{
-        code => resource_exhausted,
-        message => Message,
-        details => [trevrpc_interop_retry:retry_info(1, 500000000)]
-    };
+    trevrpc_status:with_retry_delay(trevrpc_status:new(resource_exhausted, Message), 1500);
 failure(#{fail_code := Code, fail_message := Message}) ->
     trevrpc_status:new(trevrpc_status:from_int(Code), Message).
 

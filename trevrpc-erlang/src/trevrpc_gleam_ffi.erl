@@ -11,6 +11,7 @@
 -export([http_header/2, http_peer/1, http_read_body/2]).
 -export([http_reply/4, http_stream_reply/3, http_stream_body/3]).
 -export([violations_status/1, violations_from_status/1, violation_to_string/1]).
+-export([with_retry_delay/2, retry_delay/1, bearer_token/1, bearer_metadata/1]).
 
 %% Gleam's values as this module sees them: a custom type's value is a tuple
 %% tagged with its constructor's name in snake case, `Nil' is `nil'.
@@ -408,6 +409,33 @@ validator(Validator) ->
                     end
                 end}
         end
+    end.
+
+%%% Statuses and bearer credentials
+
+-spec with_retry_delay(status(), integer()) -> status().
+with_retry_delay(Status, Milliseconds) ->
+    status(trevrpc_status:with_retry_delay(to_status(Status), Milliseconds)).
+
+-spec retry_delay(status()) -> {ok, non_neg_integer()} | {error, nil}.
+retry_delay(Status) ->
+    case trevrpc_status:retry_delay(to_status(Status)) of
+        {ok, Delay} -> {ok, Delay};
+        error -> {error, nil}
+    end.
+
+-spec bearer_token(trevrpc_metadata:metadata()) -> {ok, binary()} | {error, status()}.
+bearer_token(Metadata) ->
+    case trevrpc_bearer:token(Metadata) of
+        {ok, Token} -> {ok, Token};
+        {error, Status} -> {error, status(Status)}
+    end.
+
+-spec bearer_metadata(binary()) -> {ok, trevrpc_metadata:metadata()} | {error, status()}.
+bearer_metadata(Token) ->
+    case trevrpc_bearer:metadata(Token) of
+        {ok, Metadata} -> {ok, Metadata};
+        {error, Status} -> {error, status(Status)}
     end.
 
 %%% Violations

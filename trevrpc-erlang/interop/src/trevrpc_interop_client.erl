@@ -244,11 +244,11 @@ unary_retry_delay(Channel) ->
         {error, Exhausted} ?=
             call_unary(Channel, #{fail_code => 8, fail_message => <<"slow down">>}, opts()),
         ok ?= expect_status({error, Exhausted}, resource_exhausted, <<"slow down">>),
-        ok ?= expect(1500, trevrpc_interop_retry:retry_delay(Exhausted), "retry delay"),
+        ok ?= expect({ok, 1500}, trevrpc_status:retry_delay(Exhausted), "retry delay"),
         {error, Missing} ?=
             call_unary(Channel, #{fail_code => 5, fail_message => <<"missing">>}, opts()),
         ok ?= expect_status({error, Missing}, not_found, <<"missing">>),
-        expect(none, trevrpc_interop_retry:retry_delay(Missing), "retry delay")
+        expect(error, trevrpc_status:retry_delay(Missing), "retry delay")
     else
         {ok, _, _} -> {error, <<"call succeeded">>};
         {error, _} = Error -> Error
