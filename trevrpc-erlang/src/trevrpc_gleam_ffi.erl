@@ -41,7 +41,7 @@
         boolean(), option(inet:port_number()), boolean(), boolean(), [binary()],
         option(trevrpc_http_request:handler()), boolean(), option(pos_integer()),
         option(pos_integer()), option(pos_integer()), option(non_neg_integer()),
-        option(validator()), option(gleam_authorizer()), [gleam_interceptor()]}.
+        option(validator()), option(gleam_authorizer()), [gleam_interceptor()], boolean()}.
 %% What a Gleam authorizer and interceptors see of a call, and how it ended.
 -type call_info() :: {call_info, binary(), binary(), binary(), trevrpc_metadata:metadata()}.
 -type finished() :: {finished, binary(), binary(), binary(), status(), non_neg_integer()}.
@@ -228,7 +228,7 @@ streamed({error, Status}) -> {error, to_status(Status)}.
 start(
     {config, Port, CertFile, KeyFile, Routes, Tcp, TcpPort, Http, WebTransport, Origins, Fallback,
         MisdirectedCheck, MaxFrame, MaxStreams, MaxRequests, Grace, Validator, Authorizer,
-        Interceptors}
+        Interceptors, Telemetry}
 ) ->
     Invalid = [Origin || Origin <- Origins, trevrpc_admission:normalize_origin(Origin) =:= error],
     case [Path || {Path, _} <- Routes] -- lists:usort([Path || {Path, _} <- Routes]) of
@@ -246,7 +246,8 @@ start(
                     webtransport => WebTransport,
                     webtransport_admission => trevrpc_admission:same_origin(Origins),
                     misdirected_request_check => MisdirectedCheck,
-                    interceptors => [interceptor(Interceptor) || Interceptor <- Interceptors]
+                    interceptors => [interceptor(Interceptor) || Interceptor <- Interceptors],
+                    telemetry => Telemetry
                 },
                 [
                     {tcp_port, TcpPort},

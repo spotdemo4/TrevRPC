@@ -148,6 +148,10 @@ pub type Config {
     /// Run in order before the handler of every call, the first registering
     /// the finish function that runs last.
     interceptors: List(Interceptor),
+    /// Whether every call emits the `telemetry` events of
+    /// `trevrpc_telemetry`, which cost a little of every call, so they are
+    /// off by default.
+    telemetry: Bool,
   )
 }
 
@@ -178,6 +182,7 @@ pub fn config(
     validator: None,
     authorizer: None,
     interceptors: [],
+    telemetry: False,
   )
 }
 
