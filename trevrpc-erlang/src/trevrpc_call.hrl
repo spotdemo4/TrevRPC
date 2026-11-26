@@ -54,6 +54,8 @@
     reserve :: fun(() -> boolean()) | undefined,
     %% The request side ended: eof, or the status that ended it.
     request_end :: undefined | eof | {error, trevrpc_status:status()},
+    %% The bytes of a call's single request message, once read.
+    request_bytes = 0 :: non_neg_integer(),
     %% The datagrams the client announced with DATAGRAM_COUNT, once read.
     datagram_count :: non_neg_integer() | undefined,
     %% Datagram messages: the call's flow while it reads request datagrams,

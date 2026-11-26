@@ -123,15 +123,19 @@ validate(Validate, Method, Request, Encoded) ->
             ok;
         {error, #{code := Code} = Status} when is_atom(Code), Code =/= ok ->
             {error, Status};
-        _Other ->
-            failed(error, Method, bad_return)
+        Other ->
+            failed(error, invalid_response, #{
+                method => Method, returned => trevrpc_log:shape(Other)
+            })
     catch
         Class:Reason:Stack ->
-            failed(debug, Method, {Class, trevrpc_codec:exception(Reason, Stack)})
+            failed(debug, validator_panic, (trevrpc_log:exception(Class, Reason, Stack))#{
+                method => Method
+            })
     end.
 
-failed(Level, Method, Why) ->
-    logger:log(Level, "trevrpc request validation of ~ts failed: ~p", [Method, Why]),
+failed(Level, Phase, Fields) ->
+    trevrpc_log:log(Level, validator, Phase, Fields),
     {error, trevrpc_status:new(internal, <<"request validation failed">>)}.
 
 %%% Channels
@@ -210,6 +214,8 @@ bind(Validator, Table, Type) ->
     end.
 
 log_unbound(Type, {error, Reason}) ->
-    logger:error("trevrpc channel cannot validate ~ts: ~p", [Type, Reason]);
+    trevrpc_log:log(error, client, validator_failed, #{
+        request_type => Type, reason => trevrpc_log:shape(Reason)
+    });
 log_unbound(_Type, _Bound) ->
     ok.

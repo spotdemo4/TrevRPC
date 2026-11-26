@@ -174,22 +174,20 @@ handshake_owned(Socket, Accept, Timeout) ->
                         ok ->
                             ok;
                         {error, Reason} ->
-                            logger:warning("trevrpc: refused ~s connection from ~s: ~p", [
-                                name(Protocol), Peer, Reason
-                            ]),
+                            trevrpc_log:log(warning, server, connection_refused, #{
+                                protocol => name(Protocol), peer => Peer, reason => Reason
+                            }),
                             ssl:close(Tls)
                     end;
                 #{} ->
                     Other = ssl:negotiated_protocol(Tls),
-                    logger:warning(
-                        "trevrpc: TLS connection from ~s negotiated ~p, which is not served", [
-                            Peer, Other
-                        ]
-                    ),
+                    trevrpc_log:log(debug, server, tls_handshake_failed, #{
+                        peer => Peer, reason => {protocol_not_served, Other}
+                    }),
                     ssl:close(Tls)
             end;
         {error, Reason} ->
-            logger:warning("trevrpc: TLS handshake from ~s failed: ~p", [Peer, Reason]),
+            trevrpc_log:log(debug, server, tls_handshake_failed, #{peer => Peer, reason => Reason}),
             _ = ssl:close(Socket),
             ok
     end.

@@ -93,8 +93,12 @@ log_test() ->
         ok = logger:set_primary_config(Primary)
     end.
 
-log(#{level := Level, msg := {Format, Args}}, #{config := Pid}) when is_list(Format) ->
-    Pid ! {codec_log, Level, lists:flatten(io_lib:format(Format, Args))};
+log(#{level := Level, msg := {report, Report}, meta := #{domain := [trevrpc, codec]} = Meta}, #{
+    config := Pid
+}) ->
+    #{report_cb := Format} = Meta,
+    {Text, Args} = Format(Report),
+    Pid ! {codec_log, Level, lists:flatten(io_lib:format(Text, Args))};
 log(_Event, _Config) ->
     ok.
 

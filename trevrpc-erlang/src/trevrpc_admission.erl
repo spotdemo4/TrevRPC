@@ -94,14 +94,16 @@ same_origin(_Request, _Allowed) ->
 
 %% @doc Runs `Admission' on `Request'. An admission that raises refuses
 %% the request, and the error is returned to be reported.
--spec admit(admission(), request()) -> boolean() | {error, term()}.
+-spec admit(admission(), request()) -> boolean() | {error, map()}.
 admit(Admission, Request) ->
     try Admission(Request) of
         true -> true;
         false -> false;
-        Other -> {error, {bad_return, Other}}
+        Other -> {error, #{returned => trevrpc_log:shape(Other)}}
     catch
-        Class:Reason -> {error, {Class, Reason}}
+        %% The request's headers may hold credentials, so only the
+        %% exception's shape is kept.
+        Class:Reason:Stack -> {error, trevrpc_log:exception(Class, Reason, Stack)}
     end.
 
 %% @doc An origin (`scheme://host[:port]') with its scheme and host in lower

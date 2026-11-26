@@ -393,6 +393,8 @@ finish(Outcome, Req, Stream) ->
     end.
 
 log_failure(Req, Class, Reason, Stacktrace) ->
-    logger:error("trevrpc: the HTTP fallback failed for ~s ~s: ~p", [
-        get(method, Req), get(path, Req), {Class, Reason, Stacktrace}
-    ]).
+    trevrpc_log:log(error, server, fallback_panic, (trevrpc_log:exception(
+        Class, Reason, Stacktrace
+    ))#{
+        http_method => get(method, Req), path => get(path, Req)
+    }).

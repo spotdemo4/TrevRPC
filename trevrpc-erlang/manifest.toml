@@ -15,6 +15,7 @@ packages = [
   { name = "idna", version = "8.0.0", build_tools = ["rebar3"], requirements = [], otp_app = "idna", source = "hex", outer_checksum = "E0C5CE7846F14515AF66142A55B8097D5F46D10DF9235E781F168BEF5622BCF9" },
   { name = "qmux", version = "1.13.0", build_tools = ["gleam"], requirements = [], source = "local", path = "qmux" },
   { name = "quic", version = "3.3.0", build_tools = ["rebar3"], requirements = ["idna"], otp_app = "quic", source = "hex", outer_checksum = "8BE3AF3C8FE9B11A60C7443C6173019264DD2147DA62759BC772CD9233E16BEC" },
+  { name = "telemetry", version = "1.4.3", build_tools = ["rebar3"], requirements = [], otp_app = "telemetry", source = "hex", outer_checksum = "17A63581CF2E832A238287F5FE6811E8CA1F333249F1376AD653164A3C4770D4" },
   { name = "webtransport", version = "0.5.13", build_tools = ["rebar3"], requirements = ["h2", "quic"], otp_app = "webtransport", source = "hex", outer_checksum = "97C89AB850110DF2EDC000C37E880FEDC629954E12E2A3BEED7EF804B55A165B" },
 ]
 
@@ -26,4 +27,5 @@ gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 h2 = { version = ">= 0.18.0 and < 0.19.0" }
 qmux = { path = "qmux" }
 quic = { version = ">= 3.3.0 and < 3.4.0" }
+telemetry = { version = ">= 1.3.0 and < 2.0.0" }
 webtransport = { version = ">= 0.5.13 and < 0.6.0" }

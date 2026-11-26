@@ -34,12 +34,14 @@
 %% the race between a call that finishes and a deadline or cancellation
 %% that ends it: exactly one of them writes the call's end.
 %%
-%% The finish functions a call's interceptors registered are kept here
-%% too, as the call process sends each ({@link intercepted/5}), and run
-%% from here once, in a process of their own: with the status the call
-%% process reports after it wrote its STATUS ({@link finished/4}), or with
-%% the status of whatever else ended it, since a call process that was
-%% stopped cannot run them itself.
+%% An admitted call's end is reported once, however it ends. The call
+%% process tells this one how it ended after it wrote its STATUS ({@link
+%% ended/4}), then emits its telemetry stop (see {@link trevrpc_telemetry});
+%% for a call stopped before it told, this process emits the stop itself,
+%% with the status of whatever stopped it. Either way the finish functions
+%% the call's interceptors registered, which the call process sends here as
+%% it gets them ({@link intercepted/4}), run from here once, in a process of
+%% their own, since a call process that was stopped cannot run them.
 %%
 %% A native QUIC connection, a QMux session and a WebTransport session keep
 %% the connection metadata sets their client offered, at most four, in an
@@ -52,7 +54,7 @@
 -behaviour(gen_server).
 
 -export([start/2, start_qmux/3, start_http/3, serve_h3/4, shutdown/1, admit/4, finish/3, reserve/4]).
--export([intercepted/5, finished/4]).
+-export([intercepted/4, ended/4]).
 -export([store_connection_metadata/3, connection_metadata/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -88,7 +90,10 @@
     %% The finish functions the call's interceptors registered, the last
     %% first, until they run, and what they get of the call's method.
     finishes = [] :: [trevrpc_server:finish()],
-    method :: map() | undefined
+    %% The call's telemetry metadata, once admitted, and whether its end was
+    %% reported.
+    call :: trevrpc_telemetry:meta() | undefined,
+    reported = false :: boolean()
 }).
 
 -record(state, {
@@ -207,18 +212,18 @@ serve_h3(Pid, H3, Quic, ServerName) ->
     gen_server:call(Pid, {h3, H3, Quic, ServerName}).
 
 %% @doc Keeps `Finish', a finish function that an interceptor of the call
-%% on stream `Id' registered, to run once the call ends, with `Method', what
-%% it gets of the call's method (see {@link trevrpc_server:finished()}).
-%% Called by the call process, which may be stopped at any moment.
--spec intercepted(pid(), non_neg_integer(), reference(), trevrpc_server:finish(), map()) -> ok.
-intercepted(Pid, Id, Ref, Finish, Method) ->
-    gen_server:cast(Pid, {intercepted, Id, Ref, Finish, Method}).
+%% on stream `Id' registered, to run once the call ends. Called by the call
+%% process, which may be stopped at any moment.
+-spec intercepted(pid(), non_neg_integer(), reference(), trevrpc_server:finish()) -> ok.
+intercepted(Pid, Id, Ref, Finish) ->
+    gen_server:cast(Pid, {intercepted, Id, Ref, Finish}).
 
-%% @doc Runs the finish functions of the call on stream `Id', which ended
-%% with `Status' once it wrote its end.
--spec finished(pid(), non_neg_integer(), reference(), trevrpc_status:status()) -> ok.
-finished(Pid, Id, Ref, Status) ->
-    gen_server:cast(Pid, {finished, Id, Ref, Status}).
+%% @doc Reports that the admitted call on stream `Id' ended with `Status'
+%% once it wrote its end, which runs its finish functions; the call process
+%% emits its telemetry stop itself.
+-spec ended(pid(), non_neg_integer(), reference(), trevrpc_status:status()) -> ok.
+ended(Pid, Id, Ref, Status) ->
+    gen_server:cast(Pid, {ended, Id, Ref, Status}).
 
 %% @doc Cancels every call, waits for their handlers up to the graceful
 %% shutdown timeout, then closes the connection.
@@ -378,18 +383,19 @@ handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
 handle_cast({connection_metadata, Id, Set}, State) ->
     {noreply, store_metadata(Id, Set, State)};
-handle_cast({intercepted, Id, Ref, Finish, Method}, #state{streams = Streams} = State) ->
+handle_cast({intercepted, Id, Ref, Finish}, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #entry{ref = Ref, finishes = Finishes} = Entry} ->
-            Intercepted = Entry#entry{finishes = [Finish | Finishes], method = Method},
+            Intercepted = Entry#entry{finishes = [Finish | Finishes]},
             {noreply, State#state{streams = Streams#{Id := Intercepted}}};
         _ ->
             {noreply, State}
     end;
-handle_cast({finished, Id, Ref, Status}, #state{streams = Streams} = State) ->
+handle_cast({ended, Id, Ref, Status}, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #entry{state = finishing, ref = Ref} = Entry} ->
-            {noreply, State#state{streams = Streams#{Id := run_finishes(Entry, Status)}}};
+            Reported = run_finishes(Entry#entry{reported = true}, Status),
+            {noreply, State#state{streams = Streams#{Id := Reported}}};
         _ ->
             {noreply, State}
     end;
@@ -495,6 +501,18 @@ handle_info({'DOWN', Monitor, process, _Pid, Reason}, #state{monitors = Monitors
         error -> server_down(Monitor, State)
     end;
 handle_info(kill_calls, #state{streams = Streams} = State) ->
+    _ =
+        case map_size(Streams) of
+            0 ->
+                ok;
+            Left ->
+                trevrpc_log:log(error, server, shutdown_incomplete, #{
+                    calls => Left,
+                    graceful_shutdown_timeout => maps:get(
+                        graceful_shutdown_timeout, State#state.config
+                    )
+                })
+        end,
     _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams)],
     %% A STATUS that a client which stopped reading still has not taken
     %% holds the connection no longer.
@@ -507,7 +525,7 @@ terminate(_Reason, #state{streams = Streams, sessions = Sessions} = State) ->
     %% Calls still in flight, as when the connection closes under them,
     %% give their slots in the server's request limit back.
     _ = maps:fold(fun release/3, State, Streams),
-    _ = [run_finishes(Entry, ended_status(State)) || Entry <- maps:values(Streams)],
+    _ = [report_end(Entry, ended_status(State)) || Entry <- maps:values(Streams)],
     %% Writers waiting for the send queue that outlive their call, as a
     %% call's datagram sender may, stop waiting.
     _ = [Pid ! {trevrpc_stream, Ref, closed} || {Pid, Ref} <- State#state.send_waiters],
@@ -599,6 +617,7 @@ full(#state{active = Active, config = #{max_streams_per_connection := Max}}) ->
 %% Starts the call of the stream that opened, which reads its REQUEST.
 open_stream(Id, #state{active = Active, config = Config} = State0) ->
     Ref = make_ref(),
+    Started = erlang:monotonic_time(),
     {Peer, State} = peer(State0),
     {Pid, Monitor} = trevrpc_server_call:start(#{
         transport => State#state.transport,
@@ -607,9 +626,10 @@ open_stream(Id, #state{active = Active, config = Config} = State0) ->
         router => self(),
         config => Config,
         connection_metadata => State#state.metadata_sets,
-        peer => Peer
+        peer => Peer,
+        started => Started
     }),
-    Entry = #entry{ref = Ref, pid = Pid, monitor = Monitor, started = erlang:monotonic_time()},
+    Entry = #entry{ref = Ref, pid = Pid, monitor = Monitor, started = Started},
     State#state{
         streams = (State#state.streams)#{Id => Entry},
         monitors = (State#state.monitors)#{Monitor => Id},
@@ -663,9 +683,9 @@ misdirected(Id, Headers, #state{server_name = ServerName} = State) ->
     Authority = trevrpc_http:authority(Headers),
     case trevrpc_http:misdirected(Authority, ServerName) of
         true ->
-            logger:debug("trevrpc: answered 421 to a request for ~s on a connection for ~s", [
-                Authority, ServerName
-            ]),
+            trevrpc_log:log(debug, server, misdirected_request, #{
+                authority => Authority, server_name => ServerName
+            }),
             Message = <<"misdirected request: this connection serves ", ServerName/binary>>,
             refuse_http(Id, 421, refusal_headers([], State), Message, State),
             true;
@@ -810,9 +830,11 @@ upgrade(Id, Method, Target, Headers, #state{config = #{http_path := HttpPath} = 
                 {ok, Accept, Accepted} ->
                     accept_websocket(Id, Accept, Accepted, State);
                 {refuse, Status, Message, Refused} ->
-                    logger:warning("trevrpc: refused WebSocket upgrade from ~s with ~b: ~s", [
-                        trevrpc_http1:describe(Refused), Status, Message
-                    ]),
+                    trevrpc_log:log(debug, server, session_admission, (trevrpc_http1:fields(
+                        Refused
+                    ))#{
+                        transport => websocket, status => Status, message => Message
+                    }),
                     refuse_http(Id, Status, refusal_headers([], State), Message, State),
                     {noreply, State}
             end
@@ -834,24 +856,26 @@ accept_websocket(Id, Accept, Request, #state{transport = {h1, Conn}, config = Co
             }),
             case qmux:start({qmux_ssl, Socket}, server, self(), Opts) of
                 {ok, Session, Queue} ->
-                    logger:info("trevrpc: WebSocket session from ~s", [
-                        trevrpc_http1:describe(Request)
-                    ]),
+                    trevrpc_log:log(debug, server, session_upgrade_success, (trevrpc_http1:fields(
+                        Request
+                    ))#{
+                        transport => websocket
+                    }),
                     {noreply, State#state{
                         transport = {qmux, Session, Queue},
                         session_monitor = monitor(process, Session)
                     }};
                 {error, Reason} ->
-                    logger:warning("trevrpc: refused WebSocket session from ~s: ~p", [
-                        trevrpc_http1:describe(Request), Reason
-                    ]),
+                    trevrpc_log:log(debug, server, session_upgrade, (trevrpc_http1:fields(Request))#{
+                        transport => websocket, reason => Reason
+                    }),
                     ok = trevrpc_http1:refuse_session(Socket),
                     {stop, normal, State}
             end;
         {error, Reason} ->
-            logger:warning("trevrpc: WebSocket upgrade from ~s failed: ~p", [
-                trevrpc_http1:describe(Request), Reason
-            ]),
+            trevrpc_log:log(debug, server, session_upgrade, (trevrpc_http1:fields(Request))#{
+                transport => websocket, reason => trevrpc_log:shape(Reason)
+            }),
             {stop, normal, State}
     end.
 
@@ -1192,6 +1216,7 @@ admitted(Id, #entry{ref = Ref, pid = Pid} = Entry, Admission, Flow, Decode, Stat
     Running = Entry#entry{
         state = running,
         admitted = true,
+        call = maps:get(telemetry, Admission),
         flow = Flow,
         timer = start_timer(Timeout, {deadline, Id}),
         reserved =
@@ -1244,45 +1269,59 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
         #{Id := #entry{state = finishing} = Entry} ->
             %% A call stopped while it wrote its end, which it could not
             %% report.
-            _ = run_finishes(Entry, ended_status(State)),
+            _ = report_end(Entry, ended_status(State)),
             maybe_close(remove(Id, State));
         #{Id := #entry{state = expiring, fin = Fin} = Entry} ->
             Status = trevrpc_status:new(deadline_exceeded, <<"deadline exceeded">>),
-            _ = run_finishes(Entry, Status),
+            _ = report_end(Entry, Status),
             maybe_close(remove(Id, lone_status(Id, Fin, Status, State)));
         #{Id := #entry{state = overflowing, fin = Fin} = Entry} ->
             Status = trevrpc_status:new(resource_exhausted, <<"requests read too slowly">>),
-            _ = run_finishes(Entry, Status),
+            _ = report_end(Entry, Status),
             maybe_close(remove(Id, lone_status(Id, Fin, Status, State)));
         #{Id := #entry{state = cancelling} = Entry} ->
-            _ = run_finishes(Entry, trevrpc_status:new(cancelled, <<"RPC cancelled">>)),
+            _ = report_end(Entry, trevrpc_status:new(cancelled, <<"RPC cancelled">>)),
             maybe_close(remove(Id, State));
         #{Id := #entry{state = shutdown} = Entry} ->
             cut_off(Id, State),
-            _ = run_finishes(Entry, shutdown_status()),
+            _ = report_end(Entry, shutdown_status()),
             maybe_close(remove(Id, State));
         #{Id := #entry{state = Running, fin = Fin} = Entry} when
             Running =:= starting; Running =:= running
         ->
             %% The call process failed outside its handler, which catches
             %% handler failures itself.
-            logger:error("trevrpc call process on stream ~b exited: ~p", [Id, Reason]),
+            trevrpc_log:log(error, server, internal_error, (exit_fields(Reason))#{
+                stream => Id, method => call_method(Entry)
+            }),
             cancel_timer(Entry),
             Status = trevrpc_status:new(internal, <<"internal server error">>),
-            _ = run_finishes(Entry, Status),
+            _ = report_end(Entry, Status),
             State1 = lone_status(Id, Fin, Status, release(Id, Entry, State)),
             maybe_close(remove(Id, State1));
         _ ->
             maybe_close(State)
     end.
 
+%% Reports the end of a call that this process stopped, with `Status',
+%% unless the call process already did: its telemetry stop, if it was
+%% admitted, and its finish functions.
+report_end(#entry{call = undefined} = Entry, _Status) ->
+    Entry;
+report_end(#entry{reported = true} = Entry, _Status) ->
+    Entry;
+report_end(#entry{call = Meta, started = Started} = Entry, Status) ->
+    trevrpc_telemetry:stop(Started, Meta, Status, {0, 0}),
+    run_finishes(Entry#entry{reported = true}, Status).
+
 %% Runs the finish functions of a call that ended with `Status', once, in a
 %% process of their own, so that a slow or failing one cannot hold this
 %% process back, and returns the entry without them.
 run_finishes(#entry{finishes = []} = Entry, _Status) ->
     Entry;
-run_finishes(#entry{finishes = Finishes, method = Method, started = Started} = Entry, Status) ->
+run_finishes(#entry{finishes = Finishes, call = Meta, started = Started} = Entry, Status) ->
     Elapsed = erlang:convert_time_unit(erlang:monotonic_time() - Started, native, microsecond),
+    Method = maps:with([method, service, method_name, kind], Meta),
     Finished = Method#{status => Status, elapsed => Elapsed},
     _ = spawn(fun() -> lists:foreach(fun(Finish) -> run_finish(Finish, Finished) end, Finishes) end),
     Entry#entry{finishes = []}.
@@ -1292,10 +1331,21 @@ run_finish(Finish, #{method := Method} = Finished) ->
         Finish(Finished)
     catch
         Class:Reason:Stack ->
-            logger:error("trevrpc finish function of ~ts failed: ~p", [
-                Method, {Class, Reason, Stack}
-            ])
+            trevrpc_log:log(error, server, interceptor_panic, (trevrpc_log:exception(
+                Class, Reason, Stack
+            ))#{
+                method => Method, finish => true
+            })
     end.
+
+%% What a call process's exit reason says, without what it was raised on.
+exit_fields({Reason, [Frame | _] = Stack}) when is_tuple(Frame) ->
+    trevrpc_log:exception(error, Reason, Stack);
+exit_fields(Reason) ->
+    #{reason => trevrpc_log:shape(Reason)}.
+
+call_method(#entry{call = #{method := Method}}) -> Method;
+call_method(_Entry) -> undefined.
 
 %% The status of a call whose stream ended under it: the server's shutdown,
 %% or the client's or the connection's end.

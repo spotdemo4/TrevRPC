@@ -2,7 +2,9 @@
     {description, "Protobuf over QUIC, HTTP/3 & WebTransport"},
     {vsn, "1.13.0"},
     {registered, []},
-    {applications, [kernel, stdlib, crypto, public_key, ssl, quic, h2, h1, ws, webtransport, qmux]},
+    {applications, [
+        kernel, stdlib, crypto, public_key, ssl, quic, h2, h1, ws, webtransport, qmux, telemetry
+    ]},
     {env, []},
     {modules, []},
     {licenses, ["MIT"]},

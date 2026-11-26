@@ -506,7 +506,12 @@ admit_test() ->
     ?assertNot(
         trevrpc_admission:admit(fun trevrpc_admission:no_origin/1, Request#{origin => <<"x">>})
     ),
+    %% A failure is kept by its shape, as the request's headers may hold
+    %% credentials.
     ?assertMatch(
-        {error, {error, boom}}, trevrpc_admission:admit(fun(_) -> error(boom) end, Request)
+        {error, #{class := error, reason := boom}},
+        trevrpc_admission:admit(fun(_) -> error(boom) end, Request)
     ),
-    ?assertMatch({error, {bad_return, 1}}, trevrpc_admission:admit(fun(_) -> 1 end, Request)).
+    ?assertMatch(
+        {error, #{returned := number}}, trevrpc_admission:admit(fun(_) -> 1 end, Request)
+    ).

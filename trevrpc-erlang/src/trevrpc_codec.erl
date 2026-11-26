@@ -11,15 +11,12 @@
 %% the other way round. A codec that raises cannot encode or decode the
 %% message, and the call gets a status saying so. A failed encode is a bug
 %% of this side, logged as an error; a failed decode is more likely a bad
-%% peer, logged at debug level. Either way the log has the exception's
-%% class, its reason's tag and where it was raised, never the message or
-%% its bytes.
+%% peer, logged at debug level. Either way the report ({@link trevrpc_log})
+%% has the exception's class, its reason's tag and where it was raised,
+%% never the message or its bytes.
 -module(trevrpc_codec).
 
 -export([check/1, encode/2, decode/2]).
-
-%% Used by trevrpc_validator.
--export([exception/2]).
 
 -export_type([codec/0]).
 
@@ -62,49 +59,10 @@ decode(#{decode := Decode}, Bin) ->
     end.
 
 failed(Level, Op, Class, Reason, Stack) ->
-    {Cause, Location} = exception(Reason, Stack),
-    logger:log(Level, "trevrpc codec failed to ~s a message: ~p:~p at ~p", [
-        Op, Class, Cause, Location
-    ]),
+    Phase =
+        case Op of
+            encode -> encode_failed;
+            decode -> decode_failed
+        end,
+    trevrpc_log:log(Level, codec, Phase, trevrpc_log:exception(Class, Reason, Stack)),
     error.
-
-%% @private What an exception raised on a message, or in a server's hook,
-%% was, and where, for a log that must not hold the message or the call's
-%% metadata: its reason's tag, and the function that raised it, without its
-%% arguments.
--spec exception(term(), [tuple()]) -> {term(), term()}.
-exception(Reason, Stack) ->
-    {cause(Reason), location(Stack)}.
-
-%% What a failure was, without what it failed on: gpb's failures carry the
-%% bytes or the message, and others may too, so only tags and names stay.
-cause({gpb_error, {decoding_failure, {_Bin, Type, {Class, Reason, _Stack}}}}) when
-    is_atom(Type)
-->
-    {decoding_failure, Type, Class, tag(Reason)};
-cause({gpb_type_error, {Error, Info}}) when is_list(Info) ->
-    {type_error, tag(Error), path(proplists:get_value(path, Info))};
-cause(Reason) ->
-    tag(Reason).
-
-tag(Reason) when is_atom(Reason) -> Reason;
-tag(Reason) when tuple_size(Reason) > 0, is_atom(element(1, Reason)) -> element(1, Reason);
-tag(_Reason) -> other.
-
-%% gpb's path names fields, as an atom or a string.
-path(Path) when is_atom(Path) -> Path;
-path(Path) when is_list(Path) -> unicode:characters_to_binary(Path);
-path(_Path) -> unknown.
-
-%% The function that raised, without its arguments, and its file and line.
-location([{Module, Function, Arity, Info} | _]) when is_integer(Arity) ->
-    {Module, Function, Arity, place(Info)};
-location([{Module, Function, Args, Info} | _]) when is_list(Args) ->
-    {Module, Function, length(Args), place(Info)};
-location(_Stack) ->
-    unknown.
-
-place(Info) when is_list(Info) ->
-    [Entry || {Key, _} = Entry <- Info, Key =:= file orelse Key =:= line];
-place(_Info) ->
-    [].

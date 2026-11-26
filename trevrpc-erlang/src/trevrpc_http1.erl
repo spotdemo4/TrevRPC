@@ -13,7 +13,7 @@
 %% the HTTP path go to the HTTP fallback, or get `404' without one.
 -module(trevrpc_http1).
 
--export([check_upgrade/5, describe/1, refuse_session/1]).
+-export([check_upgrade/5, fields/1, refuse_session/1]).
 
 %% WebSocket close code 1013: try again later, for a session refused after
 %% its upgrade.
@@ -77,23 +77,19 @@ check(Method, Headers, Request, #{admission := Admission}) ->
                         false ->
                             {refuse, 403, <<"forbidden">>};
                         {error, Reason} ->
-                            logger:error("trevrpc: the WebTransport admission failed: ~p", [
-                                Reason
-                            ]),
+                            trevrpc_log:log(error, server, admission_panic, Reason#{
+                                admission => <<"WebTransport">>
+                            }),
                             {refuse, 500, <<"internal server error">>}
                     end
             end
     end.
 
-%% @doc The peer and origin of an upgrade's request, for the log.
--spec describe(map()) -> iolist().
-describe(Request) ->
-    Peer =
-        case Request of
-            #{peer := {Ip, Port}} -> io_lib:format("~s:~b", [inet:ntoa(Ip), Port]);
-            #{} -> "an unknown peer"
-        end,
-    io_lib:format("~s (origin ~s)", [Peer, maps:get(origin, Request, <<"none">>)]).
+%% @doc The peer and origin of an upgrade's request, for its reports:
+%% never its other headers, which may hold credentials.
+-spec fields(map()) -> #{peer := term(), origin := binary() | undefined}.
+fields(Request) ->
+    #{peer => maps:get(peer, Request, undefined), origin => maps:get(origin, Request, undefined)}.
 
 %% @doc Closes the upgraded socket of a session that could not start, with
 %% WebSocket close code 1013.

@@ -5,8 +5,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-%% The logger handler of hook_logs/0.
--export([log/2]).
+%% The logger handler of with_reports/1, and the telemetry handler of
+%% with_events/1.
+-export([log/2, event/4]).
 
 -define(UNARY, <<"/test.Hooks/Unary">>).
 -define(FAIL, <<"/test.Hooks/Fail">>).
@@ -17,6 +18,9 @@
 -define(UNKNOWN, <<"/test.Hooks/Unknown">>).
 -define(CRASH, <<"/test.Hooks/Crash">>).
 -define(BIG, <<"/test.Hooks/Big">>).
+-define(PANIC, <<"/test.Hooks/Panic">>).
+-define(GARBAGE, <<"/test.Hooks/Garbage">>).
+-define(TRAP, <<"/test.Hooks/Trap">>).
 -define(TOKEN, <<"s3cret">>).
 
 %%% The server
@@ -53,6 +57,23 @@ routes() ->
             handler => fun(_Request, Call) ->
                 #{<<"x-test">> := Pid} = trevrpc_call:metadata(Call),
                 binary_to_term(Pid) ! {handler, self()},
+                timer:sleep(infinity),
+                {ok, <<>>}
+            end
+        },
+        %% Fails on what it got, which reports must not hold.
+        ?PANIC => #{
+            kind => unary, handler => fun(Request, _Call) -> error({badmatch, Request}) end
+        },
+        ?GARBAGE => #{kind => unary, handler => fun(Request, _Call) -> {weird, Request} end},
+        %% Traps exits, so shutdown's graceful timeout runs out on it, and
+        %% tells the test it does.
+        ?TRAP => #{
+            kind => unary,
+            handler => fun(_Request, Call) ->
+                process_flag(trap_exit, true),
+                #{<<"x-test">> := Pid} = trevrpc_call:metadata(Call),
+                binary_to_term(Pid) ! {trapping, self()},
                 timer:sleep(infinity),
                 {ok, <<>>}
             end
@@ -203,6 +224,14 @@ hooks_test_() ->
             {"call process stopped from outside", fun crashed_call/0},
             {"call whose connection closes", fun closed_connection/0},
             {"call stopped while it writes its end", fun stopped_writing/0},
+            {"telemetry: a call", fun telemetry_call/0},
+            {"telemetry: an unknown method", fun telemetry_unknown/0},
+            {"telemetry: a call the authorizer rejects", fun telemetry_unauthorized/0},
+            {"telemetry: a call the admission refuses", fun telemetry_refused/0},
+            {"telemetry: a malformed REQUEST", fun telemetry_malformed/0},
+            {"telemetry: a call past its deadline", fun telemetry_deadline/0},
+            {"reports: handler failures", fun handler_reports/0},
+            {"reports: an incomplete shutdown", fun shutdown_report/0},
             {"optimistic call refused and replayed", fun replayed/0}
         ]
     ].
@@ -477,14 +506,44 @@ admitted_first() ->
         ?assertMatch({error, #{code := unimplemented}}, unary(Channel, ?UNKNOWN))
     end).
 
-%% A hook gets the call's metadata, credentials included: what it raised or
-%% returned is logged without them.
-hook_logs() ->
+%% Runs Test with the runtime's reports at every level sent here, as
+%% {report, Phase, Report, Meta, Text}, and none to the default handler.
+with_reports(Test) ->
     Primary = logger:get_primary_config(),
     {ok, #{level := Default}} = logger:get_handler_config(default),
-    ok = logger:add_handler(?MODULE, ?MODULE, #{config => self(), level => all}),
+    ok = logger:add_handler(?MODULE, ?MODULE, #{
+        config => self(),
+        level => all,
+        filters => [{trevrpc, {fun logger_filters:domain/2, {log, sub, [trevrpc]}}}],
+        filter_default => stop
+    }),
     ok = logger:update_handler_config(default, level, none),
-    ok = logger:set_primary_config(level, error),
+    ok = logger:set_primary_config(level, all),
+    try
+        Test()
+    after
+        ok = logger:remove_handler(?MODULE),
+        ok = logger:update_handler_config(default, level, Default),
+        ok = logger:set_primary_config(Primary)
+    end.
+
+log(#{level := Level, msg := {report, #{phase := Phase} = Report}, meta := Meta}, #{config := Pid}) ->
+    #{report_cb := Format} = Meta,
+    {Text, Args} = Format(Report),
+    Pid ! {report, Phase, Report, Meta#{level => Level}, lists:flatten(io_lib:format(Text, Args))};
+log(_Event, _Config) ->
+    ok.
+
+%% The next report of `Phase', skipping others.
+report(Phase) ->
+    receive
+        {report, Phase, Report, Meta, Text} -> {Report, Meta, Text}
+    after 5000 -> error({no_report, Phase})
+    end.
+
+%% A hook gets the call's metadata, credentials included: what it raised or
+%% returned is reported without them.
+hook_logs() ->
     Authorizer = fun(#{metadata := Metadata}) ->
         case Metadata of
             #{<<"x-mode">> := <<"match">>} ->
@@ -497,7 +556,7 @@ hook_logs() ->
         end
     end,
     Interceptor = fun(#{metadata := Metadata}) -> error({oops, Metadata}) end,
-    try
+    with_reports(fun() ->
         with_server(
             #{authorizer => Authorizer, interceptors => [Interceptor]},
             fun(#{channel := Channel}) ->
@@ -514,36 +573,27 @@ hook_logs() ->
                 ]
             end
         ),
-        Logs = [
-            receive
-                {hook_log, Text} -> Text
-            after 5000 -> timeout
-            end
-         || _ <- lists:seq(1, 3)
+        {Match, MatchMeta, MatchText} = report(authorizer_panic),
+        {Return, _, ReturnText} = report(invalid_response),
+        {Intercept, _, InterceptText} = report(interceptor_panic),
+        [
+            ?assertEqual(nomatch, string:find(Text, "s3cret"))
+         || Text <- [MatchText, ReturnText, InterceptText]
         ],
-        [?assertEqual(nomatch, string:find(Text, "s3cret")) || Text <- Logs],
-        [Match, Return, Intercept] = Logs,
-        ?assertNotEqual(nomatch, string:find(Match, "badmatch")),
-        ?assertNotEqual(nomatch, string:find(Match, "trevrpc_hooks_tests")),
-        ?assertNotEqual(nomatch, string:find(Return, "{weird,2}")),
-        ?assertNotEqual(nomatch, string:find(Intercept, "oops"))
-    after
-        ok = logger:remove_handler(?MODULE),
-        ok = logger:update_handler_config(default, level, Default),
-        ok = logger:set_primary_config(Primary)
-    end.
-
-log(#{msg := {Format, Args}}, #{config := Pid}) when is_list(Format) ->
-    Text = lists:flatten(io_lib:format(Format, Args)),
-    case
-        string:find(Text, "trevrpc authorizer") =/= nomatch orelse
-            string:find(Text, "trevrpc interceptor") =/= nomatch
-    of
-        true -> Pid ! {hook_log, Text};
-        false -> ok
-    end;
-log(_Event, _Config) ->
-    ok.
+        ?assertMatch(
+            #{
+                method := ?UNARY,
+                class := error,
+                reason := badmatch,
+                location := {trevrpc_hooks_tests, _, 1, _},
+                stack := [_ | _]
+            },
+            Match
+        ),
+        ?assertMatch(#{domain := [trevrpc, server], level := error}, MatchMeta),
+        ?assertMatch(#{source := authorizer, returned := {weird, 2}}, Return),
+        ?assertMatch(#{reason := oops}, Intercept)
+    end).
 
 %% A call process that something stopped from outside ends with `internal'.
 crashed_call() ->
@@ -590,6 +640,213 @@ stopped_writing() ->
         _ = intercepted(a),
         ok = trevrpc_server:stop(Server),
         ?assertMatch(#{status := #{code := unavailable}}, finished(a))
+    end).
+
+%%% Telemetry
+
+%% Runs Test with the server's call events sent here, as
+%% {telemetry, start | stop, Measurements, Metadata}.
+with_events(Test) ->
+    Id = make_ref(),
+    ok = telemetry:attach_many(
+        Id,
+        [[trevrpc, server, call, start], [trevrpc, server, call, stop]],
+        fun ?MODULE:event/4,
+        self()
+    ),
+    try
+        Test()
+    after
+        telemetry:detach(Id)
+    end.
+
+event([trevrpc, server, call, Event], Measurements, Metadata, Test) ->
+    Test ! {telemetry, Event, Measurements, Metadata}.
+
+%% A call's two events, checked to belong together.
+events() ->
+    {Measured, Meta} =
+        receive
+            {telemetry, start, M, Md} -> {M, Md}
+        after 5000 -> error(no_start)
+        end,
+    #{telemetry_span_context := Span} = Meta,
+    receive
+        {telemetry, stop, Stopped, #{telemetry_span_context := Span} = Ended} ->
+            ?assertEqual(Meta, maps:remove(status, Ended)),
+            ?assert(maps:get(duration, Stopped) >= 0),
+            {Measured, Meta, Stopped, maps:get(status, Ended)}
+    after 5000 -> error(no_stop)
+    end.
+
+%% No other event came.
+no_more_events() ->
+    receive
+        {telemetry, _, _, _} = Event -> error({unexpected, Event})
+    after 0 -> ok
+    end.
+
+telemetry_call() ->
+    with_events(fun() ->
+        with_server(#{}, fun(#{channel := Channel}) ->
+            ?assertEqual({ok, <<"hi">>}, unary(Channel, ?UNARY)),
+            {Start, Meta, Stop, Status} = events(),
+            ?assertMatch(#{monotonic_time := _, system_time := _}, Start),
+            ?assertMatch(
+                #{
+                    method := ?UNARY,
+                    service := <<"test.Hooks">>,
+                    method_name := <<"Unary">>,
+                    kind := unary,
+                    registered := true,
+                    peer := {{127, 0, 0, 1}, _}
+                },
+                Meta
+            ),
+            ?assertMatch(#{request_body_len := 2, response_body_len := 2}, Stop),
+            ?assertMatch(#{code := ok}, Status),
+            no_more_events()
+        end)
+    end).
+
+telemetry_unknown() ->
+    with_events(fun() ->
+        with_server(#{}, fun(#{channel := Channel}) ->
+            ?assertMatch({error, #{code := unimplemented}}, unary(Channel, ?UNKNOWN)),
+            {_, Meta, _, Status} = events(),
+            ?assertMatch(#{method := ?UNKNOWN, registered := false}, Meta),
+            ?assertMatch(#{code := unimplemented}, Status),
+            no_more_events()
+        end)
+    end).
+
+telemetry_unauthorized() ->
+    with_events(fun() ->
+        with_server(#{authorizer => trevrpc_authorizer:bearer(?TOKEN)}, fun(#{channel := Channel}) ->
+            ?assertMatch({error, #{code := unauthenticated}}, unary(Channel, ?UNARY)),
+            {_, #{registered := true}, _, Status} = events(),
+            ?assertMatch(#{code := unauthenticated}, Status),
+            no_more_events()
+        end)
+    end).
+
+telemetry_refused() ->
+    Test = self(),
+    Authorizer = fun(#{metadata := Metadata}) ->
+        case Metadata of
+            #{<<"x-hold">> := _} ->
+                Test ! {holding, self()},
+                receive
+                    release -> ok
+                end;
+            #{} ->
+                ok
+        end
+    end,
+    with_events(fun() ->
+        Opts = #{authorizer => Authorizer, max_concurrent_requests => 1},
+        with_server(Opts, fun(#{channel := Channel}) ->
+            spawn(fun() ->
+                Test ! {held, unary(Channel, ?UNARY, #{metadata => #{<<"x-hold">> => <<"1">>}})}
+            end),
+            Holder =
+                receive
+                    {holding, Pid} -> Pid
+                after 5000 -> error(not_holding)
+                end,
+            {telemetry, start, _, #{telemetry_span_context := Held}} =
+                receive
+                    {telemetry, start, _, _} = Started -> Started
+                end,
+            ?assertMatch({error, #{code := unavailable}}, unary(Channel, ?UNARY)),
+            {_, _, _, Status} = events(),
+            ?assertMatch(#{code := unavailable, message := <<"too many concurrent RPCs">>}, Status),
+            Holder ! release,
+            receive
+                {held, _} -> ok
+            end,
+            receive
+                {telemetry, stop, _, #{telemetry_span_context := Held, status := #{code := ok}}} ->
+                    ok
+            after 5000 -> error(no_stop)
+            end,
+            no_more_events()
+        end)
+    end).
+
+telemetry_malformed() ->
+    with_events(fun() ->
+        with_server(#{}, fun(#{channel := Channel}) ->
+            ?assertMatch({error, #{code := invalid_argument}}, unary(Channel, <<"nope">>)),
+            {_, Meta, _, Status} = events(),
+            ?assertMatch(
+                #{method := <<"nope">>, service := <<>>, method_name := <<>>, registered := false},
+                Meta
+            ),
+            ?assertMatch(#{code := invalid_argument}, Status),
+            no_more_events()
+        end)
+    end).
+
+%% The connection emits the stop of a call it stopped, once.
+telemetry_deadline() ->
+    with_events(fun() ->
+        with_server(#{}, fun(#{channel := Channel}) ->
+            {ok, Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 200}),
+            {_, #{kind := bidirectional_streaming}, Stop, Status} = events(),
+            ?assertMatch(#{code := deadline_exceeded}, Status),
+            ?assertMatch(#{request_body_len := 0, response_body_len := 0}, Stop),
+            ?assertMatch({error, #{code := deadline_exceeded}}, trevrpc_client:recv(Call)),
+            no_more_events()
+        end)
+    end).
+
+%%% Reports
+
+handler_reports() ->
+    with_reports(fun() ->
+        with_server(#{}, fun(#{channel := Channel}) ->
+            Secret = #{metadata => #{<<"authorization">> => <<"Bearer s3cret">>}},
+            ?assertMatch({error, #{code := internal}}, unary(Channel, ?PANIC, Secret)),
+            ?assertMatch({error, #{code := internal}}, unary(Channel, ?FAIL)),
+            ?assertMatch({error, #{code := internal}}, unary(Channel, ?GARBAGE, Secret))
+        end),
+        {Panic, Meta, PanicText} = report(handler_panic),
+        ?assertMatch(#{domain := [trevrpc, server], level := error}, Meta),
+        ?assertMatch(
+            #{
+                method := ?PANIC,
+                class := error,
+                reason := badmatch,
+                location := {trevrpc_hooks_tests, _, 2, [_ | _]}
+            },
+            Panic
+        ),
+        ?assertEqual(nomatch, string:find(PanicText, "hi")),
+        {Internal, _, _} = report(internal_error),
+        ?assertMatch(#{method := ?FAIL, message := <<"database is down">>}, Internal),
+        {Garbage, _, GarbageText} = report(invalid_response),
+        ?assertMatch(#{method := ?GARBAGE, source := handler, returned := {weird, 2}}, Garbage),
+        ?assertEqual(nomatch, string:find(GarbageText, "s3cret"))
+    end).
+
+shutdown_report() ->
+    with_reports(fun() ->
+        with_server(#{graceful_shutdown_timeout => 100}, fun(
+            #{channel := Channel, server := Server}
+        ) ->
+            Test = self(),
+            Metadata = #{<<"x-test">> => term_to_binary(Test)},
+            spawn(fun() -> Test ! {result, unary(Channel, ?TRAP, #{metadata => Metadata})} end),
+            receive
+                {trapping, _} -> ok
+            after 5000 -> error(not_trapping)
+            end,
+            ok = trevrpc_server:stop(Server)
+        end),
+        {Report, Meta, _} = report(shutdown_incomplete),
+        ?assertMatch(#{calls := Calls} when Calls >= 1, Report),
+        ?assertMatch(#{level := error}, Meta)
     end).
 
 %%% Ready-made authorizers

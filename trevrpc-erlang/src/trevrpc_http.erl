@@ -110,7 +110,7 @@ admit(Version, Method, Path, Headers, Peer, #{admission := Admission}, What) ->
         false ->
             {refuse, 403, [], <<What/binary, " admission denied">>};
         {error, Reason} ->
-            logger:error("trevrpc: the ~s admission failed: ~p", [What, Reason]),
+            trevrpc_log:log(error, server, admission_panic, Reason#{admission => What}),
             {refuse, 500, [], <<"internal server error">>}
     end.
 

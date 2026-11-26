@@ -384,6 +384,8 @@ init(Opts) ->
     _ = application:ensure_all_started(ssl),
     _ = application:ensure_all_started(h1),
     _ = application:ensure_all_started(h2),
+    %% Calls emit telemetry events, whose handlers live in its table.
+    _ = application:ensure_all_started(telemetry),
     maybe
         {ok, Credentials} ?= trevrpc_quic:credentials(Opts),
         {ok, Compression} ?= compression(Opts),
@@ -917,7 +919,7 @@ handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{connections = Conn
 handle_info({'EXIT', Tcp, Reason}, #state{tcp = Tcp} = State) ->
     %% A server that silently stopped serving TCP would strand the clients
     %% QUIC cannot reach: stop it all instead.
-    logger:error("trevrpc: the TCP listener exited: ~p", [Reason]),
+    trevrpc_log:log(error, server, listener_exited, #{listener => tcp, reason => Reason}),
     {stop, {tcp_listener, Reason}, State#state{tcp = undefined}};
 handle_info({'EXIT', _From, normal}, State) ->
     {noreply, State};
