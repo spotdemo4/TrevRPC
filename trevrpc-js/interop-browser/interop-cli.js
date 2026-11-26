@@ -19,8 +19,9 @@
 // WebTransport serverCertificateHashes. WebSocket connections cannot pin a certificate hash, so the
 // Chromium and Firefox contexts ignore certificate errors instead; Safari needs the certificate
 // trusted by the system. Chromium and Firefox come from PLAYWRIGHT_BROWSERS_PATH unless
-// TREVRPC_BROWSER_CHROMIUM or TREVRPC_BROWSER_FIREFOX name an executable; Safari is driven through
-// safaridriver (see safari.js).
+// TREVRPC_BROWSER_CHROMIUM or TREVRPC_BROWSER_FIREFOX name an executable, and run with the library
+// TREVRPC_BROWSER_PRELOAD names preloaded (libeatmydata, in the Nix package on Linux; see
+// browserEnvironment in driver.js); Safari is driven through safaridriver (see safari.js).
 //
 // The CLI serves the page from a loopback origin; the page fetches its input from there and posts
 // each result back, so every browser driver only has to open it.

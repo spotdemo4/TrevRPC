@@ -9,6 +9,7 @@
   makeWrapper,
   protobuf,
   gnugrep,
+  libeatmydata,
   playwright-driver,
   wireGolden,
   zstdGolden,
@@ -50,6 +51,14 @@ let
   # their plugins. It is an npm package of its own, and flake-release publishes one package.json per
   # flake attribute, so the release publishes it from `.#trevrpc-js.protocGen`.
   protocGen = callPackage ./protoc-gen-trevrpc-js { inherit interopProto trevrpcProto; };
+  # On Linux the interop CLI runs the Playwright browsers with libeatmydata preloaded, so their
+  # throwaway profiles never wait on fsync (#625; see browserEnvironment in
+  # interop-browser/driver.js). --set-default lets an empty TREVRPC_BROWSER_PRELOAD turn it off.
+  browserWrapperFlags = lib.optionals stdenv.hostPlatform.isLinux [
+    "--set-default"
+    "TREVRPC_BROWSER_PRELOAD"
+    "${libeatmydata}/lib/libeatmydata.so"
+  ];
 
   # The interop descriptors are generated from the shared interop protos, which import the TrevRPC
   # schema options, and the wire and compression tests read the shared golden vectors; all of them
@@ -183,7 +192,8 @@ buildNpmPackage (final: {
     chmod -R u+w "$interop"
     makeWrapper ${nodejs_26}/bin/node "$out/bin/trevrpc-interop-browser" \
       --add-flags "$interop/interop-browser/cli.js" \
-      --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}"
+      --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}" \
+      ${lib.escapeShellArgs browserWrapperFlags}
 
     ln -s ${protocGen}/bin/protoc-gen-trevrpc-js "$out/bin/protoc-gen-trevrpc-js"
   '';
@@ -234,7 +244,9 @@ buildNpmPackage (final: {
     grep -q 'usage: trevrpc-interop-browser bench' bench.out
 
     ${lib.optionalString stdenv.hostPlatform.isLinux ''
-      # The CLI must launch each browser and report a clean failure when no server listens.
+      # The CLI must launch each browser, with libeatmydata preloaded, and report a clean failure
+      # when no server listens.
+      grep -q 'TREVRPC_BROWSER_PRELOAD.*libeatmydata\.so' "$out/bin/trevrpc-interop-browser"
       export HOME="$TMPDIR/home"
       mkdir -p "$HOME"
       hash=0000000000000000000000000000000000000000000000000000000000000000

@@ -9,7 +9,13 @@ import { fileURLToPath } from "node:url";
 
 import { errors } from "playwright";
 
-import { LaunchAttempts, launchPlaywright, runPage } from "../interop-browser/driver.js";
+import {
+  Browsers,
+  LaunchAttempts,
+  browserEnvironment,
+  launchPlaywright,
+  runPage,
+} from "../interop-browser/driver.js";
 import { parseInteropArguments } from "../interop-browser/interop-cli.js";
 import { ScenarioNames } from "../interop-browser/names.js";
 import { runScenarios } from "../interop-browser/scenarios.js";
@@ -317,6 +323,55 @@ test("a Playwright browser that does not start in time is launched again, up to 
   const broken = fakeType([new Error("executable doesn't exist")]);
   await assert.rejects(launchPlaywright(broken, {}), /executable doesn't exist/);
   assert.equal(broken.launches(), 1);
+});
+
+test("browsers run with TREVRPC_BROWSER_PRELOAD preloaded ahead of LD_PRELOAD", () => {
+  const library = "/nix/store/x-libeatmydata/lib/libeatmydata.so";
+  assert.deepEqual(browserEnvironment({ HOME: "/home" }), { HOME: "/home" });
+  // Empty, as `TREVRPC_BROWSER_PRELOAD= trevrpc-interop-browser ...` leaves it, preloads nothing.
+  assert.deepEqual(browserEnvironment({ TREVRPC_BROWSER_PRELOAD: "", LD_PRELOAD: "a.so" }), {
+    TREVRPC_BROWSER_PRELOAD: "",
+    LD_PRELOAD: "a.so",
+  });
+  assert.deepEqual(browserEnvironment({ TREVRPC_BROWSER_PRELOAD: library }), {
+    TREVRPC_BROWSER_PRELOAD: library,
+    LD_PRELOAD: library,
+  });
+  assert.deepEqual(browserEnvironment({ TREVRPC_BROWSER_PRELOAD: library, LD_PRELOAD: "a.so" }), {
+    TREVRPC_BROWSER_PRELOAD: library,
+    LD_PRELOAD: `${library} a.so`,
+  });
+});
+
+test("Playwright's browsers launch with the preload in their environment", () => {
+  const library = "/nix/store/x-libeatmydata/lib/libeatmydata.so";
+  const env = { HOME: "/home", TREVRPC_BROWSER_PRELOAD: library };
+  for (const [browser, variable] of [
+    [Browsers.chromium, "TREVRPC_BROWSER_CHROMIUM"],
+    [Browsers.firefox, "TREVRPC_BROWSER_FIREFOX"],
+  ]) {
+    const options = browser.launchOptions({}, env, "/playwright/browser");
+    assert.equal(options.env.LD_PRELOAD, library, browser.name);
+    assert.equal(options.env.HOME, "/home", browser.name);
+    assert.equal(options.executablePath, "/playwright/browser", browser.name);
+    assert.equal(options.headless, true, browser.name);
+    assert.equal(
+      browser.launchOptions({}, { ...env, [variable]: "/own/browser" }).executablePath,
+      "/own/browser",
+      browser.name,
+    );
+    assert.equal(browser.launchOptions({}, { HOME: "/home" }).env.LD_PRELOAD, undefined);
+  }
+  // Extra options add to a browser's own rather than replace them.
+  const chromium = Browsers.chromium.launchOptions({ args: ["--extra"] }, env);
+  assert.ok(chromium.args.includes("--no-sandbox") && chromium.args.at(-1) === "--extra");
+  assert.equal(chromium.env.LD_PRELOAD, library);
+  const firefox = Browsers.firefox.launchOptions({ firefoxUserPrefs: { extra: true } }, env);
+  assert.deepEqual(firefox.firefoxUserPrefs, {
+    "network.http.http3.enable": true,
+    extra: true,
+  });
+  assert.equal(firefox.env.LD_PRELOAD, library);
 });
 
 test("the CLI fails every scenario cleanly when safaridriver cannot start", () => {

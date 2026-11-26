@@ -27,6 +27,7 @@ export function pageHtml(bundle) {
  * The browsers by name. Each opens a URL with extra launch options ({ args, firefoxUserPrefs },
  * which only Playwright's browsers take), within timeoutMs, and resolves with a session to close.
  * setupTimeoutMs, where a browser has it, replaces SetupTimeoutMs as its default timeoutMs.
+ * Playwright's browsers also give the options they launch with (see playwrightBrowser).
  *
  * pageProtocols maps each HTTP version a browser can be made to load a server's page over to the
  * extra launch options that do it, given the page ({ url, cert }). forceQuic(host, cert), where a
@@ -132,22 +133,33 @@ function importPlaywright() {
 /**
  * The Playwright browser of type name (chromium or firefox): launched headless, with certificate
  * errors ignored.
+ *
+ * Its launchOptions(extra, env, defaultExecutable) are the options open launches it with: the
+ * browser's own launch options with extra merged in, the executable that env names in
+ * executableVariable or else defaultExecutable, and the environment browserEnvironment makes of
+ * env.
  */
 function playwrightBrowser(name, executableVariable, launchOptions) {
+  const optionsFor = (extra = {}, env = process.env, defaultExecutable) => ({
+    ...launchOptions,
+    ...(extra.args && { args: [...(launchOptions.args ?? []), ...extra.args] }),
+    ...(extra.firefoxUserPrefs && {
+      firefoxUserPrefs: { ...launchOptions.firefoxUserPrefs, ...extra.firefoxUserPrefs },
+    }),
+    executablePath: env[executableVariable] || defaultExecutable,
+    env: browserEnvironment(env),
+    headless: true,
+    timeout: LaunchTimeoutMs,
+  });
   return {
     name,
+    launchOptions: optionsFor,
     async open(url, extra = {}, timeoutMs = SetupTimeoutMs) {
       const type = (await importPlaywright())[name];
-      const instance = await launchPlaywright(type, {
-        ...launchOptions,
-        ...(extra.args && { args: [...(launchOptions.args ?? []), ...extra.args] }),
-        ...(extra.firefoxUserPrefs && {
-          firefoxUserPrefs: { ...launchOptions.firefoxUserPrefs, ...extra.firefoxUserPrefs },
-        }),
-        executablePath: process.env[executableVariable] || type.executablePath(),
-        headless: true,
-        timeout: LaunchTimeoutMs,
-      });
+      const instance = await launchPlaywright(
+        type,
+        optionsFor(extra, process.env, type.executablePath()),
+      );
       const close = () => closePlaywright(instance);
       try {
         // The interop certificate is self-signed: WebTransport trusts it by hash, WebSocket cannot.
@@ -166,6 +178,24 @@ function playwrightBrowser(name, executableVariable, launchOptions) {
       return { close };
     },
   };
+}
+
+/**
+ * The environment a Playwright browser runs in: env, with the shared library that
+ * TREVRPC_BROWSER_PRELOAD names, if any, preloaded ahead of any LD_PRELOAD in env.
+ *
+ * The Nix package names libeatmydata on Linux, which makes fsync a no-op. Each launch gets a fresh
+ * profile, and Chromium verifies no certificate until it has created the profile's
+ * ServerCertificate database, which fsyncs its journal. On a machine busy writing to disk, such as
+ * a CI runner, that fsync can outlast a channel's connect deadline. A throwaway profile needs none
+ * of the durability fsync buys (#625).
+ */
+export function browserEnvironment(env = process.env) {
+  const library = env.TREVRPC_BROWSER_PRELOAD;
+  if (!library) {
+    return { ...env };
+  }
+  return { ...env, LD_PRELOAD: env.LD_PRELOAD ? `${library} ${env.LD_PRELOAD}` : library };
 }
 
 /**
