@@ -144,7 +144,9 @@ request(Stream, Deadline, Config, Sets) ->
     end.
 
 %% The metadata of the events of a call whose REQUEST failed its checks:
-%% what it decodes to, if anything.
+%% what it decodes to, if anything; none without telemetry.
+rejected_meta(_Payload, #{telemetry := false}, _Peer) ->
+    undefined;
 rejected_meta(Payload, #{routes := Routes}, Peer) ->
     case trevrpc_wire:decode_request(Payload) of
         {ok, #{method := Method, kind := Kind}} ->
@@ -286,9 +288,15 @@ invalid_status(Message) ->
 admit(Checked, Stream, Router, Config) ->
     #{request := Request, route := Routed, timeout := Timeout, started := Started} = Checked,
     #{method := Method, kind := Kind} = Request,
-    Meta = trevrpc_telemetry:meta(
-        Method, Kind, is_map_key(Method, maps:get(routes, Config)), maps:get(peer, Checked)
-    ),
+    Meta =
+        case Config of
+            #{telemetry := true, routes := Routes} ->
+                trevrpc_telemetry:meta(
+                    Method, Kind, is_map_key(Method, Routes), maps:get(peer, Checked)
+                );
+            #{telemetry := false} ->
+                undefined
+        end,
     %% A call to a method the server does not have ends once authorized,
     %% without decoding anything.
     {Requests, Offer} =
@@ -422,7 +430,8 @@ intercept([Interceptor | Rest], #{method := Method} = Info, Register) ->
 run_interceptors([], #{context := Context}, _Router, _Id, _Ref) ->
     {ok, Context};
 run_interceptors(Interceptors, #{info := Info, context := Context}, Router, Id, Ref) ->
-    Register = fun(Finish) -> trevrpc_server_conn:intercepted(Router, Id, Ref, Finish) end,
+    Method = maps:with([method, service, method_name, kind], Info),
+    Register = fun(Finish) -> trevrpc_server_conn:intercepted(Router, Id, Ref, Finish, Method) end,
     intercept(Interceptors, Info#{context => Context}, Register).
 
 merge_context(#{context := Context} = Info, Added) ->

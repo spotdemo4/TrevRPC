@@ -44,7 +44,7 @@
 %% from the process's exit, which this process monitors anyway, costs a
 %% call no message of its own. Either way the finish
 %% functions the call's interceptors registered, which the call process
-%% sends here as it gets them ({@link intercepted/4}), then run once, in a
+%% sends here as it gets them ({@link intercepted/5}), then run once, in a
 %% process of their own, since a call process that was stopped cannot run
 %% them.
 %%
@@ -59,7 +59,7 @@
 -behaviour(gen_server).
 
 -export([start/2, start_qmux/3, start_http/3, serve_h3/4, shutdown/1, admit/4, finish/3, finish/4]).
--export([reserve/4, intercepted/4, unsent/3]).
+-export([reserve/4, intercepted/5, unsent/3]).
 -export([store_connection_metadata/3, connection_metadata/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -95,9 +95,11 @@
     %% The finish functions the call's interceptors registered, the last
     %% first, until they run, and what they get of the call's method.
     finishes = [] :: [trevrpc_server:finish()],
-    %% The call's telemetry metadata, once admitted, and how it ended, as
-    %% the call process said when it asked to write its end: its status,
-    %% and the bytes of its single request and response messages.
+    method :: map() | undefined,
+    %% The call's telemetry metadata, once admitted with telemetry, and how
+    %% it ended, as the call process said when it asked to write its end:
+    %% its status, and the bytes of its single request and response
+    %% messages.
     call :: trevrpc_telemetry:meta() | undefined,
     ended :: ended() | undefined
 }).
@@ -220,11 +222,12 @@ serve_h3(Pid, H3, Quic, ServerName) ->
     gen_server:call(Pid, {h3, H3, Quic, ServerName}).
 
 %% @doc Keeps `Finish', a finish function that an interceptor of the call
-%% on stream `Id' registered, to run once the call ends. Called by the call
-%% process, which may be stopped at any moment.
--spec intercepted(pid(), non_neg_integer(), reference(), trevrpc_server:finish()) -> ok.
-intercepted(Pid, Id, Ref, Finish) ->
-    gen_server:cast(Pid, {intercepted, Id, Ref, Finish}).
+%% on stream `Id' registered, to run once the call ends, with `Method', what
+%% it gets of the call's method (see {@link trevrpc_server:finished()}).
+%% Called by the call process, which may be stopped at any moment.
+-spec intercepted(pid(), non_neg_integer(), reference(), trevrpc_server:finish(), map()) -> ok.
+intercepted(Pid, Id, Ref, Finish, Method) ->
+    gen_server:cast(Pid, {intercepted, Id, Ref, Finish, Method}).
 
 %% @doc Reports that the admitted call on stream `Id' could not write the
 %% end it gave {@link finish/4}: it ended cancelled, as its client did not
@@ -399,10 +402,10 @@ handle_call({finish, Id, Ref, Ended}, _From, #state{streams = Streams} = State) 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
 handle_cast({connection_metadata, Id, Set}, State) ->
     {noreply, store_metadata(Id, Set, State)};
-handle_cast({intercepted, Id, Ref, Finish}, #state{streams = Streams} = State) ->
+handle_cast({intercepted, Id, Ref, Finish, Method}, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #entry{ref = Ref, finishes = Finishes} = Entry} ->
-            Intercepted = Entry#entry{finishes = [Finish | Finishes]},
+            Intercepted = Entry#entry{finishes = [Finish | Finishes], method = Method},
             {noreply, State#state{streams = Streams#{Id := Intercepted}}};
         _ ->
             {noreply, State}
@@ -1325,15 +1328,13 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
             maybe_close(State)
     end.
 
-%% Reports the end of an admitted call, with `Status': its telemetry stop
-%% and its finish functions. Its entry is forgotten right after, so this
-%% happens once. A call that was not admitted reports itself, start and
-%% stop together.
+%% Reports the end of an admitted call, with `Status': its telemetry stop,
+%% if the server has telemetry, and its finish functions, if it has any.
+%% Its entry is forgotten right after, so this happens once. A call that
+%% was not admitted has neither, and reports itself.
 report_end(Entry, Status) ->
     report_end(Entry, Status, {0, 0}).
 
-report_end(#entry{call = undefined} = Entry, _Status, _Bytes) ->
-    Entry;
 report_end(#entry{call = Meta, started = Started} = Entry, Status, Bytes) ->
     trevrpc_telemetry:stop(Started, Meta, Status, Bytes),
     run_finishes(Entry, Status).
@@ -1343,9 +1344,8 @@ report_end(#entry{call = Meta, started = Started} = Entry, Status, Bytes) ->
 %% process back, and returns the entry without them.
 run_finishes(#entry{finishes = []} = Entry, _Status) ->
     Entry;
-run_finishes(#entry{finishes = Finishes, call = Meta, started = Started} = Entry, Status) ->
+run_finishes(#entry{finishes = Finishes, method = Method, started = Started} = Entry, Status) ->
     Elapsed = erlang:convert_time_unit(erlang:monotonic_time() - Started, native, microsecond),
-    Method = maps:with([method, service, method_name, kind], Meta),
     Finished = Method#{status => Status, elapsed => Elapsed},
     _ = spawn(fun() -> lists:foreach(fun(Finish) -> run_finish(Finish, Finished) end, Finishes) end),
     Entry#entry{finishes = []}.
@@ -1369,6 +1369,7 @@ exit_fields(Reason) ->
     #{reason => trevrpc_log:shape(Reason)}.
 
 call_method(#entry{call = #{method := Method}}) -> Method;
+call_method(#entry{method = #{method := Method}}) -> Method;
 call_method(_Entry) -> undefined.
 
 %% The status of a call whose stream ended under it: the server's shutdown,

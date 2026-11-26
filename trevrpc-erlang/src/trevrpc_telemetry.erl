@@ -1,6 +1,7 @@
 %% @doc The server's call metrics, as `telemetry' events.
 %%
-%% A server emits two events for every call whose REQUEST arrived, whatever
+%% A server started with `telemetry => true' (see {@link trevrpc_server})
+%% emits two events for every call whose REQUEST arrived, whatever
 %% becomes of it, calls the protocol's checks, the admission, the
 %% authorizer or an unknown method rejected before a handler ran included,
 %% as the Go and Rust servers' metrics see them:
@@ -82,8 +83,11 @@ meta(Method, Kind, Registered, Peer) ->
 -type meta_peer() :: {inet:ip_address(), inet:port_number()} | undefined.
 
 %% @private The start of a call whose stream opened at `Started'
-%% (`erlang:monotonic_time()').
--spec start(integer(), meta()) -> ok.
+%% (`erlang:monotonic_time()'). These functions do nothing for a call with
+%% no metadata, that of a server without telemetry.
+-spec start(integer(), meta() | undefined) -> ok.
+start(_Started, undefined) ->
+    ok;
 start(Started, Meta) ->
     telemetry:execute(
         ?START, #{monotonic_time => Started, system_time => Started + erlang:time_offset()}, Meta
@@ -91,8 +95,12 @@ start(Started, Meta) ->
 
 %% @private The end of a call with `Status', and the bytes of its single
 %% request and response messages.
--spec stop(integer(), meta(), trevrpc_status:status(), {non_neg_integer(), non_neg_integer()}) ->
+-spec stop(
+    integer(), meta() | undefined, trevrpc_status:status(), {non_neg_integer(), non_neg_integer()}
+) ->
     ok.
+stop(_Started, undefined, _Status, _Bytes) ->
+    ok;
 stop(Started, Meta, Status, {RequestBytes, ResponseBytes}) ->
     Now = erlang:monotonic_time(),
     telemetry:execute(
@@ -107,7 +115,7 @@ stop(Started, Meta, Status, {RequestBytes, ResponseBytes}) ->
     ).
 
 %% @private Both events of a call rejected before it was admitted.
--spec rejected(integer(), meta(), trevrpc_status:status()) -> ok.
+-spec rejected(integer(), meta() | undefined, trevrpc_status:status()) -> ok.
 rejected(Started, Meta, Status) ->
     start(Started, Meta),
     stop(Started, Meta, Status, {0, 0}).

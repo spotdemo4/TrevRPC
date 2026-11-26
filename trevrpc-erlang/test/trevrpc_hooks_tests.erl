@@ -233,6 +233,7 @@ hooks_test_() ->
             {"telemetry: a call whose deadline passes at once", fun telemetry_instant_deadline/0},
             {"telemetry: a call stopped while it writes its end", fun telemetry_stopped_writing/0},
             {"telemetry: a call whose connection closes", fun telemetry_closed_connection/0},
+            {"telemetry: off by default", fun telemetry_off/0},
             {"reports: handler failures", fun handler_reports/0},
             {"reports: an incomplete shutdown", fun shutdown_report/0},
             {"optimistic call refused and replayed", fun replayed/0}
@@ -691,7 +692,7 @@ no_more_events() ->
 
 telemetry_call() ->
     with_events(fun() ->
-        with_server(#{}, fun(#{channel := Channel}) ->
+        with_server(#{telemetry => true}, fun(#{channel := Channel}) ->
             ?assertEqual({ok, <<"hi">>}, unary(Channel, ?UNARY)),
             {Start, Meta, Stop, Status} = events(),
             ?assertMatch(#{monotonic_time := _, system_time := _}, Start),
@@ -714,7 +715,7 @@ telemetry_call() ->
 
 telemetry_unknown() ->
     with_events(fun() ->
-        with_server(#{}, fun(#{channel := Channel}) ->
+        with_server(#{telemetry => true}, fun(#{channel := Channel}) ->
             ?assertMatch({error, #{code := unimplemented}}, unary(Channel, ?UNKNOWN)),
             {_, Meta, _, Status} = events(),
             ?assertMatch(#{method := ?UNKNOWN, registered := false}, Meta),
@@ -725,7 +726,9 @@ telemetry_unknown() ->
 
 telemetry_unauthorized() ->
     with_events(fun() ->
-        with_server(#{authorizer => trevrpc_authorizer:bearer(?TOKEN)}, fun(#{channel := Channel}) ->
+        with_server(#{telemetry => true, authorizer => trevrpc_authorizer:bearer(?TOKEN)}, fun(
+            #{channel := Channel}
+        ) ->
             ?assertMatch({error, #{code := unauthenticated}}, unary(Channel, ?UNARY)),
             {_, #{registered := true}, _, Status} = events(),
             ?assertMatch(#{code := unauthenticated}, Status),
@@ -747,7 +750,7 @@ telemetry_refused() ->
         end
     end,
     with_events(fun() ->
-        Opts = #{authorizer => Authorizer, max_concurrent_requests => 1},
+        Opts = #{telemetry => true, authorizer => Authorizer, max_concurrent_requests => 1},
         with_server(Opts, fun(#{channel := Channel}) ->
             spawn(fun() ->
                 Test ! {held, unary(Channel, ?UNARY, #{metadata => #{<<"x-hold">> => <<"1">>}})}
@@ -779,7 +782,7 @@ telemetry_refused() ->
 
 telemetry_malformed() ->
     with_events(fun() ->
-        with_server(#{}, fun(#{channel := Channel}) ->
+        with_server(#{telemetry => true}, fun(#{channel := Channel}) ->
             ?assertMatch({error, #{code := invalid_argument}}, unary(Channel, <<"nope">>)),
             {_, Meta, _, Status} = events(),
             ?assertMatch(
@@ -794,7 +797,7 @@ telemetry_malformed() ->
 %% The connection emits the stop of a call it stopped, once.
 telemetry_deadline() ->
     with_events(fun() ->
-        with_server(#{}, fun(#{channel := Channel}) ->
+        with_server(#{telemetry => true}, fun(#{channel := Channel}) ->
             {ok, Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 200}),
             {_, #{kind := bidirectional_streaming}, Stop, Status} = events(),
             ?assertMatch(#{code := deadline_exceeded}, Status),
@@ -808,7 +811,7 @@ telemetry_deadline() ->
 %% events: the connection emits both.
 telemetry_instant_deadline() ->
     with_events(fun() ->
-        with_server(#{}, fun(#{channel := Channel}) ->
+        with_server(#{telemetry => true}, fun(#{channel := Channel}) ->
             [
                 begin
                     {ok, _Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 1}),
@@ -825,7 +828,11 @@ telemetry_instant_deadline() ->
 %% end reports once, from the connection, which never heard how it ended.
 telemetry_stopped_writing() ->
     with_events(fun() ->
-        Opts = #{graceful_shutdown_timeout => 200, channel => #{max_frame_size => 65536}},
+        Opts = #{
+            telemetry => true,
+            graceful_shutdown_timeout => 200,
+            channel => #{max_frame_size => 65536}
+        },
         with_server(Opts, fun(#{channel := Channel, server := Server}) ->
             {ok, Call} = trevrpc_client:client_stream(Channel, ?BIG, #{timeout => 10000}),
             ok = trevrpc_client:close_send(Call),
@@ -844,7 +851,7 @@ telemetry_stopped_writing() ->
 %% connection's end.
 telemetry_closed_connection() ->
     with_events(fun() ->
-        with_server(#{}, fun(#{channel := Channel}) ->
+        with_server(#{telemetry => true}, fun(#{channel := Channel}) ->
             {ok, _Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 5000}),
             receive
                 {telemetry, start, _, _} = Started -> self() ! Started
@@ -853,6 +860,21 @@ telemetry_closed_connection() ->
             trevrpc_channel:close(Channel),
             {_, _, _, Status} = events(),
             ?assertMatch(#{code := cancelled}, Status),
+            no_more_events()
+        end)
+    end).
+
+%% A server without telemetry emits no events, and still runs the finish
+%% functions of its interceptors, which the connection runs where it would
+%% have emitted the call's stop.
+telemetry_off() ->
+    with_events(fun() ->
+        with_server(#{interceptors => [recorder(a)]}, fun(#{channel := Channel}) ->
+            ?assertMatch({error, #{code := invalid_argument}}, unary(Channel, <<"nope">>)),
+            ?assertEqual({ok, <<"hi">>}, unary(Channel, ?UNARY)),
+            _ = intercepted(a),
+            ?assertMatch(#{method := ?UNARY, status := #{code := ok}}, finished(a)),
+            nothing_more(),
             no_more_events()
         end)
     end).
@@ -973,6 +995,7 @@ invalid_options_test_() ->
      || {Opts, Error} <- [
             {#{authorizer => fun() -> ok end}, {invalid_option, authorizer}},
             {#{interceptors => fun(_) -> ok end}, {invalid_option, interceptors}},
+            {#{telemetry => yes}, {invalid_option, telemetry}},
             {#{interceptors => [fun(_) -> ok end, nope]}, {invalid_option, interceptors}}
         ]
     ].

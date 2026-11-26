@@ -70,6 +70,11 @@
 %% interceptor()}, and {@link trevrpc_authorizer} for ready-made
 %% authorizers.
 %%
+%% With `telemetry' set to `true', every call emits the `telemetry' events
+%% of {@link trevrpc_telemetry}. They are off by default, as a server that
+%% nothing listens to should not pay for them: each call then builds and
+%% emits nothing.
+%%
 %% Every connection is owned by a `trevrpc_server_conn' process, which
 %% reads each stream's REQUEST, checks it and runs its handler in a call
 %% process of its own. That process can be stopped at any moment, which is
@@ -258,7 +263,8 @@
     misdirected_request_check => boolean(),
     validator => trevrpc_validator:validator(),
     authorizer => authorizer(),
-    interceptors => [interceptor()]
+    interceptors => [interceptor()],
+    telemetry => boolean()
 }.
 
 %% What each connection process needs, shared by all of them.
@@ -313,7 +319,9 @@
     %% server name are answered `421'.
     misdirected_request_check := boolean(),
     authorizer := authorizer() | undefined,
-    interceptors := [interceptor()]
+    interceptors := [interceptor()],
+    %% Whether calls emit their telemetry events.
+    telemetry := boolean()
 }.
 
 -record(state, {
@@ -454,6 +462,8 @@ check_hooks(Opts) ->
     case Opts of
         #{authorizer := Authorizer} when not is_function(Authorizer, 1) ->
             {error, {invalid_option, authorizer}};
+        #{telemetry := Telemetry} when not is_boolean(Telemetry) ->
+            {error, {invalid_option, telemetry}};
         #{interceptors := Interceptors} when not is_list(Interceptors) ->
             {error, {invalid_option, interceptors}};
         #{interceptors := Interceptors} ->
@@ -768,7 +778,8 @@ config(Opts, Compression, Validators) ->
         h1_idle_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
         misdirected_request_check => maps:get(misdirected_request_check, Opts, true),
         authorizer => maps:get(authorizer, Opts, undefined),
-        interceptors => maps:get(interceptors, Opts, [])
+        interceptors => maps:get(interceptors, Opts, []),
+        telemetry => maps:get(telemetry, Opts, false)
     }.
 
 http_options(#{http := true} = Opts) ->
