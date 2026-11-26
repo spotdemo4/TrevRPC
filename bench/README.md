@@ -76,7 +76,7 @@ reads, with that table's options (scenarios, sizes, concurrency, payload,
 compression modes, netem profiles, messages, duration) as defaults; explicit
 flags still override them. The tables are in [`tables.py`](tables.py):
 `comparison`, `compression`, `link`, `lossy`, `metadata`, `datagrams`,
-`validation`, `browser`, `browser-compression`, `browser-lossy`, and `access`.
+`validation`, `browser`, `browser-compression`, `browser-lossy`, `access`, and `coverage`.
 They refer to the packaged servers and clients
 by name (`go`, `rust`, `python`, the baseline's `grpc` and `connect`, and `chromium`) and
 run each native TrevRPC client against its own runtime's server only, and the Python
@@ -176,17 +176,45 @@ one table per profile, and each JSON record carries the profile as `netem`.
   repeated option, so a section can also override a shared one. Packets the
   servers send go to the `down` queue by their source port, and the
   namespace reserves the servers' ports so that no client sends from one.
-- `outage DURATION every PERIOD`, anywhere in a profile, drops every packet
-  in both directions for `DURATION` out of each `PERIOD`, the first starting
-  half a period after the client does, as when a phone hands over between
-  cells or a laptop roams between access points: `outage 170ms every 5s`.
-  Outages that would end after the measured window are left out.
-- The `access` table runs profiles of Wi-Fi, roaming Wi-Fi, LTE and 5G on the
-  move ([`tables.py`](tables.py) cites the measurements behind each), with the
-  same cells as `lossy`. Both, and `browser-lossy`, run 20 s windows after 3 s
-  of warmup: deep queues take seconds to settle, and in 10 s windows, cells
-  with outages swung by up to a quarter between runs, and cells over TCP at
-  about 3% burst loss by up to 15 times.
+- Three timed sections, anywhere in a profile, act for `DURATION` out of each
+  `PERIOD`, the first starting half a period after the client does; those
+  that would end after the measured window are left out:
+  - `outage DURATION every PERIOD` drops every packet in both directions, as
+    when a laptop roams between access points: `outage 400ms every 5s`.
+  - `pause DURATION every PERIOD` holds every packet in both directions and
+    lets them go when it ends, as a cellular handover does when the network
+    forwards what the old cell held to the new one: `pause 170ms every 5s`.
+    The profile gets a `plug` qdisc under each netem.
+  - `episode DURATION every PERIOD NETEM_ARGS` adds `NETEM_ARGS` to both
+    directions for the duration, up to the next section, by changing the
+    netems in place, which keeps the packets they hold: `episode 4s every
+    10s slot distribution pareto 10ms 60ms`. A change keeps the options netem
+    sends as attributes of their own when new arguments leave them out: a
+    `rate`, `slot`s, a `delay`'s `distribution` (a `slot`'s is part of the
+    slot), a loss model (`gemodel` or `state`) and `ecn`. So an episode may only change those where the profile
+    sets them, which its end restores. Its arguments end at the next section,
+    after which words go where they went before it.
+- `trace NAME [from OFFSET]` steps each direction's rate, every 100 ms,
+  through a recorded trace of a link's capacity, starting `OFFSET` into it
+  (default 0) when the client starts, and repeating it. `NAME.up` and
+  `NAME.down` are in the directory of `$TREVRPC_BENCH_TRACES`, as Mahimahi
+  writes them: each line is the millisecond of an opportunity to carry
+  1500 bytes. The packaged runner has Mahimahi's `Verizon-LTE-driving`
+  ([`traces.nix`](traces.nix)). netem times each packet when it arrives, at
+  the rate of that moment, so the rates have a floor of 120 kbit/s, at which
+  a full-sized packet waits at most one step. A trace splits the directions,
+  and cannot go with an episode.
+- `Link.configure` tries every profile's changes once before any benchmark
+  runs: blocking and releasing its plugs, an episode and its end, and its
+  trace's first step, as it adds and deletes each kind of filter once.
+- The `access` table runs profiles of Wi-Fi, roaming Wi-Fi, LTE, LTE on the
+  road (the trace) and 5G on the move ([`tables.py`](tables.py) cites the
+  measurements behind each), with the same cells as `lossy`. Both, and
+  `browser-lossy`, run 20 s windows after 3 s of warmup: deep queues take
+  seconds to settle, and in 10 s windows, cells with outages swung by up to a
+  quarter between runs, and cells over TCP at about 3% burst loss by up to 15
+  times. The `coverage` table runs LTE at its 5th percentile, where 64
+  workers complete nothing, with one and four.
 - Over a link with a delay, the runner asks every client for its `slow` count
   with `--slow-us` set to twice the link's round trip (the delays of both
   directions, without jitter, slots or queueing), and the summary's `late%`
@@ -195,8 +223,8 @@ one table per profile, and each JSON record carries the profile as `netem`.
   the scenarios whose operation is one round trip (`unary`, `bidi`,
   `validation-unary` and the paced ones) count late operations: a streaming
   call takes as long as its messages need.
-- Over a link with outages, the runner also asks for a `timeline` and records
-  when each outage ran, by the wall clock. The summary's `recov_ms` column is
+- Over a link with outages or pauses, the runner also asks for a `timeline` and
+  records when each ran, by the wall clock. The summary's `recov_ms` column is
   the median, over the outages, of how long the client took to get back to
   full throughput: from the end of the outage to the start of the first
   quarter second whose rate is 90% of the rate in the second before the

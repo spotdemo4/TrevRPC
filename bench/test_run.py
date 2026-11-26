@@ -455,15 +455,21 @@ class TableTest(unittest.TestCase):
         self.assertEqual(18, self.cells("lossy")[("go", "quic")])
         self.assertEqual(15, self.cells("lossy")[("go", "tcp")])
         self.assertEqual(12, self.cells("lossy")[("grpc", "grpc")])
-        # The access networks run the same cells as the lossy links, over four profiles.
+        # The access networks run the same cells as the lossy links, over five profiles.
         lossy = self.cells("lossy")
         self.assertEqual(
-            {lane: count // 3 * 4 for lane, count in lossy.items()}, self.cells("access")
+            {lane: count // 3 * 5 for lane, count in lossy.items()}, self.cells("access")
         )
         self.assertEqual(
             {("go", "quic"): 12, ("go", "tcp"): 3, ("rust", "quic"): 12, ("rust", "tcp"): 3},
             self.cells("datagrams"),
         )
+        # Poor coverage: three scenarios with one and four workers, on every lane.
+        self.assertEqual(
+            {("go", "quic"): 6, ("go", "tcp"): 6, ("rust", "quic"): 6, ("rust", "tcp"): 6,
+             ("grpc", "grpc"): 6, ("connect", "connect"): 6},
+            self.cells("coverage"),
+        )  # fmt: skip
         # Browsers run in their own tables, with the native clients over QUIC and connect-go's
         # for reference; their TrevRPC lanes run against both servers, and fetch has no client
         # streams.

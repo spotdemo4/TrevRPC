@@ -718,7 +718,7 @@ class Runner:
         they end, as (start, end) by the wall clock."""
         if self.link is None or profile is None:
             return contextlib.nullcontext([])
-        return self.link.outages(profile, self.matrix.warmup + self.matrix.duration)
+        return self.link.impairments(profile, self.matrix.warmup + self.matrix.duration)
 
     def fail(self, cell: str, reason: str, log: Path, offset: int) -> None:
         """Reports the failure now and keeps it, with the end of the cell's log and what the
@@ -740,14 +740,14 @@ class Runner:
 def link_flags(profile: str | None, scenario: str) -> list[str]:
     """The client flags an emulated link asks for: the threshold of a late operation, twice the
     link's round trip, for the scenarios whose operation is one round trip, and timelines when
-    it has outages."""
+    it has outages or pauses."""
     if profile is None:
         return []
     flags: list[str] = []
     round_trip = netem.round_trip(profile)
     if round_trip is not None and scenario in ROUND_TRIP_SCENARIOS:
         flags += ["--slow-us", str(round(LATE_ROUND_TRIPS * round_trip * 1e6))]
-    if netem.parse(profile).outage is not None:
+    if netem.parse(profile).interrupted:
         flags += ["--timeline-ms", str(TIMELINE_MS)]
     return flags
 

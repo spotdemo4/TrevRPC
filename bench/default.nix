@@ -26,6 +26,8 @@ callPackage ../interop/runner.nix {
     iproute2
     util-linux
   ];
+  # The traces that profiles name with `trace NAME`; see traces.nix.
+  env.TREVRPC_BENCH_TRACES = "${callPackage ./traces.nix { }}";
   # Every server and client (Python has a client only), plus the grpc-go and connect-go baselines, and on Linux Chromium,
   # from the browsers playwright-driver ships.
   defaults = {

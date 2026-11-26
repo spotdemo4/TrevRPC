@@ -186,24 +186,49 @@ GILBERT_ELLIOTT = [
 # Access networks as their measurements describe them, where what users see is delay, a
 # bottleneck with a deep queue, and outages, more than random loss: Wi-Fi and cellular
 # retransmit below IP.
+#
+# Wi-Fi: one medium, so one queue for both directions, at 100 Mbit/s. Sui et al. (MobiSys 2016)
+# measured Wi-Fi's share of the round trip on a campus network under its users' own traffic: 3 ms
+# at the median, 20 ms at p90 and 250 ms at p99, the tail coming in episodes that last minutes.
+# Small Pareto slots give the median, and episodes of large ones, 4 s of every 10 s, the tail:
+# with 64 workers of 1 KiB unary calls, Go's calls took 24 ms at the median and 240-275 ms at
+# p99 over the 20 ms base round trip, and 33-68 ms at p90, which falls where the episodes' share
+# of the calls ends, so it swings from run to run (#741). Slots alone cannot: those that gave
+# the median under load capped the tail near 30 ms, and those fitted to single packets added
+# 20 ms at the median under load.
+WIFI = (
+    "delay 10ms rate 100mbit limit 1000 slot distribution pareto 0.2ms 1ms"
+    " episode 4s every 10s slot distribution pareto 10ms 60ms"
+)
 ACCESS = [
-    # Wi-Fi: one medium, so one queue for both directions, at 100 Mbit/s. Pareto slots add 2 ms
-    # to the round trip at the median and 19 ms at p90, as Sui et al. (MobiSys 2016) measured on
-    # a campus network, but only 36 ms at p99, where they saw over 250 ms: their tail comes in
-    # episodes of minutes, which netem's independent slots do not model.
-    "delay 10ms rate 100mbit limit 1000 slot distribution pareto 1ms 8ms",
+    WIFI,
     # The same Wi-Fi, roaming between access points every 5 s: 60-400 ms without 802.11r
-    # (Shin et al., MobiSys 2004), the longest here.
-    "delay 10ms rate 100mbit limit 1000 slot distribution pareto 1ms 8ms outage 400ms every 5s",
+    # (Shin et al., MobiSys 2004), the longest here. Roaming drops what was in flight.
+    f"{WIFI} outage 400ms every 5s",
     # LTE: a 60 ms round trip, 20 Mbit/s down and 5 up (Huang et al., SIGCOMM 2013; Ghoshal et
     # al., IMC 2023), each direction behind about a second of queue (Jiang et al., CellNet 2012),
     # and the 0.06% that TCP retransmits on it.
     "delay 30ms loss 0.05% up rate 5mbit limit 450 down rate 20mbit limit 1700",
+    # The same LTE with the capacity of a phone on the road, which changes from one tenth of a
+    # second to the next: Mahimahi's Verizon LTE driving trace (Winstein et al., NSDI 2013; see
+    # traces.nix), from 157 s in, the 23 s whose uplink rates match the whole trace's and whose
+    # downlink median is within 15% of it (5.5 against 6.4 Mbit/s); the trace's first 23 s run
+    # at twice its average.
+    "delay 30ms loss 0.05% trace Verizon-LTE-driving from 157s up limit 450 down limit 1700",
     # 5G NSA on the move: a 70 ms round trip, 40 Mbit/s down and 12 up (Ghoshal et al.), half a
     # second of queue, and a 170 ms handover every 5 s (167 ms on average, Hassan et al.,
-    # SIGCOMM 2022), far more often than on a freeway, so that each run sees two.
-    "delay 35ms up rate 12mbit limit 500 down rate 40mbit limit 1700 outage 170ms every 5s",
+    # SIGCOMM 2022), far more often than on a freeway, so that each run sees several. The
+    # network forwards what the old cell held to the new one (X2/Xn data forwarding), so a
+    # handover pauses the link instead of dropping packets.
+    "delay 35ms up rate 12mbit limit 500 down rate 40mbit limit 1700 pause 170ms every 5s",
 ]
+
+# Poor coverage: LTE at its 5th percentile, 0.5 Mbit/s down and 38 kbit/s up over a 467 ms round
+# trip (#734's sources), where 64 workers complete nothing, so one and four workers. Cellular
+# buffers are sized in bytes, so at these rates they hold seconds: 30 packets up are 9.5 s of
+# queue, and 100 down 2.4 s. Paced messages would arrive right at their 500 ms deadline,
+# and bidi round trips run as unary calls do, so neither runs.
+COVERAGE = "delay 233ms up rate 38kbit limit 30 down rate 500kbit limit 100"
 
 TABLES: dict[str, Table] = {
     "comparison": Table(
@@ -253,6 +278,18 @@ TABLES: dict[str, Table] = {
         lossy,
     ),
     "access": Table("Access networks", {**IMPAIRED, "netem": ACCESS}, lossy),
+    "coverage": Table(
+        "Poor coverage",
+        {
+            **IMPAIRED_WINDOW,
+            "scenarios": ["unary", "server-stream", "client-stream"],
+            "sizes": [1024],
+            "concurrency": [1, 4],
+            "messages": 10,
+            "netem": [COVERAGE],
+        },
+        own_server,
+    ),
     "browser": Table(
         "Browsers",
         {

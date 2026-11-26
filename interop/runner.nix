@@ -11,6 +11,8 @@
   script,
   # Tools the runner calls besides openssl.
   runtimeInputs ? [ ],
+  # Environment variables the runner starts with.
+  env ? { },
   # The matrix the runner falls back to when none of its matrix options is given, as option names
   # mapped to a value or a list of values; see parse_with_defaults in harness.py.
   defaults ? { },
@@ -50,7 +52,10 @@ stdenvNoCC.mkDerivation {
     makeWrapper ${python3}/bin/python3 $out/bin/${name} \
       --add-flags "-I $share/${script}" \
       --prefix PATH : ${lib.makeBinPath ([ openssl ] ++ runtimeInputs)} \
-      --set TREVRPC_RUNNER_DEFAULTS ${lib.escapeShellArg defaultFlags}
+      --set TREVRPC_RUNNER_DEFAULTS ${lib.escapeShellArg defaultFlags} \
+      ${lib.concatStringsSep " " (
+        lib.mapAttrsToList (name: value: "--set ${name} ${lib.escapeShellArg value}") env
+      )}
     runHook postInstall
   '';
 }
