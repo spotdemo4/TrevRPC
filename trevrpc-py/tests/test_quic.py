@@ -13,6 +13,7 @@ from unittest import mock
 import trevrpc
 from protobuf.wkt.google.protobuf.wrappers_pb import StringValue
 from trevrpc import Code, Method, MethodKind, TrevRpcError
+from trevrpc._quic import QuicTransport
 from trevrpc._stream import Stream
 
 from .server import FLOOD_MESSAGE, WAIT, TestServer, start_server
@@ -345,6 +346,23 @@ class StreamLimitTest(QuicTest):
         )
         self.assertEqual([r.value for r in replies], [str(i) for i in range(40)])
         self.assertEqual(len(self.server.connections), 1)
+
+
+class ByteCountTest(QuicTest):
+    async def test_the_connection_counts_the_udp_payload_it_sends_and_receives(self) -> None:
+        await self.channel.unary(UNARY, s("hello"))
+        connection = self.channel._connection  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(connection, QuicTransport)
+        sent, received = connection.bytes_sent, connection.bytes_received
+        # At least the client's 1200-byte Initial and the server's handshake.
+        self.assertGreaterEqual(sent, 1200)
+        self.assertGreater(received, 0)
+
+        large = "x" * 100_000
+        reply = await self.channel.unary(UNARY, s(large))
+        self.assertEqual(large, reply.value)
+        self.assertGreater(connection.bytes_sent - sent, len(large))
+        self.assertGreater(connection.bytes_received - received, len(large))
 
 
 class QMuxCallTest(CallTest):

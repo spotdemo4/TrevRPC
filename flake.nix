@@ -394,6 +394,7 @@
                 trevrpc-bench-baseline
                 trevrpc-go-interop
                 trevrpc-js
+                trevrpc-py-interop
                 trevrpc-rust
                 ;
             };

@@ -8,6 +8,7 @@
   trevrpc-bench-baseline,
   trevrpc-go-interop,
   trevrpc-js,
+  trevrpc-py-interop,
   trevrpc-rust,
 }:
 callPackage ../interop/runner.nix {
@@ -25,7 +26,7 @@ callPackage ../interop/runner.nix {
     iproute2
     util-linux
   ];
-  # Every server and client, plus the grpc-go and connect-go baselines, and on Linux Chromium,
+  # Every server and client (Python has a client only), plus the grpc-go and connect-go baselines, and on Linux Chromium,
   # from the browsers playwright-driver ships.
   defaults = {
     server = [
@@ -35,6 +36,7 @@ callPackage ../interop/runner.nix {
     client = [
       "go=${lib.getExe' trevrpc-go-interop "trevrpc-interop-go"}"
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
+      "python=${lib.getExe trevrpc-py-interop}"
     ];
     baseline = lib.getExe trevrpc-bench-baseline;
     browser = lib.optionals stdenv.hostPlatform.isLinux [ "chromium" ];

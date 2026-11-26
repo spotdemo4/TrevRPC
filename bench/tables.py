@@ -2,10 +2,11 @@
 
 A table names its options, which become the defaults of the command line (explicit flags still
 win), and a filter over the cells those options span. Tables refer to the packaged servers and
-clients by name: `go` and `rust` run against their own server only, and the baseline's clients are
-`grpc` and `connect`. Browsers are clients named after themselves, such as `chromium`, whose
-TrevRPC lanes run against every TrevRPC server and whose fetch lanes run against `connect`. The
-Erlang runtime, which the packaged runner leaves out, is `erlang` when named on the command line.
+clients by name: `go` and `rust` run against their own server only, `python`, which has no server,
+against the Go server, and the baseline's clients are `grpc` and `connect`. Browsers are clients
+named after themselves, such as `chromium`, whose TrevRPC lanes run against every TrevRPC server
+and whose fetch lanes run against `connect`. The Erlang runtime, which the packaged runner leaves
+out, is `erlang` when named on the command line.
 """
 
 from __future__ import annotations
@@ -55,9 +56,14 @@ def refused(cell: Cell) -> bool:
     return cell.client == "erlang" and cell.validation is not None
 
 
+# The server a client runs against when its runtime has none.
+HOME_SERVERS = {"python": "go"}
+
+
 def own_server(cell: Cell) -> bool:
-    """TrevRPC clients against their own runtime's server; the baselines always are."""
-    return cell.client == cell.server
+    """TrevRPC clients against their own runtime's server, or for a client-only runtime, against
+    its home server; the baselines always are."""
+    return cell.server == HOME_SERVERS.get(cell.client, cell.client)
 
 
 def comparison(cell: Cell) -> bool:

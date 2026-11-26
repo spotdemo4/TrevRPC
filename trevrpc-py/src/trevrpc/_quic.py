@@ -137,6 +137,10 @@ class QuicTransport(asyncio.DatagramProtocol):
         self._next_flow = 1
         self.datagrams_received = 0
         """DATAGRAM frames the connection received, for diagnostics."""
+        self.bytes_sent = 0
+        """UDP payload bytes the connection sent, for diagnostics and benchmarks."""
+        self.bytes_received = 0
+        """UDP payload bytes the connection received, for diagnostics and benchmarks."""
         self.error: TrevRpcError | None = None
         """Why the connection ended, once it has."""
         self.closed: asyncio.Future[None] = loop.create_future()
@@ -207,6 +211,7 @@ class QuicTransport(asyncio.DatagramProtocol):
 
     @override
     def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
+        self.bytes_received += len(data)
         self._quic.receive_datagram(data, addr, now=self._loop.time())
         self._process_events()
         self._transmit()
@@ -354,6 +359,7 @@ class QuicTransport(asyncio.DatagramProtocol):
             return
         now = self._loop.time()
         for data, _ in self._quic.datagrams_to_send(now=now):
+            self.bytes_sent += len(data)
             transport.sendto(data)
         if self._blocked:
             for stream in list(self._blocked):

@@ -1,5 +1,5 @@
-# The Python interop client, trevrpc-interop-python: the scenarios in trevrpc_interop.py and the
-# bindings in gen/, run on trevrpc's environment.
+# The Python interop client, trevrpc-interop-python: the scenarios in trevrpc_interop.py, the load
+# benchmark client in trevrpc_bench.py and the bindings in gen/, run on trevrpc's environment.
 {
   lib,
   makeWrapper,
@@ -14,18 +14,28 @@ stdenvNoCC.mkDerivation {
     root = ./.;
     fileset = lib.fileset.unions [
       ./trevrpc_interop.py
+      ./trevrpc_bench.py
+      ./test_trevrpc_bench.py
       ./gen
     ];
   };
 
   nativeBuildInputs = [ makeWrapper ];
 
+  # The load-benchmark client's unit tests.
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+    PYTHONDONTWRITEBYTECODE=1 ${trevrpc-py}/bin/python -E -s -m unittest test_trevrpc_bench
+    runHook postCheck
+  '';
+
   # Python puts the script's directory first on sys.path, which finds gen/. -E and -s keep the
   # environment and the user's site-packages out of it.
   installPhase = ''
     runHook preInstall
     mkdir -p $out/share/trevrpc-interop-python
-    cp -R . $out/share/trevrpc-interop-python
+    cp -R trevrpc_interop.py trevrpc_bench.py gen $out/share/trevrpc-interop-python
     makeWrapper ${trevrpc-py}/bin/python $out/bin/trevrpc-interop-python \
       --add-flags "-E -s $out/share/trevrpc-interop-python/trevrpc_interop.py"
     runHook postInstall
@@ -36,6 +46,7 @@ stdenvNoCC.mkDerivation {
   installCheckPhase = ''
     runHook preInstallCheck
     $out/bin/trevrpc-interop-python client --help >/dev/null
+    $out/bin/trevrpc-interop-python bench --help >/dev/null
     runHook postInstallCheck
   '';
 

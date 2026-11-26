@@ -1,4 +1,5 @@
-"""The Python interop client: runs the scenarios of interop/README.md against a server.
+"""The Python interop client: runs the scenarios of interop/README.md against a server, and with
+`bench`, one cell of the load benchmark of bench/README.md (see trevrpc_bench.py).
 
     trevrpc_interop.py client --addr <host:port> --ca <cert.pem> [--server-name localhost]
                               [--transport quic|tcp|auto] [--tcp-addr <host:port>]
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import trevrpc
+import trevrpc_bench
 from gen.buf.validate.validate_pb import Violations
 from gen.compressed_pb import PlainMessage
 from gen.compressed_trevrpc import CompressedEchoClient, RefusingEchoClient
@@ -589,7 +591,10 @@ def main() -> int:
     client.add_argument("--expect-transport", choices=("quic", "qmux"))
     client.add_argument("--dictionary")
     client.add_argument("--scenarios")
+    trevrpc_bench.add_parser(commands)
     args = parser.parse_args()
+    if args.command == "bench":
+        return trevrpc_bench.main(args)
     return asyncio.run(run(args))
 
 

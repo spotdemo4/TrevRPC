@@ -513,6 +513,27 @@ class TableTest(unittest.TestCase):
         self.assertEqual({"quic": 0, "tcp": 0}, cells("validation"))
         self.assertEqual({"quic": 12, "tcp": 12}, cells("metadata"))
 
+    def test_tables_run_the_python_client_against_the_go_server(self) -> None:
+        def cells(table: str, server: str) -> dict[str, int]:
+            args = run.parse_args(
+                ["--table", table, "--server", "go=go", "--server", "rust=rust",
+                 "--client", "python=python"]
+            )  # fmt: skip
+            matrix = run.build_matrix(args)
+            return {
+                transport: sum(
+                    len(matrix.cells("python", server, transport, profile))
+                    for profile in args.netem or [None]
+                )
+                for transport in run.NATIVE_TRANSPORTS
+            }
+
+        # Python has no server, so it runs the Go client's cells, against the Go server only.
+        self.assertEqual({"quic": 12, "tcp": 12}, cells("comparison", "go"))
+        self.assertEqual({"quic": 0, "tcp": 0}, cells("comparison", "rust"))
+        self.assertEqual({"quic": 18, "tcp": 15}, cells("lossy", "go"))
+        self.assertEqual({"quic": 24, "tcp": 0}, cells("validation", "go"))
+
     def test_explicit_flags_override_the_table(self) -> None:
         args = run.parse_args(
             ["--table", "lossy", "--netem", "delay 1ms", "--sizes", "64", "--baseline", "b"]

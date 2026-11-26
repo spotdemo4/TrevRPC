@@ -23,7 +23,8 @@ protoc \
 	-I "$root/proto" \
 	--py_out="$out" \
 	--trevrpc-py_out="$out" \
-	interop.proto compressed.proto unreliable.proto validated.proto buf/validate/validate.proto \
+	interop.proto compressed.proto unreliable.proto validated.proto validation_bench.proto \
+	buf/validate/validate.proto \
 	trevrpc/options.proto
 protoc \
 	-I "$here/../tests/proto" \
