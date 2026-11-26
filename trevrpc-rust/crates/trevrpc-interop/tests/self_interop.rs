@@ -598,6 +598,10 @@ fn bench_rejects_unusable_flags() {
         &["--scenario", "validation-unary", "--validation", "nope"],
         // --validation picks the request type of the validation scenarios only.
         &["--scenario", "unary", "--validation", "cel"],
+        &["--scenario", "unary", "--slow-us", "-1"],
+        &["--scenario", "unary", "--slow-us", "soon"],
+        &["--scenario", "unary", "--timeline-ms", "-50"],
+        &["--scenario", "unary", "--timeline-ms", "often"],
         &[
             "--scenario",
             "validation-client-stream",
@@ -688,6 +692,52 @@ fn bench_json_each(server: &Server, cells: &[Vec<&str>]) -> Vec<String> {
             json
         })
         .collect()
+}
+
+/// `--slow-us` and `--timeline-ms` add their fields to the result, and only then. A threshold of
+/// one microsecond is slower than any loopback call, so every counted operation is slow.
+#[test]
+fn bench_reports_slow_operations_and_a_delivery_timeline_on_request() {
+    let server = Server::start("bench-timeline");
+    let cells = ["unary", "server-stream", "paced", "unreliable-paced"].map(|scenario| {
+        vec![
+            "--scenario",
+            scenario,
+            "--slow-us",
+            "1",
+            "--timeline-ms",
+            "100",
+            "--duration",
+            "0.45",
+        ]
+    });
+    for (cell, json) in cells.iter().zip(bench_json_each(&server, &cells)) {
+        assert_close(number(&json, "slow"), number(&json, "ops"), 1e-9, &json);
+        let (_, timeline) = json
+            .split_once(r#""timeline":{"start_unix_us":"#)
+            .expect(&json);
+        let (start, rest) = timeline
+            .split_once(r#","bucket_ms":100,"msgs":["#)
+            .expect(&json);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let start: u128 = start.parse().unwrap();
+        assert!(now.abs_diff(start) < 60_000_000, "{json}");
+        let (buckets, _) = rest.split_once("]}").expect(&json);
+        let buckets: Vec<u64> = buckets.split(',').map(|n| n.parse().unwrap()).collect();
+        // ceil(450 / 100) buckets, and messages delivered in the window land in them.
+        assert_eq!(buckets.len(), 5, "{cell:?}: {json}");
+        assert!(buckets.iter().sum::<u64>() > 0, "{cell:?}: {json}");
+    }
+
+    let json = bench_json(&server, &["--scenario", "unary"]);
+    assert!(
+        !json.contains("slow") && !json.contains("timeline"),
+        "{json}"
+    );
+    server.finish();
 }
 
 #[test]

@@ -6,6 +6,7 @@
 //       [--ws-url <url>] [--cert-hash <hex>] [--cert <pem>] [--scenario S] [--size N]
 //       [--metadata-size N] [--concurrency N] [--duration S] [--warmup S] [--messages N]
 //       [--payload repeat|records] [--compression MODE] [--dictionary <file>]
+//       [--slow-us N] [--timeline-ms N]
 //
 // The lanes are webtransport and websocket, the TrevRPC transports (--url is the WebTransport URL
 // and --cert-hash trusts its certificate; --ws-url is the WebSocket URL), and connect-web,
@@ -35,7 +36,8 @@ export const BenchUsage =
   "usage: trevrpc-interop-browser bench --browser chromium|firefox --transport <lane> --url <url>" +
   " [--ws-url <url>] [--cert-hash <hex>] [--cert <pem>] [--scenario S] [--size N]" +
   " [--metadata-size N] [--concurrency N] [--duration S] [--warmup S] [--messages N]" +
-  " [--payload repeat|records] [--compression MODE] [--dictionary <file>]";
+  " [--payload repeat|records] [--compression MODE] [--dictionary <file>]" +
+  " [--slow-us N] [--timeline-ms N]";
 const BenchBundle = new URL("../build/interop/bench.js", import.meta.url);
 /**
  * How long the page may take to open, and the room on top of the warmup and the window for
@@ -92,6 +94,8 @@ export async function parseBenchArguments(args) {
     payload: { type: "string", default: "repeat" },
     compression: { type: "string", default: "none" },
     dictionary: { type: "string" },
+    "slow-us": { type: "string", default: "0" },
+    "timeline-ms": { type: "string", default: "0" },
   });
 
   const browser = Browsers[values.browser];
@@ -158,6 +162,8 @@ export async function parseBenchArguments(args) {
     warmup: seconds(values, "warmup", true),
     payload: values.payload,
     compression: values.compression,
+    slowUs: integer(values, "slow-us", 0),
+    timelineMs: integer(values, "timeline-ms", 0),
     dictionary: await readDictionary(values.dictionary).catch((error) => {
       throw new UsageError(`--dictionary: ${error.message}`, { cause: error });
     }),

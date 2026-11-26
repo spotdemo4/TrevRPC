@@ -37,6 +37,12 @@ type benchConfig struct {
 	metadataSize                              int
 	duration, warmup                          time.Duration
 	payload, compression                      string
+	// slowUS is --slow-us: the latency in microseconds above which an
+	// operation counts as slow, or 0 to not count.
+	slowUS int
+	// timelineMS is --timeline-ms: the width in milliseconds of the intervals
+	// the delivered messages are counted in, or 0 to not count.
+	timelineMS int
 }
 
 func parseBenchFlags(args []string) (benchConfig, error) {
@@ -60,6 +66,8 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 	fs.IntVar(&cfg.metadataSize, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
 	fs.StringVar(&cfg.payload, "payload", "repeat", "EchoRequest.message: repeat (x repeated) or records (a new log-records message per request)")
 	fs.StringVar(&cfg.compression, "compression", "none", "none, gzip or zstd")
+	fs.IntVar(&cfg.slowUS, "slow-us", 0, "count the operations slower than this many microseconds as slow; 0 counts none")
+	fs.IntVar(&cfg.timelineMS, "timeline-ms", 0, "count the messages delivered in each interval of this many milliseconds of the window; 0 counts none")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -81,6 +89,8 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 		return cfg, fmt.Errorf("--metadata-size must be between 0 and %d", maxMetadataSize)
 	case cfg.duration <= 0, cfg.warmup < 0:
 		return cfg, errors.New("--duration must be > 0 and --warmup >= 0")
+	case cfg.slowUS < 0, cfg.timelineMS < 0:
+		return cfg, errors.New("--slow-us and --timeline-ms must be >= 0")
 	case cfg.payload != "repeat" && cfg.payload != "records":
 		return cfg, fmt.Errorf("--payload must be repeat or records, not %q", cfg.payload)
 	case !slices.Contains(compressions, cfg.compression):
@@ -122,6 +132,66 @@ type benchResult struct {
 	WireBytesPerMsg *float64       `json:"wire_bytes_per_msg,omitempty"`
 	Payload         string         `json:"payload"`
 	Compression     string         `json:"compression"`
+	// Slow counts the measured operations slower than --slow-us, and is nil
+	// without it.
+	Slow *uint64 `json:"slow,omitempty"`
+	// Timeline counts the messages delivered in each interval of the window,
+	// and is nil without --timeline-ms.
+	Timeline *timelineResult `json:"timeline,omitempty"`
+}
+
+// timelineResult is the timeline field of the result line.
+type timelineResult struct {
+	StartUnixUS int64    `json:"start_unix_us"`
+	BucketMS    int      `json:"bucket_ms"`
+	Msgs        []uint64 `json:"msgs"`
+}
+
+// timeline counts messages in the consecutive intervals, buckets, of the
+// measured window [start, end). Only one goroutine writes it, so each worker
+// has its own, which summarize adds up. A nil timeline counts nothing.
+type timeline struct {
+	start, end time.Time
+	bucket     time.Duration
+	msgs       []uint64
+}
+
+// newTimeline returns a timeline with ceil(window / bucket) buckets. The window
+// is rounded to a microsecond first, so that --duration 0.3, which converts to
+// a few nanoseconds more or less than 300 ms, does not gain or lose a bucket
+// against --timeline-ms 100.
+func newTimeline(start, end time.Time, bucket time.Duration) *timeline {
+	buckets := int((end.Sub(start).Round(time.Microsecond) + bucket - 1) / bucket)
+	return &timeline{start: start, end: end, bucket: bucket, msgs: make([]uint64, buckets)}
+}
+
+// add counts msgs in the bucket of the instant at, unless the window does not
+// contain it.
+func (t *timeline) add(at time.Time, msgs int) {
+	if t == nil || at.Before(t.start) || !at.Before(t.end) {
+		return
+	}
+	t.msgs[min(int(at.Sub(t.start)/t.bucket), len(t.msgs)-1)] += uint64(msgs)
+}
+
+// workerOptions are the optional counts of a worker, both off in its zero value.
+type workerOptions struct {
+	// slowAfter is the latency above which a measured operation counts in
+	// workerResult.slow, or 0 to count none.
+	slowAfter time.Duration
+	// timeline counts the messages of every operation that succeeds, by the
+	// instant it ends, or is nil.
+	timeline *timeline
+}
+
+// newWorkerOptions returns the options --slow-us and --timeline-ms ask for,
+// for the window [start, end).
+func newWorkerOptions(cfg benchConfig, start, end time.Time) workerOptions {
+	options := workerOptions{slowAfter: time.Duration(cfg.slowUS) * time.Microsecond}
+	if cfg.timelineMS > 0 {
+		options.timeline = newTimeline(start, end, time.Duration(cfg.timelineMS)*time.Millisecond)
+	}
+	return options
 }
 
 func (r benchResult) write(w io.Writer) error {
@@ -134,6 +204,9 @@ type workerResult struct {
 	latencies []time.Duration
 	msgs      uint64
 	errors    uint64
+	// slow counts the latencies above workerOptions.slowAfter.
+	slow     uint64
+	timeline *timeline
 	// firstError is the first of errors, which reportErrors prints.
 	firstError error
 }
@@ -170,7 +243,9 @@ func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 	sampler := newWireSampler(conn.wire, cfg.concurrency, measureStart, measureEnd)
 	var wg sync.WaitGroup
 	for i, w := range workers {
-		wg.Go(func() { results[i] = runWorker(runCtx, w, sampler, i, measureStart, measureEnd) })
+		wg.Go(func() {
+			results[i] = runWorker(runCtx, w, sampler, i, measureStart, measureEnd, newWorkerOptions(cfg, measureStart, measureEnd))
+		})
 	}
 
 	ok := sleepUntil(ctx, measureStart)
@@ -262,9 +337,10 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 // measureEnd. A failed operation counts as an error if it started inside the
 // window; failures during warmup are ignored. The first such error is kept.
 // The worker tells sampler, as worker index, when it starts an operation and
-// the messages of every operation that succeeds, in the window or not.
-func runWorker(ctx context.Context, w worker, sampler *wireSampler, index int, measureStart, measureEnd time.Time) workerResult {
-	var result workerResult
+// the messages of every operation that succeeds, in the window or not, and
+// counts them in options.timeline by the instant the operation ends.
+func runWorker(ctx context.Context, w worker, sampler *wireSampler, index int, measureStart, measureEnd time.Time, options workerOptions) workerResult {
+	result := workerResult{timeline: options.timeline}
 	for {
 		opStart := time.Now()
 		sampler.observe(opStart)
@@ -279,6 +355,9 @@ func runWorker(ctx context.Context, w worker, sampler *wireSampler, index int, m
 		}
 		opEnd := time.Now()
 		inWindow := !opStart.Before(measureStart)
+		if err == nil {
+			result.timeline.add(opEnd, msgs)
+		}
 		if err != nil {
 			if inWindow {
 				if result.errors == 0 {
@@ -292,7 +371,11 @@ func runWorker(ctx context.Context, w worker, sampler *wireSampler, index int, m
 			continue
 		}
 		if inWindow && !opEnd.After(measureEnd) {
-			result.latencies = append(result.latencies, opEnd.Sub(opStart))
+			latency := opEnd.Sub(opStart)
+			result.latencies = append(result.latencies, latency)
+			if options.slowAfter > 0 && latency > options.slowAfter {
+				result.slow++
+			}
 			result.msgs += uint64(msgs)
 		}
 	}
@@ -314,11 +397,21 @@ var errStarved = errors.New("no operation completed inside the measured window")
 
 func summarize(cfg benchConfig, results []workerResult, wire wireSample) (benchResult, error) {
 	var latencies []time.Duration
-	var msgs, errs uint64
+	var msgs, errs, slow uint64
+	var timeline *timelineResult
 	for _, r := range results {
 		latencies = append(latencies, r.latencies...)
 		msgs += r.msgs
 		errs += r.errors
+		slow += r.slow
+		if t := r.timeline; t != nil {
+			if timeline == nil {
+				timeline = &timelineResult{StartUnixUS: t.start.UnixMicro(), BucketMS: cfg.timelineMS, Msgs: make([]uint64, len(t.msgs))}
+			}
+			for i, count := range t.msgs {
+				timeline.Msgs[i] += count
+			}
+		}
 	}
 	if len(latencies) == 0 && errs == 0 {
 		return benchResult{}, errStarved
@@ -348,6 +441,10 @@ func summarize(cfg benchConfig, results []workerResult, wire wireSample) (benchR
 		},
 	}
 	res.BytesPerSec = res.MsgsPerSec * float64(cfg.size)
+	res.Timeline = timeline
+	if cfg.slowUS > 0 {
+		res.Slow = &slow
+	}
 	// A sampler starved until the window had passed sees no message; the
 	// window's are then the only count there is.
 	wireMsgs := wire.msgs

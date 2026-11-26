@@ -21,6 +21,7 @@
 //!                            [--compression none|dictionary|stream|stream-dictionary]
 //!                            [--dictionary <file>] [--min-quic-connections 1]
 //!                            [--validation none|standard|cel]
+//!                            [--slow-us 0] [--timeline-ms 0]
 //! ```
 //!
 //! The `bench` subcommand follows `bench/README.md`.
@@ -101,6 +102,8 @@ async fn main() -> ExitCode {
                 "dictionary",
                 "min-quic-connections",
                 "validation",
+                "slow-us",
+                "timeline-ms",
             ],
         )
         .map(Command::Bench),

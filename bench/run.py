@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -133,8 +133,21 @@ UNCONNECTED = "could not connect"
 COLUMNS = (
     "scenario", "size", "md", "conc", "conns", "rate", "rules", "transport", "compression",
     "client", "server", "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%",
-    "spread%",
+    "late%", "recov_ms", "spread%",
 )  # fmt: skip
+# Over an emulated link, an operation, or a paced message, is late when it takes longer than this
+# many round trips of the link. Only the scenarios whose operation is one round trip count late
+# operations: a streaming call takes as long as its messages need.
+LATE_ROUND_TRIPS = 2
+ROUND_TRIP_SCENARIOS = ("unary", "bidi", "paced", "unreliable-paced", "validation-unary")
+# The interval of the timelines the clients report over a link with outages, in milliseconds.
+TIMELINE_MS = 50
+# How a run's recovery after an outage is measured from its timeline: the rate in the second
+# before the outage is full throughput, and the link has recovered once the rate over a
+# quarter of a second comes back to 90% of it.
+RECOVERY_BASELINE = 1.0
+RECOVERY_WINDOW = 0.25
+RECOVERY_SHARE = 0.9
 
 
 @dataclass(frozen=True)
@@ -239,9 +252,26 @@ class Result:
     record: dict[str, object]
     # The messages per second of every run of the cell, when it ran more than once.
     runs: tuple[float, ...] = ()
+    # How many operations the window counts, and with --slow-us how many of them were late.
+    ops: float = 0
+    slow: float | None = None
+    # The median time the run took to recover after the link's outages, in milliseconds.
+    recovery_ms: float | None = None
+
+    @property
+    def late_percent(self) -> float | None:
+        """The share of operations, or for the paced scenarios of messages, that took longer than
+        --slow-us, counting a paced message that never arrived in time as late too."""
+        if self.slow is None:
+            return None
+        if self.scenario in PACED_SCENARIOS:
+            total = self.msgs + self.lost
+            return (self.slow + self.lost) / total * 100 if total else None
+        return self.slow / self.ops * 100 if self.ops else None
 
     def row(self) -> list[str]:
         lost = self.lost / (self.lost + self.msgs) * 100 if self.lost > 0 else 0
+        late = self.late_percent
         spread = (
             (max(self.runs) - min(self.runs)) / self.msgs_per_sec * 100
             if len(self.runs) > 1 and self.msgs_per_sec > 0
@@ -266,6 +296,8 @@ class Result:
             str(math.floor(self.p99_us)),
             "-" if self.wire_bytes_per_msg is None else str(math.floor(self.wire_bytes_per_msg)),
             hundredths(lost),
+            "-" if late is None else hundredths(late),
+            "-" if self.recovery_ms is None else str(math.floor(self.recovery_ms)),
             "-" if spread is None else hundredths(spread),
         ]
 
@@ -364,7 +396,65 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         ),
         netem=netem,
         record=record,
+        ops=number_field(record, "ops", 0),
+        slow=None if record.get("slow") is None else number_field(record, "slow"),
     )
+
+
+def recoveries(record: Mapping[str, object], outages: list[tuple[float, float]]) -> list[float]:
+    """How long after each outage the run took to recover, in seconds, from the timeline in its
+    record: from the end of the outage to the start of the first RECOVERY_WINDOW whose rate is
+    RECOVERY_SHARE of the rate in the RECOVERY_BASELINE before the outage. An outage without a
+    full baseline second in the window is left out, and one after which the rate never recovers
+    before the next outage, or the end of the window, counts as lasting until then."""
+    timeline = record.get("timeline")
+    if not isinstance(timeline, dict):
+        return []
+    timeline = cast(dict[str, object], timeline)
+    counts = timeline.get("msgs")
+    if not isinstance(counts, list):
+        raise ValueError("no valid 'timeline.msgs'")
+    msgs = [float(count) for count in cast(list[int], counts)]
+    start = number_field(timeline, "start_unix_us") / 1e6
+    bucket = number_field(timeline, "bucket_ms") / 1000
+    if bucket <= 0:
+        raise ValueError("no valid 'timeline.bucket_ms'")
+    end = start + len(msgs) * bucket
+    window = max(math.ceil(RECOVERY_WINDOW / bucket - 1e-9), 1)
+
+    def index(at: float) -> int:
+        return math.ceil((at - start) / bucket - 1e-9)
+
+    found: list[float] = []
+    for number, (down, up) in enumerate(outages):
+        first = index(down - RECOVERY_BASELINE)
+        if first < 0 or up > end:
+            continue
+        before = msgs[first : math.floor((down - start) / bucket + 1e-9)]
+        if not before or sum(before) == 0:
+            continue
+        rate = sum(before) / len(before)
+        limit = min(outages[number + 1][0] if number + 1 < len(outages) else end, end)
+        last = math.floor((limit - start) / bucket + 1e-9)
+        recovered = limit - up
+        for at in range(index(up), last - window + 1):
+            if sum(msgs[at : at + window]) / window >= RECOVERY_SHARE * rate:
+                recovered = max(start + at * bucket - up, 0.0)
+                break
+        found.append(recovered)
+    return found
+
+
+def with_outages(result: Result, outages: list[tuple[float, float]]) -> Result:
+    """The result with its median recovery after the outages that ran, if its client reported a
+    timeline; the record keeps every outage's recovery as `recoveries_ms`."""
+    times = recoveries(result.record, outages)
+    if not times:
+        return result
+    milliseconds = [round(time * 1000, 1) for time in times]
+    median = sorted(milliseconds)[(len(milliseconds) - 1) // 2]
+    record = {**result.record, "recovery_ms": median, "recoveries_ms": milliseconds}
+    return replace(result, recovery_ms=median, record=record)
 
 
 def validation_field(record: dict[str, object]) -> str:
@@ -374,11 +464,18 @@ def validation_field(record: dict[str, object]) -> str:
     return validation
 
 
+def clean(results: list[Result]) -> list[Result]:
+    """The runs without failed operations, or every run when each had some: a run whose calls
+    were still in flight when its window ended counts them as failed, and leaves them out of its
+    latencies, so it says less about the cell than a run that completed them all."""
+    return [result for result in results if result.errors == 0] or results
+
+
 def agree(results: list[Result], tolerance: float) -> bool:
-    """Whether two of the runs differ in messages per second by at most `tolerance` percent of
-    the lower. The median of runs that include such a pair is one of them or between them, unless
-    a third run lies even closer."""
-    rates = sorted(result.msgs_per_sec for result in results)
+    """Whether two of the runs without failed operations (see `clean`) differ in messages per
+    second by at most `tolerance` percent of the lower. The median of runs that include such a
+    pair is one of them or between them, unless a third run lies even closer."""
+    rates = sorted(result.msgs_per_sec for result in clean(results))
     return any(
         low > 0 and (high - low) / low * 100 <= tolerance for low, high in itertools.pairwise(rates)
     )
@@ -386,13 +483,19 @@ def agree(results: list[Result], tolerance: float) -> bool:
 
 def median_run(results: list[Result]) -> Result:
     """The run with the median messages per second (the lower of the two middle ones for an even
-    count), carrying every run's rate in `runs` and its record."""
-    ordered = sorted(results, key=lambda result: result.msgs_per_sec)
+    count) among those without failed operations, if any (see `clean`), carrying every run's
+    rate in `runs` and its record, and how many runs had failed operations."""
+    ordered = sorted(clean(results), key=lambda result: result.msgs_per_sec)
     median = ordered[(len(ordered) - 1) // 2]
     if len(results) == 1:
         return median
     rates = tuple(result.msgs_per_sec for result in results)
-    record = {**median.record, "repeats": len(results), "msgs_per_sec_runs": list(rates)}
+    record = {
+        **median.record,
+        "repeats": len(results),
+        "msgs_per_sec_runs": list(rates),
+        "failed_runs": sum(1 for result in results if result.errors != 0),
+    }
     return replace(median, runs=rates, record=record)
 
 
@@ -496,6 +599,7 @@ class Runner:
                 mode += ["--metadata-scope", cell.metadata_scope]
             if cell.connections != 1:
                 mode += ["--connections", str(cell.connections)]
+            mode += link_flags(netem, cell.scenario)
             suffix = "" if cell.compression == "none" else f"-{cell.compression}"
             rate = "" if cell.rate is None else f"-r{cell.rate}"
             validation = "" if cell.validation is None else f"-{cell.validation}"
@@ -581,7 +685,7 @@ class Runner:
         """Runs the cell once, logging to NAME.log, and says how it went."""
         log = self.out / f"{name}.log"
         offset = 0 if self.server is None else self.server.log_size()
-        with log.open("w", encoding="utf-8") as stderr, self.outages(netem):
+        with log.open("w", encoding="utf-8") as stderr, self.outages(netem) as outages:
             completed = run_with_deadline(
                 command, self.matrix.deadline, stdout=subprocess.PIPE, stderr=stderr
             )
@@ -599,7 +703,7 @@ class Runner:
                 return Attempt(log, offset, None, f"{reason}: {last}", "did not connect")
             return Attempt(log, offset, None, reason)
         try:
-            result = parse_result(client, server, line, netem)
+            result = with_outages(parse_result(client, server, line, netem), outages)
         except ValueError as error:
             return Attempt(log, offset, None, f"printed an invalid result ({error}): {line}")
         if result.errors != 0:
@@ -607,10 +711,13 @@ class Runner:
             return Attempt(log, offset, result, f"reported errors: {line}", retry)
         return Attempt(log, offset, result)
 
-    def outages(self, profile: str | None) -> contextlib.AbstractContextManager[None]:
-        """The profile's outages, which run while a client does."""
+    def outages(
+        self, profile: str | None
+    ) -> contextlib.AbstractContextManager[list[tuple[float, float]]]:
+        """The profile's outages, which run while a client does, and which the block gets as
+        they end, as (start, end) by the wall clock."""
         if self.link is None or profile is None:
-            return contextlib.nullcontext()
+            return contextlib.nullcontext([])
         return self.link.outages(profile, self.matrix.warmup + self.matrix.duration)
 
     def fail(self, cell: str, reason: str, log: Path, offset: int) -> None:
@@ -628,6 +735,21 @@ class Runner:
         self.server = None
         if (failure := stop_server(server)) is not None:
             self.failures.append(failure)
+
+
+def link_flags(profile: str | None, scenario: str) -> list[str]:
+    """The client flags an emulated link asks for: the threshold of a late operation, twice the
+    link's round trip, for the scenarios whose operation is one round trip, and timelines when
+    it has outages."""
+    if profile is None:
+        return []
+    flags: list[str] = []
+    round_trip = netem.round_trip(profile)
+    if round_trip is not None and scenario in ROUND_TRIP_SCENARIOS:
+        flags += ["--slow-us", str(round(LATE_ROUND_TRIPS * round_trip * 1e6))]
+    if netem.parse(profile).outage is not None:
+        flags += ["--timeline-ms", str(TIMELINE_MS)]
+    return flags
 
 
 def browser_lanes(server: Server, cert_hash: str) -> dict[str, list[str]]:

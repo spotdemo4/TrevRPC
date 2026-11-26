@@ -68,10 +68,10 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(
             ["bidi", "64", "0", "4", "1", "-", "-", "quic", "none", "go", "go"], bidi[:11]
         )
-        # ops/s, msgs/s, MB/s, p50us, p99us, wire_B/msg, lost%, spread%
-        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-"], bidi[11:])
+        # ops/s, msgs/s, MB/s, p50us, p99us, wire_B/msg, lost%, late%, recov_ms, spread%
+        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-", "-", "-"], bidi[11:])
         self.assertEqual(["unary", "rust", "go"], [unary[0], unary[9], unary[10]])
-        self.assertEqual(["80", "33.33", "-"], unary[16:])
+        self.assertEqual(["80", "33.33", "-", "-", "-"], unary[16:])
 
     def test_shows_the_rate_of_paced_runs_in_rate_order(self) -> None:
         paced = {**RESULT, "scenario": "unreliable-paced"}
@@ -541,15 +541,72 @@ class TableTest(unittest.TestCase):
 
         self.assertEqual(["delay 1ms"], args.netem)
         self.assertEqual([64], args.sizes)
-        self.assertEqual(10.0, args.duration)
+        self.assertEqual(20.0, args.duration)
 
     def test_impaired_tables_run_long_windows(self) -> None:
         lossy = run.parse_args(["--table", "lossy", "--baseline", "b"])
         access = run.parse_args(["--table", "access", "--baseline", "b"])
 
-        self.assertEqual((10.0, 1.0), (lossy.duration, lossy.warmup))
-        # Deep queues and outages every 5 s need longer windows than loss alone.
-        self.assertEqual((20.0, 3.0), (access.duration, access.warmup))
+        browser = run.parse_args(["--table", "browser-lossy", "--baseline", "b"])
+
+        # Burst loss, deep queues and outages every 5 s all need long windows.
+        for table in (lossy, access, browser):
+            self.assertEqual((20.0, 3.0), (table.duration, table.warmup))
+
+
+def timeline(start: float, msgs: list[int], bucket_ms: int = 100) -> dict[str, object]:
+    return {"start_unix_us": round(start * 1e6), "bucket_ms": bucket_ms, "msgs": msgs}
+
+
+class TailTest(unittest.TestCase):
+    def test_a_link_asks_for_late_counts_and_timelines_with_outages(self) -> None:
+        self.assertEqual([], run.link_flags(None, "unary"))
+        self.assertEqual(["--slow-us", "40000"], run.link_flags("delay 10ms loss 1%", "bidi"))
+        outages = "delay 35ms up rate 12mbit down rate 40mbit outage 170ms every 5s"
+        self.assertEqual(
+            ["--slow-us", "140000", "--timeline-ms", "50"], run.link_flags(outages, "paced")
+        )
+        self.assertEqual([], run.link_flags("rate 10mbit", "unary"))
+        # A streaming call takes as long as its messages need, so it is never late.
+        self.assertEqual(["--timeline-ms", "50"], run.link_flags(outages, "server-stream"))
+
+    def test_late_share_of_operations_and_of_paced_messages(self) -> None:
+        unary = run.parse_result("go", "go", json.dumps({**RESULT, "slow": 25}))
+        self.assertEqual(25.0, unary.late_percent)
+        paced = {**RESULT, "scenario": "paced", "msgs": 90, "lost": 10, "slow": 5}
+        # A paced message that never arrived in time is late too.
+        self.assertEqual(15.0, run.parse_result("go", "go", json.dumps(paced)).late_percent)
+        self.assertIsNone(run.parse_result("go", "go", json.dumps(RESULT)).late_percent)
+
+    def test_recovery_runs_from_the_outage_to_the_rate_coming_back(self) -> None:
+        # 100 ms buckets from t=100: ten a bucket, nothing during the outage from 101.0 to
+        # 101.2, then 3, 5, 9 and 10 a bucket. The first quarter second (3 buckets, rounded up)
+        # back to 90% of 10 a bucket starts at 101.4 (9, 10, 10), 0.2 s after the outage.
+        msgs = [10] * 10 + [0, 0, 3, 5, 9, 10, 10, 10, 10, 10]
+        record = {**RESULT, "timeline": timeline(100.0, msgs)}
+        self.assertEqual([0.2], [round(t, 6) for t in run.recoveries(record, [(101.0, 101.2)])])
+
+    def test_no_recovery_before_the_next_outage_lasts_until_it(self) -> None:
+        msgs = [10] * 10 + [0, 0, 1, 1, 1, 1, 0, 0, 1, 1]
+        record = {**RESULT, "timeline": timeline(100.0, msgs)}
+        outages = [(101.0, 101.2), (101.6, 101.8)]
+        # The second outage has no clean baseline second, but a full one still counts.
+        self.assertEqual([0.4, 0.2], [round(t, 6) for t in run.recoveries(record, outages)])
+
+    def test_outages_without_a_baseline_second_are_left_out(self) -> None:
+        record = {**RESULT, "timeline": timeline(100.0, [10] * 20)}
+        self.assertEqual([], run.recoveries(record, [(100.5, 100.7)]))
+        self.assertEqual([], run.recoveries(RESULT, [(101.0, 101.2)]))
+
+    def test_the_median_recovery_goes_in_the_result(self) -> None:
+        msgs = [10] * 10 + [0, 0, 10, 10, 10] + [10] * 5 + [0, 0, 0, 10, 10, 10] + [10] * 4
+        result = run.parse_result(
+            "go", "go", json.dumps({**RESULT, "timeline": timeline(100.0, msgs)})
+        )
+        outaged = run.with_outages(result, [(101.0, 101.2), (102.0, 102.3)])
+        self.assertEqual(0.0, outaged.recovery_ms)
+        self.assertEqual([0.0, 0.0], outaged.record["recoveries_ms"])
+        self.assertIs(result, run.with_outages(result, []))
 
 
 class RepeatTest(unittest.TestCase):
@@ -584,6 +641,24 @@ class RepeatTest(unittest.TestCase):
         # 1000 and 1300 differ by 30%; 1300 and 1290 agree within 3% of the median, 1290.
         self.assertEqual(["cell-r1", "cell-r2", "cell-r3"], calls)
         self.assertEqual(1290.0, runner.results[0].msgs_per_sec)
+
+    def test_the_median_comes_from_runs_without_failed_operations(self) -> None:
+        failed = run.parse_result(
+            "go", "go", json.dumps({**RESULT, "msgs_per_sec": 1100, "errors": 3})
+        )
+        results = [*self.results(900, 1000), failed]
+        median = run.median_run(results)
+        self.assertEqual(900.0, median.msgs_per_sec)
+        self.assertEqual(1, median.record["failed_runs"])
+        self.assertEqual([900.0, 1000.0, 1100.0], median.record["msgs_per_sec_runs"])
+        # When every run failed some, the median is of them all.
+        self.assertEqual(1100.0, run.median_run([failed]).msgs_per_sec)
+
+    def test_a_run_with_failed_operations_agrees_with_none(self) -> None:
+        failed = run.parse_result(
+            "go", "go", json.dumps({**RESULT, "msgs_per_sec": 1010, "errors": 3})
+        )
+        self.assertFalse(run.agree([*self.results(1000), failed], 3))
 
 
 class FailureTest(unittest.TestCase):

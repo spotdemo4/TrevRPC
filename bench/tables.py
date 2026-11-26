@@ -150,6 +150,12 @@ ALL_COMPRESSIONS = ["none", "gzip", "zstd", "dictionary", "stream", "stream-dict
 # were noisy; 5 s measured the same as 3 s within the runs' spread.
 LOOPBACK = {"duration": 3.0, "warmup": 0.5}
 
+# How long the tables of impaired links measure each cell, after how much warmup: deep queues
+# take seconds to fill and settle, outages every 5 s need several per window, and burst loss sends
+# TCP into backoffs of seconds. In 10 s windows, outage cells swung by up to a quarter between
+# runs, and TCP cells at about 3% burst loss by up to 15 times (#740).
+IMPAIRED_WINDOW = {"duration": 20.0, "warmup": 3.0}
+
 # What the tables of impaired links run: few messages per call, small paced ones, and long
 # windows, which loss and outages need to average out.
 IMPAIRED = {
@@ -162,7 +168,7 @@ IMPAIRED = {
     # 1 KiB per worker lost nearly all of them, even over TCP, and 100 of 64 bytes already
     # doubled the round trips.
     "rates": [25],
-    "duration": 10.0,
+    **IMPAIRED_WINDOW,
 }
 
 # Real links lose packets in bursts, not one at a time: Wi-Fi and cellular retransmit below IP, so
@@ -246,13 +252,7 @@ TABLES: dict[str, Table] = {
         },
         lossy,
     ),
-    "access": Table(
-        "Access networks",
-        # Deep queues take seconds to fill and settle, and outages every 5 s need several per
-        # window: in 10 s windows, cells swung by up to a quarter between runs.
-        {**IMPAIRED, "duration": 20.0, "warmup": 3.0, "netem": ACCESS},
-        lossy,
-    ),
+    "access": Table("Access networks", {**IMPAIRED, "netem": ACCESS}, lossy),
     "browser": Table(
         "Browsers",
         {
@@ -282,7 +282,7 @@ TABLES: dict[str, Table] = {
             "sizes": [1024],
             "concurrency": [64],
             "messages": 10,
-            "duration": 10.0,
+            **IMPAIRED_WINDOW,
             "netem": [GILBERT_ELLIOTT[1]],
         },
         browser,

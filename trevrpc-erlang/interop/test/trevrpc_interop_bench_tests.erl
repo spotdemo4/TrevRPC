@@ -34,7 +34,18 @@ bench_test_() ->
                     {timeout, 60, fun() -> options(Env) end}},
                 {"metadata as connection metadata",
                     {timeout, 60, fun() -> connection_metadata(Env) end}},
-                {"what the runtime cannot do is a usage error", fun() -> refusals(Env) end}
+                {"what the runtime cannot do is a usage error", fun() -> refusals(Env) end},
+                {"the slow count and the timeline are absent unless asked for",
+                    {timeout, 60, fun() -> extras_off(Env) end}},
+                {"slow counts the operations and messages over the limit",
+                    {timeout, 60, fun() -> slow(Env) end}},
+                {"the timeline has a bucket for every interval of the window",
+                    {timeout, 60, fun() -> timeline_buckets(Env) end}},
+                {"the timeline counts the messages of each interval",
+                    {timeout, 60, fun() -> timeline_messages(Env) end}},
+                {"a negative slow limit or bucket is a usage error", fun() ->
+                    extras_refusals(Env)
+                end}
             ]
     end}.
 
@@ -157,3 +168,103 @@ refusals(#{flags := Flags}) ->
     Refused(#{"scenario" => "server-stream", "compression" => "stream"}),
     Refused(#{"scenario" => "unary", "compression" => "dictionary"}),
     Refused(#{"scenario" => "nope"}).
+
+%% Without --slow-us and --timeline-ms the result has neither field.
+extras_off(#{flags := Flags}) ->
+    [
+        begin
+            {ok, Result} = trevrpc_interop_bench:bench(Flags#{
+                "transport" => "quic",
+                "scenario" => Scenario,
+                "slow-us" => "0",
+                "timeline-ms" => "0"
+            }),
+            ?assertNot(is_map_key(slow, Result)),
+            ?assertNot(is_map_key(timeline, Result))
+        end
+     || Scenario <- ["unary", "paced"]
+    ].
+
+%% Every call and message takes longer than a microsecond, and none takes
+%% longer than a thousand seconds.
+slow(#{flags := Flags}) ->
+    [
+        begin
+            {ok, All} = trevrpc_interop_bench:bench(Flags#{
+                "transport" => "quic", "scenario" => Scenario, "slow-us" => "1"
+            }),
+            {ok, None} = trevrpc_interop_bench:bench(Flags#{
+                "transport" => "quic", "scenario" => Scenario, "slow-us" => "1000000000"
+            }),
+            ?assertEqual(maps:get(Counted, All), maps:get(slow, All)),
+            ?assertEqual(0, maps:get(slow, None)),
+            ?assertNot(is_map_key(timeline, All))
+        end
+     || {Scenario, Counted} <- [{"unary", ops}, {"server-stream", ops}, {"paced", msgs}]
+    ].
+
+%% The window of DURATION seconds holds ceil(DURATION * 1000 / N) buckets of N
+%% milliseconds, and starts about when the bench was called, by the wall
+%% clock, after the warmup.
+timeline_buckets(#{flags := Flags}) ->
+    lists:foreach(
+        fun({BucketMs, Expected}) ->
+            Before = erlang:system_time(microsecond),
+            {ok, Result} = trevrpc_interop_bench:bench(Flags#{
+                "transport" => "quic",
+                "scenario" => "unary",
+                "timeline-ms" => integer_to_list(BucketMs)
+            }),
+            After = erlang:system_time(microsecond),
+            #{timeline := #{start_unix_us := Start, bucket_ms := Bucket, msgs := Counts}} = Result,
+            ?assertEqual(BucketMs, Bucket),
+            ?assertEqual(Expected, length(Counts)),
+            ?assert(lists:all(fun(Count) -> is_integer(Count) andalso Count >= 0 end, Counts)),
+            %% The warmup is 0.1 s; the connection takes some time more.
+            ?assert(Start >= Before + 100000),
+            ?assert(Start =< After - round(?DURATION * 1000000)),
+            ?assertNot(is_map_key(slow, Result))
+        end,
+        [{100, 5}, {300, 2}, {500, 1}, {1000, 1}, {7, 72}]
+    ).
+
+%% Every interval of a window of back-to-back operations, and of paced
+%% messages, delivers some, and the intervals add up to the window's messages,
+%% give or take the operations that started before the window and the paced
+%% messages that arrived after it.
+timeline_messages(#{flags := Flags}) ->
+    [
+        begin
+            {ok, Result} = trevrpc_interop_bench:bench(Flags#{
+                "transport" => Transport,
+                "scenario" => Scenario,
+                "timeline-ms" => "100",
+                "slow-us" => "1"
+            }),
+            #{msgs := Messages, timeline := #{msgs := Counts}} = Result,
+            ?assertEqual(5, length(Counts)),
+            ?assert(lists:all(fun(Count) -> Count > 0 end, Counts)),
+            Slack = ?CONCURRENCY * (maps:get(messages, Extra) + 1),
+            ?assert(abs(lists:sum(Counts) - Messages) =< Slack)
+        end
+     || Transport <- ["quic", "tcp"],
+        {Scenario, Extra} <- [
+            {"unary", #{messages => 1}},
+            {"server-stream", #{messages => 5}},
+            {"paced", #{messages => 2}}
+        ]
+    ].
+
+extras_refusals(#{flags := Flags}) ->
+    ?assertThrow(
+        {usage, _},
+        trevrpc_interop_bench:bench(Flags#{"scenario" => "unary", "slow-us" => "-1"})
+    ),
+    ?assertThrow(
+        {usage, _},
+        trevrpc_interop_bench:bench(Flags#{"scenario" => "unary", "timeline-ms" => "-5"})
+    ),
+    ?assertThrow(
+        {usage, _},
+        trevrpc_interop_bench:bench(Flags#{"scenario" => "unary", "timeline-ms" => "x"})
+    ).

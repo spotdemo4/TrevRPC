@@ -6,7 +6,8 @@
                              [--duration SECONDS] [--warmup SECONDS] [--messages N] [--rate N]
                              [--metadata-size BYTES] [--metadata-scope call|connection]
                              [--payload repeat|records] [--compression MODE] [--dictionary FILE]
-                             [--validation none|standard|cel]
+                             [--validation none|standard|cel] [--slow-us MICROSECONDS]
+                             [--timeline-ms MILLISECONDS]
 
 Every worker is a task on one event loop, and the channels' connections run on it too, so the
 numbers measure one Python thread. It prints one JSON line and exits 0, or prints why it failed as
@@ -18,10 +19,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import contextlib
 import json
 import math
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -204,6 +207,27 @@ def new_payload(kind: str, size: int, worker: int) -> Payload:
 
 
 @dataclass
+class Timeline:
+    """The messages delivered in each `bucket_us`-microsecond interval of the measured window,
+    counted when the operation that carried them completed, or a paced echo arrived in time."""
+
+    start: float
+    bucket_us: int
+    msgs: list[int]
+
+    @classmethod
+    def of(cls, start: float, duration: float, bucket_ms: int) -> Timeline:
+        # In whole microseconds, so that float error puts no instant in the wrong bucket.
+        buckets = math.ceil(round(duration * 1e6) / (bucket_ms * 1000))
+        return cls(start, bucket_ms * 1000, [0] * buckets)
+
+    def add(self, at: float, messages: int) -> None:
+        index = round((at - self.start) * 1e6) // self.bucket_us
+        if 0 <= index < len(self.msgs):
+            self.msgs[index] += messages
+
+
+@dataclass
 class Worker:
     """What one worker measured."""
 
@@ -214,6 +238,8 @@ class Worker:
     delivered: int = 0
     """Messages its operations delivered, or paced echoes that arrived in time, in the window or
     not, for the wire sampler to read at the same instants as the bytes."""
+    timeline: Timeline | None = None
+    """The timeline the workers share, with --timeline-ms."""
 
 
 @dataclass
@@ -291,6 +317,8 @@ class Config:
     payload: str
     compression: str
     validation: str
+    slow_us: int = 0
+    timeline_ms: int = 0
 
     @property
     def stream_compressed(self) -> bool:
@@ -545,6 +573,8 @@ class OperationLoop:
                 # delivered before the end sample.
                 worker.delivered += messages
                 finished = clock.now()
+                if worker.timeline is not None:
+                    worker.timeline.add(finished, messages)
                 if began >= start and finished <= end:
                     worker.latencies.append(finished - began)
                     worker.messages += messages
@@ -637,6 +667,8 @@ class PacedWorkload:
                         rtts[sequence] = rtt
                         if rtt <= PACED_DEADLINE:
                             worker.delivered += 1
+                            if worker.timeline is not None:
+                                worker.timeline.add(arrived, 1)
 
             receiver = loop.create_task(receive())
             try:
@@ -770,6 +802,9 @@ def summarize(config: Config, transport: str, workers: list[Worker]) -> dict[str
         result["rate"] = config.rate
     if config.scenario in VALIDATION_SCENARIOS:
         result["validation"] = config.validation
+    if config.slow_us > 0:
+        threshold = config.slow_us / 1e6
+        result["slow"] = len(latencies) - bisect.bisect_right(latencies, threshold)
     return result
 
 
@@ -788,6 +823,8 @@ async def run(args: argparse.Namespace) -> int:
         payload=args.payload,
         compression=args.compression,
         validation=args.validation,
+        slow_us=args.slow_us,
+        timeline_ms=args.timeline_ms,
     )
     options: dict[str, Any] = {
         "ca": args.ca,
@@ -817,9 +854,14 @@ async def run(args: argparse.Namespace) -> int:
         wire = WireCounter(channels)
 
         loop = asyncio.get_running_loop()
+        # The wall clock at the window's start, for the timeline: the runner times outages by it.
+        wall_offset = time.time() - loop.time()
         start = loop.time() + config.warmup
         end = start + config.duration
-        workers = [Worker() for _ in range(config.concurrency)]
+        timeline = (
+            Timeline.of(start, config.duration, config.timeline_ms) if config.timeline_ms else None
+        )
+        workers = [Worker(timeline=timeline) for _ in range(config.concurrency)]
         # Only the QUIC connection counts its bytes; QMux runs on asyncio's TLS streams.
         sampler = (
             WireSampler(wire.total, workers, start, end, track=wire.track)
@@ -861,6 +903,12 @@ async def run(args: argparse.Namespace) -> int:
         except BenchError as error:
             print(f"bench: {error}", file=sys.stderr)
             return 1
+        if timeline is not None:
+            result["timeline"] = {
+                "start_unix_us": round((start + wall_offset) * 1e6),
+                "bucket_ms": config.timeline_ms,
+                "msgs": timeline.msgs,
+            }
         if sampler is not None:
             per_message = sampler.per_message(int(result["msgs"]))  # pyright: ignore[reportArgumentType]
             if per_message is not None:
@@ -893,6 +941,8 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     bench.add_argument("--compression", choices=tuple(COMPRESSIONS), default="none")
     bench.add_argument("--dictionary")
     bench.add_argument("--validation", choices=tuple(VALIDATIONS), default="none")
+    bench.add_argument("--slow-us", type=int, default=0)
+    bench.add_argument("--timeline-ms", type=int, default=0)
 
 
 def check(args: argparse.Namespace) -> str | None:
@@ -920,6 +970,10 @@ def check(args: argparse.Namespace) -> str | None:
         return "--duration must be positive"
     if not (args.warmup >= 0 and math.isfinite(args.warmup)):
         return "--warmup must not be negative"
+    if args.slow_us < 0:
+        return "--slow-us must not be negative"
+    if args.timeline_ms < 0:
+        return "--timeline-ms must not be negative"
     return None
 
 

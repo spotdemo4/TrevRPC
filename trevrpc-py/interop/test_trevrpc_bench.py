@@ -100,6 +100,15 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(100.0, result["rate"])
         self.assertNotIn("validation", result)
 
+    def test_slow_counts_the_latencies_above_the_threshold(self) -> None:
+        workers = [Worker(latencies=[0.010, 0.040, 0.041, 0.100], messages=4)]
+        result = summarize(config(slow_us=40_000), "quic", workers)
+        self.assertEqual(3 - 1, result["slow"])
+
+    def test_no_slow_count_without_the_flag(self) -> None:
+        result = summarize(config(), "quic", [Worker(latencies=[1.0], messages=1)])
+        self.assertNotIn("slow", result)
+
     def test_no_operation_completed(self) -> None:
         with self.assertRaisesRegex(
             BenchError, r"^no operation completed in the 1s measured window \(3 failed\)$"
@@ -126,6 +135,19 @@ class WireSamplerTest(unittest.TestCase):
         self.assertIsNone(sampler.per_message(windowed=0))
         sampler.at = [(0, 0), (60, 0)]
         self.assertEqual(20.0, sampler.per_message(windowed=3))
+
+
+class TimelineTest(unittest.TestCase):
+    def test_counts_land_in_the_bucket_of_their_completion(self) -> None:
+        timeline = trevrpc_bench.Timeline.of(start=10.0, duration=0.25, bucket_ms=100)
+        self.assertEqual([0, 0, 0], timeline.msgs)
+        timeline.add(9.99, 5)  # before the window
+        timeline.add(10.0, 1)
+        timeline.add(10.099, 2)
+        timeline.add(10.1, 3)
+        timeline.add(10.249, 4)
+        timeline.add(10.3, 6)  # after the window
+        self.assertEqual([3, 3, 4], timeline.msgs)
 
 
 class FakeClock:
@@ -166,17 +188,22 @@ class OperationLoopTest(unittest.IsolatedAsyncioTestCase):
     async def test_counts_only_operations_inside_the_window(self) -> None:
         clock = FakeClock()
         # The window is [0.05, 0.25]. One operation straddles its start, two complete inside it
-        # around a failure (with the failure's 1 ms backoff), and one straddles its end.
+        # around a failure (with the failure's 1 ms backoff), and one straddles its end: they
+        # finish 0.05, 0.08, 0.10, 0.151 and 0.351 s into the window.
         operation = Scripted(
-            clock, [(0.1, True), (0.05, True), (0.02, False), (0.05, True), (0.2, True)]
+            clock, [(0.1, True), (0.03, True), (0.02, False), (0.05, True), (0.2, True)]
         )
-        worker = Worker()
+        timeline = trevrpc_bench.Timeline.of(0.05, 0.2, 100)
+        worker = Worker(timeline=timeline)
         await OperationLoop(operation, None, clock.clock).work(worker, 0.05, 0.25)
 
-        self.assertEqual([0.05, 0.05], [round(latency, 9) for latency in worker.latencies])
+        self.assertEqual([0.03, 0.05], [round(latency, 9) for latency in worker.latencies])
         self.assertEqual(4, worker.messages)
         self.assertEqual(1, worker.errors)
         self.assertEqual(8, worker.delivered)
+        # The first two complete in the first 100 ms bucket and the fourth in the second; the
+        # last ends after the window.
+        self.assertEqual([4, 2], timeline.msgs)
         self.assertTrue(operation.closed)
 
 

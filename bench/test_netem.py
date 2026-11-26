@@ -210,6 +210,13 @@ class LinkTest(unittest.TestCase):
 
         self.assertEqual([], self.commands)
 
+    def test_round_trip_adds_each_direction_s_last_delay(self) -> None:
+        self.assertEqual(0.02, netem.round_trip("delay 10ms loss 1%"))
+        self.assertAlmostEqual(0.025, netem.round_trip("delay 5ms up delay 20ms") or 0)
+        # Up keeps the shared 1 s, down overrides it with 500 µs.
+        self.assertAlmostEqual(1.0005, netem.round_trip("delay 1s down delay 500us") or 0)
+        self.assertIsNone(netem.round_trip("rate 1mbit"))
+
     def test_outages_run_while_the_block_does_and_end_when_it_does(self) -> None:
         # One outage fits the 20 ms window, from 10 ms to 19 ms; the block may end before or
         # after it does, and the outage ends either way.
@@ -221,10 +228,13 @@ class LinkTest(unittest.TestCase):
             started.set()
 
         link = netem.Link(run, lambda _ports: None)
-        with link.outages("delay 1ms outage 9ms every 20ms", 0.02):
+        with link.outages("delay 1ms outage 9ms every 20ms", 0.02) as times:
             self.assertTrue(started.wait(5))
 
         self.assertEqual([netem.OUTAGE_START, netem.OUTAGE_END], commands)
+        # The outage that ran, by the wall clock.
+        self.assertEqual(1, len(times))
+        self.assertLessEqual(times[0][0], times[0][1])
 
     def test_outages_that_fail_fail_the_block(self) -> None:
         called = threading.Event()

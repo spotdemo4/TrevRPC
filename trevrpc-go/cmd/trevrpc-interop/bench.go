@@ -65,6 +65,12 @@ type benchConfig struct {
 	// validation is which ValidationBench request type the validation
 	// scenarios send: none, standard or cel.
 	validation string
+	// slowUS is --slow-us: the latency in microseconds above which an operation
+	// counts as slow, or 0 to not count.
+	slowUS int
+	// timelineMS is --timeline-ms: the width in milliseconds of the intervals
+	// the delivered messages are counted in, or 0 to not count.
+	timelineMS int
 }
 
 func (c *benchConfig) register(flags *flag.FlagSet) {
@@ -83,6 +89,8 @@ func (c *benchConfig) register(flags *flag.FlagSet) {
 	flags.StringVar(&c.compression, "compression", "none", "none, dictionary, stream or stream-dictionary")
 	flags.StringVar(&c.dictionary, "dictionary", "", "zstd dictionary file for the dictionary and stream-dictionary compression modes")
 	flags.StringVar(&c.validation, "validation", "none", "rules the validation scenarios' requests carry: none, standard or cel")
+	flags.IntVar(&c.slowUS, "slow-us", 0, "count the operations, or paced messages, slower than this many microseconds as slow; 0 counts none")
+	flags.IntVar(&c.timelineMS, "timeline-ms", 0, "count the messages delivered in each interval of this many milliseconds of the window; 0 counts none")
 }
 
 // benchCompressions are the --compression modes and the scenarios each runs.
@@ -148,6 +156,10 @@ func (c *benchConfig) validate() error {
 		return errors.New("bench: --duration must be positive")
 	case !(c.warmup >= 0):
 		return errors.New("bench: --warmup must not be negative")
+	case c.slowUS < 0:
+		return errors.New("bench: --slow-us must not be negative")
+	case c.timelineMS < 0:
+		return errors.New("bench: --timeline-ms must not be negative")
 	}
 	return nil
 }
@@ -526,7 +538,7 @@ func (p *pacedWorkload) work(ctx context.Context, w *benchWorker, start, end tim
 	// Sending goes on past the window, so the echoes of its last messages
 	// arrive under the same load.
 	total := int(end.Add(pacedDeadline).Sub(base)/p.interval) + 1
-	schedule := pacedSchedule{base: base, sent: make([]atomic.Int64, total), rtts: make([]time.Duration, total), delivered: &w.delivered, sampler: w.sampler}
+	schedule := pacedSchedule{base: base, sent: make([]atomic.Int64, total), rtts: make([]time.Duration, total), delivered: &w.delivered, timeline: w.timeline, sampler: w.sampler}
 	for i := range schedule.rtts {
 		schedule.rtts[i] = -1
 	}
@@ -552,7 +564,7 @@ func (p *pacedWorkload) work(ctx context.Context, w *benchWorker, start, end tim
 			continue
 		}
 		if inTime(rtt) {
-			w.latencies = append(w.latencies, rtt)
+			w.record(rtt)
 			w.messages++
 		} else {
 			w.lost++
@@ -573,6 +585,9 @@ type pacedSchedule struct {
 	// delivered counts the echoes that arrived in time, as they arrive, for
 	// sampler to read at the same instants as the wire bytes.
 	delivered *atomic.Uint64
+	// timeline counts the echoes that arrived in time by the instant of their
+	// arrival, or is nil.
+	timeline *benchTimeline
 	// sampler is told when the sender is about to send a message, or nil.
 	sampler *wireSampler
 }
@@ -629,7 +644,8 @@ func receivePaced(call trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest
 		if err != nil {
 			return err
 		}
-		arrived := int64(time.Since(schedule.base)) + 1
+		now := time.Now()
+		arrived := int64(now.Sub(schedule.base)) + 1
 		sequence, ok := pacedSequence(response.Message)
 		if !ok || sequence >= len(schedule.sent) {
 			return fmt.Errorf("echo %.20q carries no message number", response.Message)
@@ -643,6 +659,7 @@ func receivePaced(call trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest
 			schedule.rtts[sequence] = rtt
 			if inTime(rtt) {
 				schedule.delivered.Add(1)
+				schedule.timeline.add(now, 1)
 			}
 		}
 	}
@@ -724,6 +741,14 @@ type benchWorker struct {
 	messages  uint64
 	lost      uint64
 	errors    uint64
+	// slowAfter is the latency above which a measured operation counts in
+	// slow, or 0 to count none.
+	slowAfter time.Duration
+	slow      uint64
+	// timeline counts the messages the worker delivered in each interval of the
+	// window, or is nil. An operation loop's goroutine writes it; a paced
+	// worker's stream receivers do, one stream at a time.
+	timeline *benchTimeline
 	// delivered counts the messages its operations delivered, or the paced
 	// echoes that arrived in time, in the window or not, for sampler to read
 	// at the same instants as the wire bytes. A message counts once it has
@@ -732,6 +757,41 @@ type benchWorker struct {
 	// sampler is told when the worker starts an operation or sends a paced
 	// message, or nil.
 	sampler *wireSampler
+}
+
+// record keeps the latency of a measured operation or paced message.
+func (w *benchWorker) record(latency time.Duration) {
+	w.latencies = append(w.latencies, latency)
+	if w.slowAfter > 0 && latency > w.slowAfter {
+		w.slow++
+	}
+}
+
+// benchTimeline counts messages in the consecutive intervals, buckets, of the
+// measured window [start, end). One goroutine at a time writes it, so each
+// worker has its own, which summarize adds up. A nil timeline counts nothing.
+type benchTimeline struct {
+	start, end time.Time
+	bucket     time.Duration
+	msgs       []uint64
+}
+
+// newBenchTimeline returns a timeline with ceil(window / bucket) buckets. The
+// window is rounded to a microsecond first, so that --duration 0.3, which
+// converts to a few nanoseconds more or less than 300 ms, does not gain or
+// lose a bucket against --timeline-ms 100.
+func newBenchTimeline(start, end time.Time, bucket time.Duration) *benchTimeline {
+	buckets := int((end.Sub(start).Round(time.Microsecond) + bucket - 1) / bucket)
+	return &benchTimeline{start: start, end: end, bucket: bucket, msgs: make([]uint64, buckets)}
+}
+
+// add counts messages in the bucket of the instant at, unless the window does
+// not contain it.
+func (t *benchTimeline) add(at time.Time, messages int) {
+	if t == nil || at.Before(t.start) || !at.Before(t.end) {
+		return
+	}
+	t.msgs[min(int(at.Sub(t.start)/t.bucket), len(t.msgs)-1)] += uint64(messages)
 }
 
 // operationLoop runs its operation back to back until end. It counts only
@@ -765,8 +825,9 @@ func (l operationLoop) work(ctx context.Context, w *benchWorker, start, end time
 			}
 			continue
 		}
+		w.timeline.add(finished, messages)
 		if !began.Before(start) && !finished.After(end) {
-			w.latencies = append(w.latencies, finished.Sub(began))
+			w.record(finished.Sub(began))
 			w.messages += uint64(messages)
 			if lossy, ok := operation.(lossyOperation); ok {
 				w.lost += uint64(lossy.lost())
@@ -849,6 +910,19 @@ type benchResult struct {
 	// Validation is the rules the requests carried, which only the
 	// validation scenarios have.
 	Validation string `json:"validation,omitempty"`
+	// Slow counts the measured operations, or paced messages, slower than
+	// --slow-us, and is nil without it.
+	Slow *uint64 `json:"slow,omitempty"`
+	// Timeline counts the messages delivered in each interval of the window,
+	// and is nil without --timeline-ms.
+	Timeline *benchTimelineResult `json:"timeline,omitempty"`
+}
+
+// benchTimelineResult is the timeline field of the result line.
+type benchTimelineResult struct {
+	StartUnixUS int64    `json:"start_unix_us"`
+	BucketMS    int      `json:"bucket_ms"`
+	Msgs        []uint64 `json:"msgs"`
 }
 
 // runBench connects, runs the scenario for the warmup and the measured window
@@ -904,6 +978,10 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	var group sync.WaitGroup
 	for i := range workers {
 		workers[i].sampler = sampler
+		workers[i].slowAfter = time.Duration(config.slowUS) * time.Microsecond
+		if config.timelineMS > 0 {
+			workers[i].timeline = newBenchTimeline(start, end, time.Duration(config.timelineMS)*time.Millisecond)
+		}
 		workload := benchScenarios[config.scenario](clients[i%len(clients)], config, newBenchPayload(config.payload, config.size, i))
 		group.Go(func() { workload.work(opCtx, &workers[i], start, end) })
 	}
@@ -1017,10 +1095,20 @@ func sleepUntil(ctx context.Context, t time.Time) error {
 // summarize turns what the workers measured into the result line.
 func summarize(config benchConfig, transport trevrpc.TransportKind, window time.Duration, workers []benchWorker) (benchResult, error) {
 	var latencies []time.Duration
-	var messages, lost, failures uint64
+	var messages, lost, failures, slow uint64
+	var timeline *benchTimelineResult
 	for i := range workers {
 		w := &workers[i]
 		latencies = append(latencies, w.latencies...)
+		slow += w.slow
+		if t := w.timeline; t != nil {
+			if timeline == nil {
+				timeline = &benchTimelineResult{StartUnixUS: t.start.UnixMicro(), BucketMS: config.timelineMS, Msgs: make([]uint64, len(t.msgs))}
+			}
+			for j, count := range t.msgs {
+				timeline.Msgs[j] += count
+			}
+		}
 		messages += w.messages
 		lost += w.lost
 		failures += w.errors
@@ -1039,6 +1127,10 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 	if config.validated() {
 		validation = config.validation
 	}
+	var slowCount *uint64
+	if config.slowUS > 0 {
+		slowCount = &slow
+	}
 	return benchResult{
 		Scenario:      config.scenario,
 		Transport:     string(transport),
@@ -1055,6 +1147,8 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 		Payload:       config.payload,
 		Compression:   config.compression,
 		Validation:    validation,
+		Slow:          slowCount,
+		Timeline:      timeline,
 		Errors:        failures,
 		OpsPerSec:     float64(ops) / seconds,
 		MsgsPerSec:    float64(messages) / seconds,

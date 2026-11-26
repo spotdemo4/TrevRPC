@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -798,6 +799,8 @@ func TestBenchCommandLineErrors(t *testing.T) {
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--concurrency", "2", "--connections", "3"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-size", strconv.Itoa(benchMaxMetadataSize + 1)},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--payload", "bogus"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--slow-us", "-1"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--timeline-ms", "-1"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--compression", "gzip"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "server-stream", "--compression", "stream"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "server-stream", "--compression", "dictionary", "--dictionary", "d"},
@@ -994,5 +997,200 @@ func TestWireSamplerTakesWhatChangedBetweenTheBoundaries(t *testing.T) {
 	got := sampler.sample()
 	if got.bytes != 300 || got.delivered != 3 {
 		t.Fatalf("sample = %d bytes and %d messages, want 300 and 3", got.bytes, got.delivered)
+	}
+}
+
+// TestBenchTimelineCountsMessagesInTheBucketOfTheirInstant checks the buckets
+// of a 250 ms window cut into 100 ms intervals: three, the last one short, and
+// an instant before the window or at or after its end counts nowhere.
+func TestBenchTimelineCountsMessagesInTheBucketOfTheirInstant(t *testing.T) {
+	start := time.Now()
+	end := start.Add(250 * time.Millisecond)
+	timeline := newBenchTimeline(start, end, 100*time.Millisecond)
+	timeline.add(start.Add(-time.Nanosecond), 7)
+	timeline.add(start, 1)
+	timeline.add(start.Add(99*time.Millisecond), 2)
+	timeline.add(start.Add(100*time.Millisecond), 4)
+	timeline.add(start.Add(249*time.Millisecond), 8)
+	timeline.add(end, 16)
+	timeline.add(end.Add(time.Second), 32)
+	if want := []uint64{3, 4, 8}; !slices.Equal(timeline.msgs, want) {
+		t.Fatalf("buckets = %v, want %v", timeline.msgs, want)
+	}
+	(*benchTimeline)(nil).add(start, 1) // a nil timeline counts nothing
+
+	for _, test := range []struct {
+		window, bucket time.Duration
+		want           int
+	}{
+		{300 * time.Millisecond, 100 * time.Millisecond, 3},
+		{300*time.Millisecond + 3, 100 * time.Millisecond, 3},
+		{300*time.Millisecond - 3, 100 * time.Millisecond, 3},
+		{301 * time.Millisecond, 100 * time.Millisecond, 4},
+		{50 * time.Millisecond, time.Second, 1},
+	} {
+		if got := len(newBenchTimeline(start, start.Add(test.window), test.bucket).msgs); got != test.want {
+			t.Errorf("%s window in %s buckets: %d buckets, want %d", test.window, test.bucket, got, test.want)
+		}
+	}
+}
+
+// TestOperationLoopCountsSlowOperationsAndTimelineMessages runs an operation
+// loop whose every run takes at least 20 ms. Its assertions hold however late
+// the goroutines run: every measured operation ends in the window, so it is in
+// the timeline, and the operations run one at a time, so at most one more,
+// begun before the window, ends in it too.
+func TestOperationLoopCountsSlowOperationsAndTimelineMessages(t *testing.T) {
+	const window = 300 * time.Millisecond
+	for _, test := range []struct {
+		name     string
+		slowAt   time.Duration
+		wantSlow func(ops int) int
+	}{
+		{"every operation is slow", time.Microsecond, func(ops int) int { return ops }},
+		{"no operation is slow", time.Hour, func(int) int { return 0 }},
+		{"off", 0, func(int) int { return 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			start := time.Now().Add(10 * time.Millisecond)
+			end := start.Add(window)
+			w := benchWorker{slowAfter: test.slowAt, timeline: newBenchTimeline(start, end, 100*time.Millisecond)}
+			operationLoop{operation: scriptedOperation{benchOperation: stoppingOperation{}, delay: 20 * time.Millisecond}}.work(t.Context(), &w, start, end)
+			if len(w.latencies) == 0 {
+				t.Fatal("no operation was measured")
+			}
+			if want := uint64(test.wantSlow(len(w.latencies))); w.slow != want {
+				t.Errorf("slow = %d of %d operations, want %d", w.slow, len(w.latencies), want)
+			}
+			var total uint64
+			for _, count := range w.timeline.msgs {
+				total += count
+			}
+			if total < w.messages || total > w.messages+1 {
+				t.Errorf("timeline %v holds %d messages, want the %d measured and at most one begun before the window", w.timeline.msgs, total, w.messages)
+			}
+			if len(w.timeline.msgs) != 3 {
+				t.Errorf("timeline has %d buckets, want 3", len(w.timeline.msgs))
+			}
+		})
+	}
+}
+
+// echoReplies is a Bidi call that answers with echoes of the messages in
+// order, then ends.
+type echoReplies struct {
+	trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse]
+	messages []string
+}
+
+func (c *echoReplies) Recv() (*interoppb.EchoResponse, error) {
+	if len(c.messages) == 0 {
+		return nil, io.EOF
+	}
+	message := c.messages[0]
+	c.messages = c.messages[1:]
+	return &interoppb.EchoResponse{Message: message}, nil
+}
+
+// TestReceivePacedCountsOnlyEchoesInTimeInTheTimeline has a message echoed in
+// time and one echoed past the deadline: only the first is delivered, and
+// counts in the timeline, in the bucket of its arrival.
+func TestReceivePacedCountsOnlyEchoesInTimeInTheTimeline(t *testing.T) {
+	now := time.Now()
+	// Message 0 was sent a moment ago, message 1 a second ago, past pacedDeadline.
+	schedule := pacedSchedule{
+		base:      now.Add(-time.Second),
+		sent:      make([]atomic.Int64, 2),
+		rtts:      []time.Duration{-1, -1},
+		delivered: new(atomic.Uint64),
+		timeline:  newBenchTimeline(now.Add(-time.Minute), now.Add(time.Minute), time.Minute),
+	}
+	schedule.sent[0].Store(int64(time.Second-10*time.Millisecond) + 1)
+	schedule.sent[1].Store(1)
+	call := &echoReplies{messages: []string{pacedMessage(0, "xxxx"), pacedMessage(1, "xxxx")}}
+	if err := receivePaced(call, &schedule); err != nil {
+		t.Fatal(err)
+	}
+	if got := schedule.delivered.Load(); got != 1 {
+		t.Fatalf("delivered = %d, want only the echo in time", got)
+	}
+	// The window is [now-1min, now+1min): the echo arrived after now.
+	if want := []uint64{0, 1}; !slices.Equal(schedule.timeline.msgs, want) {
+		t.Fatalf("timeline = %v, want %v", schedule.timeline.msgs, want)
+	}
+}
+
+// TestBenchReportsSlowAndTimelineOnlyWhenAsked runs unary and paced benches
+// with and without --slow-us and --timeline-ms.
+func TestBenchReportsSlowAndTimelineOnlyWhenAsked(t *testing.T) {
+	certFile, ports := startBenchServer(t)
+	for _, scenario := range []string{"unary", "paced"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Parallel()
+			args := []string{
+				"bench",
+				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
+				"--ca", certFile,
+				"--scenario", scenario,
+				"--rate", "500",
+				"--concurrency", "2",
+				"--duration", "0.22",
+				"--warmup", "0.05",
+			}
+			var off map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(benchLine(t, args...)), &off); err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range []string{"slow", "timeline"} {
+				if _, ok := off[field]; ok {
+					t.Errorf("result has %q without its flag", field)
+				}
+			}
+
+			before := time.Now()
+			var on struct {
+				Ops, Msgs uint64
+				Slow      *uint64
+				Timeline  *struct {
+					StartUnixUS int64    `json:"start_unix_us"`
+					BucketMS    int      `json:"bucket_ms"`
+					Msgs        []uint64 `json:"msgs"`
+				}
+			}
+			if err := json.Unmarshal([]byte(benchLine(t, append(args, "--slow-us", "1", "--timeline-ms", "50")...)), &on); err != nil {
+				t.Fatal(err)
+			}
+			// Every call or round trip takes more than a microsecond.
+			if on.Slow == nil || *on.Slow != on.Ops {
+				t.Errorf("slow = %v, want all %d operations", on.Slow, on.Ops)
+			}
+			if on.Timeline == nil {
+				t.Fatal("result has no timeline")
+			}
+			if on.Timeline.BucketMS != 50 || len(on.Timeline.Msgs) != 5 {
+				t.Errorf("timeline = %d ms buckets, %d of them, want 50 ms and ceil(220/50) = 5", on.Timeline.BucketMS, len(on.Timeline.Msgs))
+			}
+			if got := time.UnixMicro(on.Timeline.StartUnixUS); got.Before(before) || got.After(time.Now().Add(time.Second)) {
+				t.Errorf("timeline starts at %s, want between %s and a second after the run", got, before)
+			}
+			var total uint64
+			for _, count := range on.Timeline.Msgs {
+				total += count
+			}
+			if total == 0 {
+				t.Errorf("timeline %v is empty, want the messages delivered", on.Timeline.Msgs)
+			}
+			if scenario == "unary" && (total < on.Msgs || total > on.Msgs+2) {
+				t.Errorf("timeline holds %d messages, want %d measured plus at most the 2 that began before the window", total, on.Msgs)
+			}
+
+			var none struct{ Slow *uint64 }
+			if err := json.Unmarshal([]byte(benchLine(t, append(args, "--slow-us", "3600000000")...)), &none); err != nil {
+				t.Fatal(err)
+			}
+			if none.Slow == nil || *none.Slow != 0 {
+				t.Errorf("slow = %v with an hour's limit, want 0 present", none.Slow)
+			}
+		})
 	}
 }

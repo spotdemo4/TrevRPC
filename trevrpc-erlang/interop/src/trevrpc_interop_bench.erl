@@ -56,23 +56,35 @@
     warmup :: float(),
     payload :: repeat | records,
     compression :: string(),
-    validation :: string()
+    validation :: string(),
+    slow_us :: non_neg_integer(),
+    timeline_ms :: non_neg_integer()
 }).
 
-%% What one worker measured: latencies in nanoseconds.
+%% What one worker measured: latencies in nanoseconds, how many of them
+%% exceed --slow-us, and the messages delivered in each bucket of the
+%% timeline, by the bucket's index (empty buckets are absent).
 -record(tally, {
     latencies = [] :: [non_neg_integer()],
     messages = 0 :: non_neg_integer(),
     lost = 0 :: non_neg_integer(),
-    errors = 0 :: non_neg_integer()
+    errors = 0 :: non_neg_integer(),
+    slow = 0 :: non_neg_integer(),
+    timeline = #{} :: #{non_neg_integer() => pos_integer()}
 }).
 
 %% The window every worker measures, in erlang:monotonic_time(nanosecond)
-%% units, and the deadline of every call, in millisecond units.
+%% units, and the deadline of every call, in millisecond units. `start_unix_us'
+%% is the start by the wall clock, in microseconds since the Unix epoch;
+%% `slow_ns' and `bucket_ns' are --slow-us and --timeline-ms in nanoseconds,
+%% 0 when off.
 -record(window, {
     start :: integer(),
     'end' :: integer(),
-    deadline :: integer()
+    deadline :: integer(),
+    start_unix_us :: integer(),
+    slow_ns :: non_neg_integer(),
+    bucket_ns :: non_neg_integer()
 }).
 
 %% @doc Runs the bench client and returns its exit status.
@@ -133,7 +145,9 @@ config(Flags) ->
                 Other -> usage("unknown --payload ~s", [Other])
             end,
         compression = flag(Flags, "compression", "none"),
-        validation = flag(Flags, "validation", "none")
+        validation = flag(Flags, "validation", "none"),
+        slow_us = integer(Flags, "slow-us", 0),
+        timeline_ms = integer(Flags, "timeline-ms", 0)
     },
     validate(Config),
     Config.
@@ -180,7 +194,9 @@ validate(#config{scenario = Scenario} = Config) ->
             "--rate must be positive and at most 10^9"
         },
         {Config#config.duration > 0, "--duration must be positive"},
-        {Config#config.warmup >= 0, "--warmup must not be negative"}
+        {Config#config.warmup >= 0, "--warmup must not be negative"},
+        {Config#config.slow_us >= 0, "--slow-us must not be negative"},
+        {Config#config.timeline_ms >= 0, "--timeline-ms must not be negative"}
     ],
     [usage(Message, []) || {false, Message} <- Checks],
     %% What the runtime cannot do yet.
@@ -274,13 +290,19 @@ connect(Count, Transport, Flags, Opts, Channels) ->
     end.
 
 measure(Config, Channels) ->
+    %% The two clocks read together, so that the window's start by the wall
+    %% clock is the monotonic start's offset from them.
     Now = erlang:monotonic_time(nanosecond),
+    Wall = erlang:system_time(microsecond),
     Start = Now + round(Config#config.warmup * ?SECOND),
     End = Start + round(Config#config.duration * ?SECOND),
     Window = #window{
         start = Start,
         'end' = End,
-        deadline = erlang:convert_time_unit(End, nanosecond, millisecond) + ?GRACE_MS
+        deadline = erlang:convert_time_unit(End, nanosecond, millisecond) + ?GRACE_MS,
+        start_unix_us = Wall + (Start - Now) div 1000,
+        slow_ns = Config#config.slow_us * 1000,
+        bucket_ns = Config#config.timeline_ms * 1000000
     },
     Parent = self(),
     Count = length(Channels),
@@ -300,7 +322,7 @@ measure(Config, Channels) ->
         end
      || Worker <- Workers
     ],
-    summarize(Config, trevrpc_channel:transport(hd(Channels)), Tallies).
+    summarize(Config, Window, trevrpc_channel:transport(hd(Channels)), Tallies).
 
 %% What one worker runs and measures.
 work(Config, Channel, Payload, Window) ->
@@ -318,7 +340,8 @@ init(_Config, Payload) ->
     #{payload => Payload, call => undefined}.
 
 %% Runs the operation back to back until the window ends, counting only the
-%% operations that start and finish within it.
+%% operations that start and finish within it, except for the timeline, which
+%% counts the messages of every operation that finished within the window.
 loop(Operation, State, #window{start = Start, 'end' = End} = Window, Tally) ->
     Began = erlang:monotonic_time(nanosecond),
     case Began >= End of
@@ -331,13 +354,20 @@ loop(Operation, State, #window{start = Start, 'end' = End} = Window, Tally) ->
             Inside = Began >= Start andalso Finished =< End,
             case Result of
                 {ok, Messages, Lost, Next} when Inside ->
-                    loop(Operation, Next, Window, Tally#tally{
-                        latencies = [Finished - Began | Tally#tally.latencies],
+                    Latency = Finished - Began,
+                    Counted = Tally#tally{
+                        latencies = [Latency | Tally#tally.latencies],
                         messages = Tally#tally.messages + Messages,
                         lost = Tally#tally.lost + Lost
-                    });
-                {ok, _Messages, _Lost, Next} ->
-                    loop(Operation, Next, Window, Tally);
+                    },
+                    loop(
+                        Operation,
+                        Next,
+                        Window,
+                        timeline(Window, Finished, Messages, slow(Window, Latency, Counted))
+                    );
+                {ok, Messages, _Lost, Next} ->
+                    loop(Operation, Next, Window, timeline(Window, Finished, Messages, Tally));
                 {error, Next} ->
                     timer:sleep(?ERROR_BACKOFF_MS),
                     Errors =
@@ -349,6 +379,27 @@ loop(Operation, State, #window{start = Start, 'end' = End} = Window, Tally) ->
                     loop(Operation, Next, Window, Tally#tally{errors = Errors})
             end
     end.
+
+%% Counts a counted latency that exceeds --slow-us.
+slow(#window{slow_ns = Limit}, Latency, #tally{slow = Slow} = Tally) when
+    Latency > Limit, Limit > 0
+->
+    Tally#tally{slow = Slow + 1};
+slow(#window{}, _Latency, #tally{} = Tally) ->
+    Tally.
+
+%% Counts `Messages' delivered at `At' in its bucket of the timeline, if the
+%% timeline is on and `At' is inside the window.
+timeline(
+    #window{start = Start, 'end' = End, bucket_ns = Bucket},
+    At,
+    Messages,
+    #tally{timeline = Timeline} = Tally
+) when Bucket > 0, At >= Start, At < End, Messages > 0 ->
+    Index = (At - Start) div Bucket,
+    Tally#tally{timeline = Timeline#{Index => maps:get(Index, Timeline, 0) + Messages}};
+timeline(#window{}, _At, _Messages, #tally{} = Tally) ->
+    Tally.
 
 close(#{call := undefined}) -> ok;
 close(#{call := Call}) -> trevrpc_client:cancel(Call).
@@ -574,21 +625,28 @@ paced(Config, Channel, Payload, #window{start = Start, 'end' = End} = Window) ->
                     {#{Index := At}, #{Index := Arrived}} when
                         Arrived - At =< ?PACED_DEADLINE
                     ->
-                        {ok, Arrived - At};
+                        {ok, Arrived - At, Arrived};
                     _ ->
                         lost
                 end,
+            %% The timeline counts every message delivered in time at its
+            %% echo's arrival, scheduled inside the window or not.
+            Timed =
+                case Delivered of
+                    {ok, _, Arrival} -> timeline(Window, Arrival, 1, Tally);
+                    lost -> Tally
+                end,
             case Scheduled >= Start andalso Scheduled < End of
                 false ->
-                    Tally;
+                    Timed;
                 true when Delivered =:= lost ->
-                    Tally#tally{lost = Tally#tally.lost + 1};
+                    Timed#tally{lost = Timed#tally.lost + 1};
                 true ->
-                    {ok, Rtt} = Delivered,
-                    Tally#tally{
-                        latencies = [Rtt | Tally#tally.latencies],
-                        messages = Tally#tally.messages + 1
-                    }
+                    {ok, Rtt, _} = Delivered,
+                    slow(Window, Rtt, Timed#tally{
+                        latencies = [Rtt | Timed#tally.latencies],
+                        messages = Timed#tally.messages + 1
+                    })
             end
         end,
         #tally{errors = Errors},
@@ -746,7 +804,7 @@ paced_sequence(Echo) ->
 
 %%% Result
 
-summarize(Config, Transport, Tallies) ->
+summarize(Config, Window, Transport, Tallies) ->
     Latencies = lists:sort(lists:append([T#tally.latencies || T <- Tallies])),
     Messages = lists:sum([T#tally.messages || T <- Tallies]),
     Lost = lists:sum([T#tally.lost || T <- Tallies]),
@@ -789,12 +847,43 @@ summarize(Config, Transport, Tallies) ->
                 payload => atom_to_binary(Config#config.payload),
                 compression => list_to_binary(Config#config.compression)
             },
-            {ok,
+            Paced =
                 case paced(Config) of
                     true -> Result#{rate => Config#config.rate};
                     false -> Result
+                end,
+            Slow =
+                case Window#window.slow_ns of
+                    0 -> Paced;
+                    _ -> Paced#{slow => lists:sum([T#tally.slow || T <- Tallies])}
+                end,
+            {ok,
+                case Window#window.bucket_ns of
+                    0 -> Slow;
+                    _ -> Slow#{timeline => timeline_result(Window, Tallies)}
                 end}
     end.
+
+%% The `timeline' field: the workers' buckets added up, one count for each
+%% bucket of the window, the last one possibly partial.
+timeline_result(#window{start = Start, 'end' = End, bucket_ns = Bucket} = Window, Tallies) ->
+    Buckets = (End - Start + Bucket - 1) div Bucket,
+    Counts = lists:foldl(
+        fun(#tally{timeline = Timeline}, Sum) ->
+            maps:fold(
+                fun(Index, Count, Acc) -> Acc#{Index => maps:get(Index, Acc, 0) + Count} end,
+                Sum,
+                Timeline
+            )
+        end,
+        #{},
+        Tallies
+    ),
+    #{
+        start_unix_us => Window#window.start_unix_us,
+        bucket_ms => Bucket div 1000000,
+        msgs => [maps:get(Index, Counts, 0) || Index <- lists:seq(0, Buckets - 1)]
+    }.
 
 %% The nearest-rank percentile `P' of the sorted latencies, in microseconds.
 percentile_us(Sorted, P) ->

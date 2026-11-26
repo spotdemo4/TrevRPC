@@ -61,6 +61,83 @@ test("failures inside the window are counted and the worker goes on", async () =
   assert.deepEqual(measured, { latencies: [2000, 2000, 2000, 2000], messages: 4, errors: 1 });
 });
 
+test("the slow count has the counted operations that took longer than the threshold", async () => {
+  const run = (slowUs) => {
+    const clock = fakeClock();
+    return measure({
+      operations: [clock.operation(3, 5)],
+      start: 10,
+      end: 20,
+      now: clock.now,
+      slowUs,
+    });
+  };
+  // Operations of 3 ms: the two that count took 3000 µs each, so only a lower threshold counts them.
+  assert.equal((await run(2999)).slow, 2);
+  assert.equal((await run(3000)).slow, 0);
+  // Off, there is no field.
+  assert.equal("slow" in (await run(0)), false);
+});
+
+test("the timeline counts messages where their operations completed", async () => {
+  // Operations of 3 ms start at 0, 3, 6, 9, 12, 15, 18 and finish at 3, 6, 9, 12, 15, 18, 21. The
+  // window [10, 20] holds 5 ms intervals: the one that finished at 12, although it started before
+  // the window, counts in the first and those at 15 and 18 in the second, and the one at 21 after
+  // the window counts nowhere.
+  const clock = fakeClock();
+  const measured = await measure({
+    operations: [clock.operation(3, 5)],
+    start: 10,
+    end: 20,
+    now: clock.now,
+    timeOrigin: 1_700_000_000_000,
+    timelineMs: 5,
+  });
+  assert.deepEqual(measured.timeline, {
+    start_unix_us: 1_700_000_000_010_000,
+    bucket_ms: 5,
+    msgs: [5, 10],
+  });
+  assert.equal(measured.messages, 10);
+  assert.equal("slow" in measured, false);
+});
+
+test("the timeline leaves out completions at the end and failures, and rounds its buckets up", async () => {
+  const clock = fakeClock();
+  const measured = await measure({
+    operations: [clock.operation(2, 1, (began) => began === 12)],
+    start: 10,
+    end: 20,
+    now: clock.now,
+    timelineMs: 4,
+    backoffMs: 0,
+  });
+  // Completions at 10 (started before the window) and 12 are in the first interval, 16 in the
+  // second and 18 in the third; the failure that started at 12 counts nowhere, and 20 is the end,
+  // which the latencies count and the timeline does not. ceil(10 / 4) = 3 intervals.
+  assert.deepEqual(measured.timeline.msgs, [2, 1, 1]);
+  assert.equal(measured.messages, 4);
+});
+
+test("the timeline has ceil(duration / bucket) intervals, even where nothing completes", async () => {
+  const measured = await measure({
+    operations: [],
+    start: 1000,
+    end: 1300,
+    now: () => 1000,
+    timelineMs: 50,
+  });
+  assert.deepEqual(measured.timeline.msgs, [0, 0, 0, 0, 0, 0]);
+  const uneven = await measure({
+    operations: [],
+    start: 0,
+    end: 1000,
+    now: () => 0,
+    timelineMs: 300,
+  });
+  assert.equal(uneven.timeline.msgs.length, 4);
+});
+
 test("operations close when their worker stops", async () => {
   const clock = fakeClock();
   let closed = 0;
@@ -142,6 +219,16 @@ test("the result line has the native clients' fields", () => {
     payload: "records",
     compression: "stream",
   });
+  // The slow count and the timeline are the result's only when measure has them.
+  const timeline = { start_unix_us: 1, bucket_ms: 500, msgs: [400, 600] };
+  assert.deepEqual(
+    summarize(
+      { ...input, concurrency: 4, duration: 2 },
+      { latencies, messages: 1000, errors: 0, slow: 7, timeline },
+    ),
+    { ...result, slow: 7, timeline },
+  );
+  assert.equal("slow" in result || "timeline" in result, false);
   assert.throws(
     () => summarize({ ...input, duration: 1 }, { latencies: [], messages: 0, errors: 3 }),
     /no operation completed in the 1s measured window \(3 failed\)/,
@@ -205,6 +292,17 @@ test("the bench command validates its arguments before launching a browser", asy
   );
   assert.equal(parsed.dictionary, undefined);
   assert.equal(parsed.duration, 5);
+  assert.equal(parsed.slowUs, 0);
+  assert.equal(parsed.timelineMs, 0);
+  const measuring = await parseBenchArguments([
+    ...webtransport,
+    "--slow-us",
+    "200000",
+    "--timeline-ms",
+    "50",
+  ]);
+  assert.equal(measuring.slowUs, 200000);
+  assert.equal(measuring.timelineMs, 50);
 
   // The message pins the check each case fails; cases with the same message fail different parts
   // of its condition.
@@ -238,6 +336,8 @@ test("the bench command validates its arguments before launching a browser", asy
     // "--warmup -1" would fail as an ambiguous option before reaching the check.
     [[...webtransport, "--warmup=-1"], /^--warmup must be a non-negative/],
     [[...webtransport, "--size", "1.5"], /^--size must be an integer/],
+    [[...webtransport, "--slow-us=-1"], /^--slow-us must be an integer of at least 0/],
+    [[...webtransport, "--timeline-ms", "0.5"], /^--timeline-ms must be an integer of at least 0/],
     [[...webtransport, "--concurrency", "0"], /^--concurrency must be an integer of at least 1/],
     [connect("connect-web", "--scenario", "client-stream"), /^the connect-web lane runs/],
     [connect("connect-web-h3"), /^the connect-web-h3 lane needs --cert/],

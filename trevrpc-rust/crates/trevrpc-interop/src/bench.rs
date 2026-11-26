@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::{Instant, timeout_at};
 use trevrpc::client::{
@@ -229,6 +229,10 @@ struct Params {
     compression: CompressionMode,
     /// The rules of the requests of the validation scenarios.
     validation: Validation,
+    /// The latency above which a counted operation (or paced message) is slow, with `--slow-us`.
+    slow: Option<Duration>,
+    /// The width of a bucket of the delivery timeline, with `--timeline-ms`.
+    timeline: Option<Duration>,
 }
 
 impl Params {
@@ -293,6 +297,10 @@ impl Params {
         if duration.is_zero() {
             return Err("--duration must be positive".into());
         }
+        let slow = number(flags, "slow-us", 0)?;
+        let slow = (slow > 0).then(|| Duration::from_micros(count_of(slow)));
+        let timeline = number(flags, "timeline-ms", 0)?;
+        let timeline = (timeline > 0).then(|| Duration::from_millis(count_of(timeline)));
         Ok(Self {
             scenario,
             size,
@@ -308,6 +316,8 @@ impl Params {
             payload,
             compression,
             validation,
+            slow,
+            timeline,
         })
     }
 }
@@ -448,9 +458,89 @@ impl Window {
     }
 }
 
+/// The messages delivered in each interval of the measured window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Timeline {
+    /// When the window starts, in microseconds since the Unix epoch by the wall clock.
+    start_unix_us: u64,
+    start: Instant,
+    end: Instant,
+    bucket: Duration,
+    /// The messages delivered in each interval of `bucket` from `start`.
+    buckets: Vec<u64>,
+}
+
+impl Timeline {
+    /// How many buckets of `bucket` cover `duration`, the last one partly if they do not divide it.
+    fn buckets_for(duration: Duration, bucket: Duration) -> usize {
+        duration
+            .as_nanos()
+            .div_ceil(bucket.as_nanos().max(1))
+            .try_into()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// A timeline of the whole `window`, which starts `start_unix_us` microseconds after the epoch.
+    fn new(window: Window, start_unix_us: u64, bucket: Duration) -> Self {
+        let duration = window.end.saturating_duration_since(window.start);
+        Self {
+            start_unix_us,
+            start: window.start,
+            end: window.end,
+            bucket,
+            buckets: vec![0; Self::buckets_for(duration, bucket)],
+        }
+    }
+
+    /// Counts `messages` delivered at `at`, unless that is outside the window.
+    fn record(&mut self, at: Instant, messages: u64) {
+        if at < self.start || at >= self.end {
+            return;
+        }
+        let index = at
+            .saturating_duration_since(self.start)
+            .as_nanos()
+            .checked_div(self.bucket.as_nanos())
+            .and_then(|index| usize::try_from(index).ok());
+        if let Some(count) = index.and_then(|index| self.buckets.get_mut(index)) {
+            *count = count.saturating_add(messages);
+        }
+    }
+
+    /// Adds the counts of another worker's timeline of the same window.
+    fn absorb(&mut self, other: &Self) {
+        for (count, more) in self.buckets.iter_mut().zip(&other.buckets) {
+            *count = count.saturating_add(*more);
+        }
+    }
+
+    fn json(&self) -> String {
+        let msgs: Vec<String> = self.buckets.iter().map(u64::to_string).collect();
+        format!(
+            r#"{{"start_unix_us":{},"bucket_ms":{},"msgs":[{}]}}"#,
+            self.start_unix_us,
+            self.bucket.as_millis(),
+            msgs.join(",")
+        )
+    }
+}
+
+/// Microseconds from the Unix epoch to `at` by the wall clock.
+fn unix_micros(at: SystemTime) -> Result<u64, BoxError> {
+    let since_epoch = at
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "the wall clock is before the Unix epoch")?;
+    Ok(u64::try_from(since_epoch.as_micros())?)
+}
+
 #[derive(Default)]
 struct WorkerResult {
     latencies: Vec<Duration>,
+    /// How many of the counted operations, or paced messages delivered in time, took longer than
+    /// `--slow-us`.
+    slow: u64,
+    /// The messages this worker delivered in each interval of the window, with `--timeline-ms`.
+    timeline: Option<Timeline>,
     /// The messages the measured operations delivered.
     messages: u64,
     /// The messages the measured operations lost.
@@ -512,6 +602,10 @@ struct Worker<T> {
     messages: usize,
     interval: Duration,
     bidi: Option<BidirectionalCall<EchoRequest, EchoResponse>>,
+    /// The latency above which a counted operation is slow, with `--slow-us`.
+    slow: Option<Duration>,
+    /// The timeline this worker fills in, until it moves into its result.
+    timeline: Option<Timeline>,
     /// The messages this worker's operations have delivered so far, or its paced echoes that
     /// arrived in time, in the window or not, which the wire-byte sampling reads at the same
     /// instants as the wire bytes. A message counts once it has arrived, by when its bytes have
@@ -720,7 +814,12 @@ where
                 .await?
         };
         let (sender, mut responses) = call.split();
-        let Schedule { base, sent, rtts } = schedule;
+        let Schedule {
+            base,
+            sent,
+            rtts,
+            timeline,
+        } = schedule;
         let (base, interval, sent) = (*base, self.interval, &*sent);
         let messages = &mut self.messages_source;
         let delivered = &*self.delivered;
@@ -751,7 +850,12 @@ where
                             "an echo carries no message number that was sent",
                         ))
                     })?;
-                record_echo(rtt, sent_at, arrived, delivered);
+                if record_echo(rtt, sent_at, arrived, delivered)
+                    && let Some(timeline) = timeline.as_mut()
+                    && let Some(at) = base.checked_add(Duration::from_nanos(arrived))
+                {
+                    timeline.record(at, 1);
+                }
             }
             Ok(())
         };
@@ -797,6 +901,8 @@ struct Schedule {
     sent: Vec<AtomicU64>,
     /// How long after its send each message was echoed, if it was.
     rtts: Vec<Option<Duration>>,
+    /// The timeline the echoes that arrive in time count in.
+    timeline: Option<Timeline>,
 }
 
 /// The send time of a message not sent.
@@ -804,16 +910,23 @@ const UNSENT: u64 = u64::MAX;
 
 /// Records the echo of a message sent `sent_at` and echoed `arrived` nanoseconds after the
 /// schedule's base in its `rtt`, unless an earlier echo already was, and counts it in `delivered`
-/// if it arrived within `PACED_DEADLINE` of the send.
-fn record_echo(rtt: &mut Option<Duration>, sent_at: u64, arrived: u64, delivered: &AtomicU64) {
+/// if it arrived within `PACED_DEADLINE` of the send. Returns whether it counted.
+fn record_echo(
+    rtt: &mut Option<Duration>,
+    sent_at: u64,
+    arrived: u64,
+    delivered: &AtomicU64,
+) -> bool {
     if rtt.is_some() {
-        return;
+        return false;
     }
     let echoed = Duration::from_nanos(arrived.saturating_sub(sent_at));
     *rtt = Some(echoed);
-    if echoed <= PACED_DEADLINE {
+    let in_time = echoed <= PACED_DEADLINE;
+    if in_time {
         delivered.fetch_add(1, Ordering::Relaxed);
     }
+    in_time
 }
 
 /// Nanoseconds from `base` to now.
@@ -893,6 +1006,7 @@ where
         base,
         sent: (0..total).map(|_| AtomicU64::new(UNSENT)).collect(),
         rtts: vec![None; total],
+        timeline: worker.timeline.take(),
     };
     let mut next = 0;
     while next < total {
@@ -924,6 +1038,7 @@ where
             .unwrap_or(0);
         next = next.max(due.saturating_add(1));
     }
+    result.timeline = schedule.timeline;
     for (sequence, rtt) in schedule.rtts.into_iter().enumerate() {
         let rtt = rtt.filter(|rtt| *rtt <= PACED_DEADLINE);
         let sent = scheduled(base, worker.interval, sequence);
@@ -934,6 +1049,9 @@ where
             Some(rtt) => {
                 result.latencies.push(rtt);
                 result.messages = result.messages.saturating_add(1);
+                if worker.slow.is_some_and(|slow| rtt > slow) {
+                    result.slow = result.slow.saturating_add(1);
+                }
             }
             None => result.lost = result.lost.saturating_add(1),
         }
@@ -946,7 +1064,10 @@ async fn operations<T>(mut worker: Worker<T>, window: Window) -> WorkerResult
 where
     T: StreamingRpcTransport + Clone,
 {
-    let mut result = WorkerResult::default();
+    let mut result = WorkerResult {
+        timeline: worker.timeline.take(),
+        ..WorkerResult::default()
+    };
     loop {
         let started = Instant::now();
         if started >= window.end {
@@ -960,8 +1081,15 @@ where
                 worker
                     .delivered
                     .fetch_add(moved.messages, Ordering::Relaxed);
+                if let Some(timeline) = result.timeline.as_mut() {
+                    timeline.record(finished, moved.messages);
+                }
                 if measured && finished <= window.end {
-                    result.latencies.push(finished.duration_since(started));
+                    let latency = finished.duration_since(started);
+                    if worker.slow.is_some_and(|slow| latency > slow) {
+                        result.slow = result.slow.saturating_add(1);
+                    }
+                    result.latencies.push(latency);
                     result.messages = result.messages.saturating_add(moved.messages);
                     result.lost = result.lost.saturating_add(moved.lost);
                 }
@@ -992,7 +1120,9 @@ async fn measure<T>(
 where
     T: StreamingRpcTransport + Clone,
 {
-    let start = Instant::now()
+    let now = Instant::now();
+    let wall = SystemTime::now();
+    let start = now
         .checked_add(params.warmup)
         .ok_or("--warmup is too long")?;
     let window = Window {
@@ -1001,6 +1131,14 @@ where
             .checked_add(params.duration)
             .ok_or("--duration is too long")?,
     };
+    let start_unix_us = params
+        .timeline
+        .map(|_| {
+            wall.checked_add(params.warmup)
+                .ok_or_else(|| BoxError::from("--warmup is too long"))
+                .and_then(unix_micros)
+        })
+        .transpose()?;
     let delivered: Vec<Arc<AtomicU64>> = (0..params.concurrency)
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
@@ -1022,6 +1160,11 @@ where
                     messages: params.messages,
                     interval: params.interval,
                     bidi: None,
+                    slow: params.slow,
+                    timeline: params
+                        .timeline
+                        .zip(start_unix_us)
+                        .map(|(bucket, unix_us)| Timeline::new(window, unix_us, bucket)),
                     delivered: Arc::clone(delivered),
                 },
                 window,
@@ -1104,6 +1247,10 @@ struct Report {
     latencies: Vec<Duration>,
     /// The wire bytes and the messages to divide them by.
     wire: Option<(u64, u64)>,
+    /// The operations or paced messages slower than `--slow-us`, if it is set.
+    slow: Option<u64>,
+    /// The messages delivered in each interval of the window, if `--timeline-ms` is set.
+    timeline: Option<Timeline>,
 }
 
 impl Report {
@@ -1139,6 +1286,22 @@ impl Report {
             };
             (sample.bytes, wire_msgs)
         });
+        let slow = params.slow.map(|_| {
+            results
+                .iter()
+                .fold(0_u64, |total, result| total.saturating_add(result.slow))
+        });
+        let timeline = if params.timeline.is_some() {
+            results
+                .iter()
+                .filter_map(|result| result.timeline.clone())
+                .reduce(|mut total, timeline| {
+                    total.absorb(&timeline);
+                    total
+                })
+        } else {
+            None
+        };
         let mut latencies: Vec<Duration> = results
             .into_iter()
             .flat_map(|result| result.latencies)
@@ -1169,6 +1332,8 @@ impl Report {
             errors,
             latencies,
             wire,
+            slow,
+            timeline,
         })
     }
 
@@ -1205,13 +1370,19 @@ impl Report {
         let validation = self.validation.map_or_else(String::new, |validation| {
             format!(r#","validation":"{}""#, validation.name())
         });
+        let slow = self
+            .slow
+            .map_or_else(String::new, |slow| format!(r#","slow":{slow}"#));
+        let timeline = self.timeline.as_ref().map_or_else(String::new, |timeline| {
+            format!(r#","timeline":{}"#, timeline.json())
+        });
         format!(
             concat!(
                 r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"metadata_scope":"{}","#,
                 r#""concurrency":{},"connections":{},"duration_s":{:?},"#,
                 r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
                 r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{}{},"#,
-                r#""payload":"{}","compression":"{}"{}}}"#,
+                r#""payload":"{}","compression":"{}"{}{}{}}}"#,
             ),
             self.scenario.name(),
             self.transport,
@@ -1241,6 +1412,8 @@ impl Report {
             self.payload.name(),
             self.compression.name(),
             validation,
+            slow,
+            timeline,
         )
     }
 }
@@ -1257,8 +1430,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use tokio::time::Instant;
+
     use super::{
-        PACED_DEADLINE, Params, Report, WireSample, WorkerResult, error_breakdown, record_echo,
+        PACED_DEADLINE, Params, Report, Timeline, Window, WireSample, WorkerResult,
+        error_breakdown, record_echo,
     };
     use crate::Flags;
 
@@ -1341,22 +1517,163 @@ mod tests {
         let delivered = AtomicU64::new(0);
 
         let mut rtt = None;
-        record_echo(&mut rtt, 1_000, 3_000, &delivered);
+        assert!(record_echo(&mut rtt, 1_000, 3_000, &delivered));
         assert_eq!(rtt, Some(Duration::from_nanos(2_000)));
         assert_eq!(delivered.load(Ordering::Relaxed), 1);
 
         // A second echo of the same message changes nothing.
-        record_echo(&mut rtt, 1_000, 5_000, &delivered);
+        assert!(!record_echo(&mut rtt, 1_000, 5_000, &delivered));
         assert_eq!(rtt, Some(Duration::from_nanos(2_000)));
         assert_eq!(delivered.load(Ordering::Relaxed), 1);
 
         // An echo exactly at the deadline is in time; one after it is recorded but lost.
         let mut on_time = None;
-        record_echo(&mut on_time, 0, deadline, &delivered);
+        assert!(record_echo(&mut on_time, 0, deadline, &delivered));
         assert_eq!(delivered.load(Ordering::Relaxed), 2);
         let mut late = None;
-        record_echo(&mut late, 0, deadline + 1, &delivered);
+        assert!(!record_echo(&mut late, 0, deadline + 1, &delivered));
         assert_eq!(late, Some(PACED_DEADLINE + Duration::from_nanos(1)));
         assert_eq!(delivered.load(Ordering::Relaxed), 2);
+    }
+
+    fn params(flags: &[(&'static str, &str)]) -> Result<Params, crate::BoxError> {
+        let mut flags: HashMap<_, _> = flags
+            .iter()
+            .map(|&(name, value)| (name, value.to_owned()))
+            .collect();
+        flags
+            .entry("scenario")
+            .or_insert_with(|| "unary".to_owned());
+        Params::parse(&Flags(flags))
+    }
+
+    /// A timeline of a window of `duration_ms` from `start`, in buckets of `bucket_ms`.
+    fn timeline(start: Instant, duration_ms: u64, bucket_ms: u64) -> Timeline {
+        let window = Window {
+            start,
+            end: start
+                .checked_add(Duration::from_millis(duration_ms))
+                .unwrap(),
+        };
+        Timeline::new(
+            window,
+            1_700_000_000_000_000,
+            Duration::from_millis(bucket_ms),
+        )
+    }
+
+    #[test]
+    fn slow_and_timeline_flags_default_to_off_and_reject_unusable_values() {
+        let off = params(&[]).unwrap();
+        assert_eq!((off.slow, off.timeline), (None, None));
+        let zero = params(&[("slow-us", "0"), ("timeline-ms", "0")]).unwrap();
+        assert_eq!((zero.slow, zero.timeline), (None, None));
+        let on = params(&[("slow-us", "1500"), ("timeline-ms", "50")]).unwrap();
+        assert_eq!(on.slow, Some(Duration::from_micros(1500)));
+        assert_eq!(on.timeline, Some(Duration::from_millis(50)));
+
+        for (name, value) in [
+            ("slow-us", "-1"),
+            ("slow-us", "fast"),
+            ("slow-us", "1.5"),
+            ("timeline-ms", "-50"),
+            ("timeline-ms", "often"),
+        ] {
+            assert!(params(&[(name, value)]).is_err(), "--{name} {value}");
+        }
+    }
+
+    #[test]
+    fn a_timeline_has_a_bucket_for_every_started_interval_of_the_window() {
+        let start = Instant::now();
+        assert_eq!(timeline(start, 5_000, 50).buckets.len(), 100);
+        assert_eq!(timeline(start, 5_000, 1_000).buckets.len(), 5);
+        // The last bucket is partial when the interval does not divide the window.
+        assert_eq!(timeline(start, 5_000, 300).buckets.len(), 17);
+        assert_eq!(timeline(start, 100, 1_000).buckets.len(), 1);
+    }
+
+    /// A completion counts in the bucket of its instant, whenever its operation started; one
+    /// before the window or at or after its end does not count.
+    #[test]
+    fn a_timeline_counts_completions_in_the_bucket_of_their_instant() {
+        let start = Instant::now() + Duration::from_secs(10);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut timeline = timeline(start, 200, 50);
+        timeline.record(start - Duration::from_millis(1), 7);
+        timeline.record(at(0), 1);
+        timeline.record(at(49), 2);
+        timeline.record(at(50), 4);
+        timeline.record(at(120), 8);
+        timeline.record(at(199), 16);
+        timeline.record(at(200), 32);
+        timeline.record(at(5_000), 64);
+        assert_eq!(timeline.buckets, [3, 4, 8, 16]);
+
+        let mut other = super::Timeline {
+            buckets: vec![1, 0, 0, 1],
+            ..timeline.clone()
+        };
+        other.absorb(&timeline);
+        assert_eq!(other.buckets, [4, 4, 8, 17]);
+    }
+
+    #[test]
+    fn a_timeline_sums_across_workers_into_the_report() {
+        let start = Instant::now() + Duration::from_secs(10);
+        let params = params(&[("duration", "0.2"), ("timeline-ms", "50")]).unwrap();
+        let results: Vec<_> = (0..3_u64)
+            .map(|worker| {
+                let mut timeline = timeline(start, 200, 50);
+                timeline.record(start + Duration::from_millis(60), worker + 1);
+                timeline.record(start + Duration::from_millis(160), 1);
+                WorkerResult {
+                    latencies: vec![Duration::from_millis(1)],
+                    timeline: Some(timeline),
+                    ..WorkerResult::default()
+                }
+            })
+            .collect();
+        let json = Report::new(&params, "quic", results, None).unwrap().json();
+        assert!(
+            json.ends_with(
+                r#","timeline":{"start_unix_us":1700000000000000,"bucket_ms":50,"msgs":[0,6,0,3]}}"#
+            ),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn slow_counts_sum_across_workers_into_the_report() {
+        let params = params(&[("slow-us", "1000")]).unwrap();
+        let results: Vec<_> = [2, 0, 5]
+            .into_iter()
+            .map(|slow| WorkerResult {
+                latencies: vec![Duration::from_millis(1)],
+                slow,
+                ..WorkerResult::default()
+            })
+            .collect();
+        let json = Report::new(&params, "quic", results, None).unwrap().json();
+        assert!(json.contains(r#","slow":7"#), "{json}");
+        assert!(!json.contains("timeline"), "{json}");
+    }
+
+    #[test]
+    fn slow_and_timeline_are_omitted_when_off() {
+        let params = params(&[]).unwrap();
+        let results = vec![WorkerResult {
+            latencies: vec![Duration::from_millis(1)],
+            // A worker that counted them anyway does not put them in the report.
+            slow: 3,
+            ..WorkerResult::default()
+        }];
+        let json = Report::new(&params, "quic", results, None).unwrap().json();
+        assert!(!json.contains("slow"), "{json}");
+        assert!(!json.contains("timeline"), "{json}");
+        assert!(
+            json.ends_with(r#""payload":"repeat","compression":"none"}"#),
+            "{json}"
+        );
     }
 }

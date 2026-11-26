@@ -63,6 +63,13 @@ PROBE_PORT = 1
 RESERVED_PORTS = Path("/proc/sys/net/ipv4/ip_local_reserved_ports")
 SECTIONS = ("up", "down", "outage")
 DURATION = re.compile(r"(\d+(?:\.\d+)?)(ms|s)")
+# A time as tc takes it, in microseconds without a unit.
+TC_TIME = re.compile(r"(\d+(?:\.\d+)?)(s|sec|secs|ms|msec|msecs|us|usec|usecs)?")
+TC_TIME_UNITS = {
+    **dict.fromkeys(("s", "sec", "secs"), 1.0),
+    **dict.fromkeys(("ms", "msec", "msecs"), 1e-3),
+    **dict.fromkeys(("us", "usec", "usecs"), 1e-6),
+}
 
 
 @dataclass(frozen=True)
@@ -92,6 +99,23 @@ class Profile:
     # Whether each direction has its own queue; see the module docstring.
     split: bool
     outage: Outage | None
+
+
+def round_trip(value: str) -> float | None:
+    """The profile's round trip in seconds, from the delay of each direction (netem takes the last
+    of a repeated option), leaving out jitter, slots and queueing; None without any delay."""
+    netem = parse(value)
+    total = 0.0
+    found = False
+    for arguments in (netem.up, netem.down):
+        delays = [arguments[i + 1] for i, word in enumerate(arguments[:-1]) if word == "delay"]
+        if delays:
+            match = TC_TIME.fullmatch(delays[-1])
+            if match is None:
+                raise ValueError(f"not a tc time such as 10ms: {delays[-1]!r}")
+            total += float(match[1]) * TC_TIME_UNITS[match[2] or "us"]
+            found = True
+    return total if found else None
 
 
 def seconds(value: str) -> float:
@@ -303,12 +327,15 @@ class Link:
         self._profile = netem
 
     @contextmanager
-    def outages(self, netem: str, until: float) -> Generator[None]:
+    def outages(self, netem: str, until: float) -> Generator[list[tuple[float, float]]]:
         """Runs the profile's outages, if any, while the block runs: the block starts the client,
-        and `until` is when, after that, its measured window ends."""
+        and `until` is when, after that, its measured window ends. The block gets a list that
+        holds each outage that ran as it ends, as (start, end) by the wall clock, in seconds
+        since the Unix epoch, which the clients' timelines use too."""
         outage = parse(netem).outage
+        times: list[tuple[float, float]] = []
         if outage is None:
-            yield
+            yield times
             return
         stop = threading.Event()
         errors: list[RunnerError] = []
@@ -320,10 +347,12 @@ class Link:
                     if stop.wait(began + start - time.monotonic()):
                         return
                     self._run(OUTAGE_START)
+                    dropped = time.time()
                     try:
                         _ = stop.wait(began + end - time.monotonic())
                     finally:
                         self._run(OUTAGE_END)
+                        times.append((dropped, time.time()))
                     if stop.is_set():
                         return
             except RunnerError as error:
@@ -332,7 +361,7 @@ class Link:
         thread = threading.Thread(target=run, name="netem-outages", daemon=True)
         thread.start()
         try:
-            yield
+            yield times
         finally:
             stop.set()
             thread.join()

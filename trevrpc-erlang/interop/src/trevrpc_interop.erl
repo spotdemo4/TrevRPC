@@ -15,6 +15,7 @@
 %%                               [--warmup S] [--messages N] [--rate N] [--metadata-size N]
 %%                               [--metadata-scope call] [--payload repeat|records]
 %%                               [--compression MODE] [--dictionary <file>] [--validation none]
+%%                               [--slow-us N] [--timeline-ms N]
 %% '''
 %%
 %% The `bench' subcommand is the load client of bench/README.md (see
@@ -114,7 +115,9 @@ run(["bench" | Args]) ->
             "payload",
             "compression",
             "dictionary",
-            "validation"
+            "validation",
+            "slow-us",
+            "timeline-ms"
         ])
     );
 run(_) ->

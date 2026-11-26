@@ -30,10 +30,16 @@ const PadKey = "bench-pad";
 /**
  * Runs the benchmark that input describes: { transport (the lane), url, webSocketUrl, certHash,
  * scenario, size, metadataSize, concurrency, duration, warmup (seconds), messages, payload,
- * compression, dictionary (the trained dictionary in base64, for the modes that use it) }.
- * Resolves with the result line's fields. onError sees the first operation that fails.
+ * compression, dictionary (the trained dictionary in base64, for the modes that use it), slowUs
+ * and timelineMs (0 leaves the result's slow count and timeline out) }.
+ * Resolves with the result line's fields. onError sees the first operation that fails. now is the
+ * clock of the window, in milliseconds, and timeOrigin its zero by the wall clock, in milliseconds
+ * since the Unix epoch.
  */
-export async function runBench(input, { now = () => performance.now(), onError = () => {} } = {}) {
+export async function runBench(
+  input,
+  { now = () => performance.now(), timeOrigin = performance.timeOrigin, onError = () => {} } = {},
+) {
   const lane = BenchLanes[input.transport];
   const abort = new AbortController();
   const target = lane.transport
@@ -53,7 +59,16 @@ export async function runBench(input, { now = () => performance.now(), onError =
         input.messages,
       ),
     );
-    const measured = await measure({ operations, start, end, now, onError });
+    const measured = await measure({
+      operations,
+      start,
+      end,
+      now,
+      timeOrigin,
+      slowUs: input.slowUs,
+      timelineMs: input.timelineMs,
+      onError,
+    });
     clearTimeout(stop);
     return summarize(input, measured);
   } finally {
@@ -66,16 +81,29 @@ export async function runBench(input, { now = () => performance.now(), onError =
  * Runs each operation back to back on its own worker until end. Only the operations that start
  * and finish within [start, end] count: their latencies in microseconds, the messages they
  * carried, and the ones that failed. onError sees the first failure.
+ *
+ * With a positive slowUs, the result also has the slow count: how many of the counted operations
+ * took longer than that many microseconds. With a positive timelineMs, it has the timeline: the
+ * messages delivered in each interval of that many milliseconds of [start, end), counted where the
+ * operation that carried them completed, whenever it started. timeOrigin is the zero of now by the
+ * wall clock, in milliseconds since the Unix epoch, for the timeline's start.
  */
 export async function measure({
   operations,
   start,
   end,
   now,
+  timeOrigin = 0,
+  slowUs = 0,
+  timelineMs = 0,
   backoffMs = ErrorBackoffMs,
   onError = () => {},
 }) {
   const latencies = [];
+  let slow = 0;
+  const buckets =
+    timelineMs > 0 ? Math.ceil(Math.round((end - start) * 1000) / 1000 / timelineMs) : 0;
+  const timeline = Array.from({ length: buckets }, () => 0);
   let messages = 0;
   let errors = 0;
   let failed = false;
@@ -103,8 +131,18 @@ export async function measure({
           }
           const finished = now();
           if (began >= start && finished <= end) {
-            latencies.push((finished - began) * 1000);
+            const latency = (finished - began) * 1000;
+            latencies.push(latency);
             messages += carried;
+            if (latency > slowUs) {
+              slow++;
+            }
+          }
+          if (finished >= start && finished < end) {
+            const bucket = Math.floor((finished - start) / timelineMs);
+            if (bucket < buckets) {
+              timeline[bucket] += carried;
+            }
           }
         }
       } finally {
@@ -112,11 +150,23 @@ export async function measure({
       }
     }),
   );
-  return { latencies, messages, errors };
+  return {
+    latencies,
+    messages,
+    errors,
+    ...(slowUs > 0 && { slow }),
+    ...(timelineMs > 0 && {
+      timeline: {
+        start_unix_us: Math.round((timeOrigin + start) * 1000),
+        bucket_ms: timelineMs,
+        msgs: timeline,
+      },
+    }),
+  };
 }
 
 /** The result line of what measure found, with input's description of the run. */
-export function summarize(input, { latencies, messages, errors }) {
+export function summarize(input, { latencies, messages, errors, slow, timeline }) {
   if (latencies.length === 0) {
     throw new Error(
       `no operation completed in the ${input.duration}s measured window (${errors} failed)`,
@@ -148,6 +198,8 @@ export function summarize(input, { latencies, messages, errors }) {
     lost: 0,
     payload: input.payload,
     compression: input.compression,
+    ...(slow !== undefined && { slow }),
+    ...(timeline !== undefined && { timeline }),
   };
 }
 

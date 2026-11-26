@@ -60,12 +60,16 @@ server prints every goroutine's stack, and the end of its log is printed.
 Timings depend on the machine and on whatever else is running; compare runs
 from the same machine only. `--repeat N` (default 1) runs each cell up to N
 times and reports the run with the median messages per second; its JSON object
-adds `repeats` and every run's rate as `msgs_per_sec_runs`, and the summary's
-`spread%` column is the range of those rates as a share of the median. Each
-run logs to `CELL-rI.log`. Single runs on a shared machine can be a third off,
-so use at least 3 before reading anything into one cell. `--tolerance PERCENT`
-stops repeating a cell as soon as two of its runs differ by at most that
-share of the lower one, so steady cells take two runs and noisy ones up to N.
+adds `repeats`, every run's rate as `msgs_per_sec_runs`, and `failed_runs`, how
+many runs had failed operations, and the summary's `spread%` column is the
+range of those rates as a share of the median. The median comes from the runs
+without failed operations when there are any: a run whose calls were still in
+flight when its window ended counts them as failed and leaves them out of its
+latencies. Each run logs to `CELL-rI.log`. Single runs on a shared machine can
+be a third off, so use at least 3 before reading anything into one cell.
+`--tolerance PERCENT` stops repeating a cell as soon as two of its runs without
+failed operations differ by at most that share of the lower one, so steady
+cells take two runs and noisy ones up to N.
 
 `--table NAME` runs only the cells that one table of the wiki's Benchmarks page
 reads, with that table's options (scenarios, sizes, concurrency, payload,
@@ -179,9 +183,27 @@ one table per profile, and each JSON record carries the profile as `netem`.
   Outages that would end after the measured window are left out.
 - The `access` table runs profiles of Wi-Fi, roaming Wi-Fi, LTE and 5G on the
   move ([`tables.py`](tables.py) cites the measurements behind each), with the
-  same cells as `lossy`, in 20 s windows after 3 s of warmup: deep queues take
-  seconds to settle, and in 10 s windows, cells with outages swung by up to a
-  quarter between runs.
+  same cells as `lossy`. Both, and `browser-lossy`, run 20 s windows after 3 s
+  of warmup: deep queues take seconds to settle, and in 10 s windows, cells
+  with outages swung by up to a quarter between runs, and cells over TCP at
+  about 3% burst loss by up to 15 times.
+- Over a link with a delay, the runner asks every client for its `slow` count
+  with `--slow-us` set to twice the link's round trip (the delays of both
+  directions, without jitter, slots or queueing), and the summary's `late%`
+  column is the share of operations that took longer, or for the paced
+  scenarios the share of messages that did or never arrived in time. Only
+  the scenarios whose operation is one round trip (`unary`, `bidi`,
+  `validation-unary` and the paced ones) count late operations: a streaming
+  call takes as long as its messages need.
+- Over a link with outages, the runner also asks for a `timeline` and records
+  when each outage ran, by the wall clock. The summary's `recov_ms` column is
+  the median, over the outages, of how long the client took to get back to
+  full throughput: from the end of the outage to the start of the first
+  quarter second whose rate is 90% of the rate in the second before the
+  outage. An outage without a second of the window before it is left out, and
+  one the client does not recover from before the next outage, or the end of
+  the window, counts as lasting until then. The JSON adds `recovery_ms` and
+  every outage's as `recoveries_ms`.
 - Size streaming operations to the link. Only operations that finish inside
   the measured window count, and with loss one connection carries far less:
   at a 20 ms round trip and 1% loss, roughly 1 MB/s. The default 100
@@ -270,7 +292,7 @@ for the whole run.
                [--size BYTES] [--concurrency N] [--connections N] [--duration SECONDS]
                [--warmup SECONDS] [--messages N] [--rate N] [--metadata-size BYTES]
                [--metadata-scope call|connection] [--payload repeat|records] [--compression MODE] [--dictionary FILE]
-               [--validation none|standard|cel]
+               [--validation none|standard|cel] [--slow-us MICROSECONDS] [--timeline-ms MILLISECONDS]
 ```
 
 - `--transport quic` dials native QUIC at `--addr`. `--transport tcp` dials
@@ -328,6 +350,17 @@ for the whole run.
 - `--validation` (default `none`) is the rule set of the
   [validation scenarios](#validation): which `ValidationBench` methods they call. A client exits
   non-zero for a value other than `none` with any other scenario.
+- `--slow-us` (default 0) turns on the `slow` count: with a positive value, the
+  result counts how many of the operations the window counts took longer than
+  that many microseconds, and for the paced scenarios, how many of the messages
+  delivered in time did. `run.py` passes twice an emulated link's round trip.
+- `--timeline-ms` (default 0) turns on the `timeline`: with a positive value,
+  the result counts the messages delivered in each interval of that many
+  milliseconds of the measured window, so `run.py` can line them up against a
+  profile's outages. A message counts in the interval in which the operation
+  that carried it completed, whenever that operation started, and a paced
+  message in the one in which its echo arrived in time. `run.py` passes 50 for
+  profiles with outages.
 - `--payload` (default `repeat`) is what `EchoRequest.message` holds: `repeat`
   is `size` times the letter `x`, the same in every request; `records` is a
   new [records](#payload) message for every request.
@@ -438,6 +471,16 @@ non-zero if it could not connect or measure:
   scenarios it includes echoes that arrived too late, so even a reliable stream
   can lose messages.
 - `rate` echoes `--rate`, for the paced scenarios only.
+- `slow`, with `--slow-us`, counts the operations the window counts, or for
+  the paced scenarios the messages delivered in time, that took longer than
+  `--slow-us`. Without it the field is omitted.
+- `timeline`, with `--timeline-ms`, is
+  `{"start_unix_us": START, "bucket_ms": N, "msgs": [COUNT, ...]}`: `START` is
+  when the measured window started, in microseconds since the Unix epoch by
+  the wall clock (the runner times outages by the same clock), and `msgs`
+  holds `ceil(duration × 1000 / N)` counts, the messages delivered in each
+  N-millisecond interval of the window, as `--timeline-ms` describes. Without
+  it the field is omitted.
 - `validation` echoes `--validation`, for the validation scenarios only.
 
 ## Payload
