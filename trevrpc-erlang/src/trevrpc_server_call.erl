@@ -688,7 +688,7 @@ earliest(Deadline, Timeout) -> min(Deadline, erlang:monotonic_time(millisecond) 
 
 %% Writes the call's end: its single response message, if it has one, and
 %% its terminal STATUS, once the connection released its slots, then tells
-%% the connection how it ended and emits its stop.
+%% the connection how it ended, and the sizes of its messages.
 finish(Call, Kind, Result, Router, Id) ->
     State = trevrpc_call:state(Call),
     #call_state{trailers = Trailers, max_frame_size = Max, answer = Answer} = State,
