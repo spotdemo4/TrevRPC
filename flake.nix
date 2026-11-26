@@ -89,7 +89,7 @@
               # python
               python3
               ruff
-              basedpyright
+              pyright
               uv
 
               # erlang / gleam

@@ -13,7 +13,10 @@
     "flake.nix": "flake.lock,treefmt.toml",
     "README.md": "*.md,LICENSE",
     "settings.gradle.kts": "build.gradle.kts,gradle.properties,gradle.lockfile,settings-gradle.lockfile",
-    "package.json": "package-lock.json,.npmrc"
+    "package.json": "package-lock.json,.npmrc",
+    "pyproject.toml": "uv.lock",
+    "gleam.toml": "manifest.toml",
+    "rebar.config": "rebar.lock"
   },
 
   "json.schemaDownload.trustedDomains": {
@@ -41,6 +44,31 @@
   // jetbrains.kotlin-server
   "[kotlin]": {
     "editor.defaultFormatter": "jetbrains.kotlin-server"
+  },
+
+  // ms-pyright.pyright
+  "pyright.disableLanguageServices": false,
+
+  // charliermarsh.ruff
+  "ruff.enable": true,
+  "ruff.nativeServer": "on",
+  "ruff.path": ["ruff"],
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+
+  // gleam.gleam
+  "gleam.prerelease": false,
+  "[gleam]": {
+    "editor.defaultFormatter": "gleam.gleam"
+  },
+
+  // erlang-language-platform.erlang-language-platform
+  // Formats with its bundled erlfmt: elpClient.erlfmt.path is machine-scoped, so a workspace cannot
+  // point it at the dev shell's erlfmt that `nix fmt` runs.
+  "elpClient.serverPath": "elp",
+  "[erlang]": {
+    "editor.defaultFormatter": "erlang-language-platform.erlang-language-platform"
   },
 
   // TypeScriptTeam.native-preview

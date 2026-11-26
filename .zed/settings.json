@@ -83,6 +83,17 @@
         { "language_server": { "name": "ruff" } }
       ]
     },
+    "Gleam": {
+      "format_on_save": "on",
+      "language_servers": ["gleam"],
+      "formatter": [{ "language_server": { "name": "gleam" } }]
+    },
+    "Erlang": {
+      "format_on_save": "on",
+      "language_servers": ["elp", "!erlang-ls"],
+      // The dev shell's erlfmt, which `nix fmt` runs, rather than the one bundled into elp.
+      "formatter": [{ "external": { "command": "erlfmt", "arguments": ["-"] } }]
+    },
     "Proto": {
       "format_on_save": "on",
       "language_servers": ["buf"],
