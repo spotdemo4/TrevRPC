@@ -53,16 +53,31 @@ log(Level, Side, Phase, Fields) ->
         domain => [trevrpc, Side], report_cb => fun ?MODULE:format/1
     }).
 
-%% @private The report callback: `trevrpc <phase>: key=value ...'.
+%% @private The report callback: `trevrpc <phase>: key=value ...'. Some
+%% values are the client's, such as an HTTP authority, so text is printed
+%% with its control characters escaped, and a binary that is not UTF-8 as a
+%% binary: a value cannot add lines to a text log.
 -spec format(map()) -> {io:format(), [term()]}.
 format(#{phase := Phase} = Report) ->
     Fields = lists:sort(maps:to_list(maps:remove(phase, Report))),
-    {"trevrpc ~s:" ++ lists:append([" ~s=" ++ spec(Value) || {_, Value} <- Fields]), [
-        Phase | lists:append([[Key, Value] || {Key, Value} <- Fields])
+    {"trevrpc ~s:" ++ lists:append([" ~s=~ts" || _ <- Fields]), [
+        Phase | lists:append([[Key, value(Value)] || {Key, Value} <- Fields])
     ]}.
 
-spec(Value) when is_binary(Value) -> "~ts";
-spec(_Value) -> "~0p".
+value(Value) when is_binary(Value) ->
+    case unicode:characters_to_list(Value) of
+        Chars when is_list(Chars) -> [escape(C) || C <- Chars];
+        _ -> io_lib:format("~0p", [Value])
+    end;
+value(Value) ->
+    io_lib:format("~0p", [Value]).
+
+escape($\n) -> "\\n";
+escape($\r) -> "\\r";
+escape($\t) -> "\\t";
+escape($\\) -> "\\\\";
+escape(C) when C < 16#20; C =:= 16#7F -> io_lib:format("\\x~2.16.0B", [C]);
+escape(C) -> C.
 
 %% @doc What an exception was, and where, for a report that must not hold
 %% what it was raised on: its class, its reason's tag, and the functions of

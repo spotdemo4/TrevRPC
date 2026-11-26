@@ -217,7 +217,6 @@ encode_connection_metadata(Set) ->
         metadata_field(2, maps:get(metadata, Set, #{}))
     ].
 
-%% @doc The wire value of an RPC kind.
 %% @doc The service and method names of a method path,
 %% `/package.Service/Method', or empty ones for anything else.
 -spec method_names(binary()) -> {binary(), binary()}.
@@ -229,6 +228,7 @@ method_names(<<$/, Path/binary>>) ->
 method_names(_Method) ->
     {<<>>, <<>>}.
 
+%% @doc The wire value of an RPC kind.
 -spec kind_to_int(kind()) -> integer().
 kind_to_int(unary) -> 0;
 kind_to_int(client_streaming) -> 1;

@@ -34,14 +34,16 @@
 %% the race between a call that finishes and a deadline or cancellation
 %% that ends it: exactly one of them writes the call's end.
 %%
-%% An admitted call's end is reported once, however it ends. The call
-%% process tells this one how it ended after it wrote its STATUS ({@link
-%% ended/4}), then emits its telemetry stop (see {@link trevrpc_telemetry});
-%% for a call stopped before it told, this process emits the stop itself,
-%% with the status of whatever stopped it. Either way the finish functions
-%% the call's interceptors registered, which the call process sends here as
-%% it gets them ({@link intercepted/4}), run from here once, in a process of
-%% their own, since a call process that was stopped cannot run them.
+%% This process alone reports an admitted call's start and end, so that
+%% each is reported once however the call ends: it emits the call's
+%% telemetry start when it admits it (see {@link trevrpc_telemetry}), and
+%% its stop when the call process tells it how the call ended, after it
+%% wrote its STATUS ({@link ended/5}), or when something stopped the call
+%% first, with the status of whatever stopped it. Either way the finish
+%% functions the call's interceptors registered, which the call process
+%% sends here as it gets them ({@link intercepted/4}), then run once, in a
+%% process of their own, since a call process that was stopped cannot run
+%% them.
 %%
 %% A native QUIC connection, a QMux session and a WebTransport session keep
 %% the connection metadata sets their client offered, at most four, in an
@@ -54,7 +56,7 @@
 -behaviour(gen_server).
 
 -export([start/2, start_qmux/3, start_http/3, serve_h3/4, shutdown/1, admit/4, finish/3, reserve/4]).
--export([intercepted/4, ended/4]).
+-export([intercepted/4, ended/5]).
 -export([store_connection_metadata/3, connection_metadata/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -219,11 +221,18 @@ intercepted(Pid, Id, Ref, Finish) ->
     gen_server:cast(Pid, {intercepted, Id, Ref, Finish}).
 
 %% @doc Reports that the admitted call on stream `Id' ended with `Status'
-%% once it wrote its end, which runs its finish functions; the call process
-%% emits its telemetry stop itself.
--spec ended(pid(), non_neg_integer(), reference(), trevrpc_status:status()) -> ok.
-ended(Pid, Id, Ref, Status) ->
-    gen_server:cast(Pid, {ended, Id, Ref, Status}).
+%% once it wrote its end, with the bytes of its single request and response
+%% messages: this process emits its telemetry stop and runs its finish
+%% functions.
+-spec ended(
+    pid(),
+    non_neg_integer(),
+    reference(),
+    trevrpc_status:status(),
+    {non_neg_integer(), non_neg_integer()}
+) -> ok.
+ended(Pid, Id, Ref, Status, Bytes) ->
+    gen_server:cast(Pid, {ended, Id, Ref, Status, Bytes}).
 
 %% @doc Cancels every call, waits for their handlers up to the graceful
 %% shutdown timeout, then closes the connection.
@@ -391,10 +400,10 @@ handle_cast({intercepted, Id, Ref, Finish}, #state{streams = Streams} = State) -
         _ ->
             {noreply, State}
     end;
-handle_cast({ended, Id, Ref, Status}, #state{streams = Streams} = State) ->
+handle_cast({ended, Id, Ref, Status, Bytes}, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #entry{state = finishing, ref = Ref} = Entry} ->
-            Reported = run_finishes(Entry#entry{reported = true}, Status),
+            Reported = report_end(Entry, Status, Bytes),
             {noreply, State#state{streams = Streams#{Id := Reported}}};
         _ ->
             {noreply, State}
@@ -1225,6 +1234,7 @@ admitted(Id, #entry{ref = Ref, pid = Pid} = Entry, Admission, Flow, Decode, Stat
                 false -> 0
             end
     },
+    trevrpc_telemetry:start(Running#entry.started, Running#entry.call),
     {reply, {ok, #{flow => Spec, stream_requests => Decode}}, State#state{
         streams = (State#state.streams)#{Id := Running}, flows = Registered
     }}.
@@ -1303,15 +1313,18 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
             maybe_close(State)
     end.
 
-%% Reports the end of a call that this process stopped, with `Status',
-%% unless the call process already did: its telemetry stop, if it was
-%% admitted, and its finish functions.
-report_end(#entry{call = undefined} = Entry, _Status) ->
+%% Reports the end of an admitted call, with `Status', once: its telemetry
+%% stop and its finish functions. A call that was not admitted reports
+%% itself, start and stop together.
+report_end(Entry, Status) ->
+    report_end(Entry, Status, {0, 0}).
+
+report_end(#entry{call = undefined} = Entry, _Status, _Bytes) ->
     Entry;
-report_end(#entry{reported = true} = Entry, _Status) ->
+report_end(#entry{reported = true} = Entry, _Status, _Bytes) ->
     Entry;
-report_end(#entry{call = Meta, started = Started} = Entry, Status) ->
-    trevrpc_telemetry:stop(Started, Meta, Status, {0, 0}),
+report_end(#entry{call = Meta, started = Started} = Entry, Status, Bytes) ->
+    trevrpc_telemetry:stop(Started, Meta, Status, Bytes),
     run_finishes(Entry#entry{reported = true}, Status).
 
 %% Runs the finish functions of a call that ended with `Status', once, in a

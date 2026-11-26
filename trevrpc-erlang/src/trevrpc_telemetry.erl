@@ -38,9 +38,12 @@
 %%     end, []).
 %% '''
 %%
-%% Handlers run inline, in the call's process, or in its connection's for a
-%% call that was stopped, so they must not block; `telemetry' detaches one
-%% that crashes. Neither event holds the request's metadata or messages.
+%% Each call's events are emitted once and in pairs: an admitted call's by
+%% its connection's process, which admits it and alone learns how it ended,
+%% however it ended, and a call rejected before it was admitted by its own
+%% process, both at once. Handlers run inline there, so they must not block;
+%% `telemetry' detaches one that crashes. Neither event holds the request's
+%% metadata or messages.
 -module(trevrpc_telemetry).
 
 -export([meta/4, start/2, stop/4, rejected/3]).

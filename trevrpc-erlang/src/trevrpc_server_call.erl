@@ -317,7 +317,6 @@ admit(Checked, Stream, Router, Config) ->
     ),
     case trevrpc_server_conn:admit(Router, Id, trevrpc_stream:ref(Stream), Admission) of
         {ok, #{flow := Flow, stream_requests := Decode}} ->
-            trevrpc_telemetry:start(Started, Meta),
             Deadline = deadline(Timeout),
             %% Built only for a server with hooks, which alone read it.
             Info =
@@ -336,15 +335,14 @@ admit(Checked, Stream, Router, Config) ->
                         deadline => Deadline,
                         config => Config,
                         flow => Flow,
-                        stream_requests => Decode,
-                        telemetry => Meta
+                        stream_requests => Decode
                     });
                 {error, Status} ->
                     Ref = trevrpc_stream:ref(Stream),
                     case trevrpc_server_conn:finish(Router, Id, Ref) of
                         ok ->
                             lone_status(Status, Stream, maps:get(max_frame_size, Config)),
-                            ended(Router, Id, Ref, {Started, Meta}, Status, {0, 0});
+                            ended(Router, Id, Ref, Status, {0, 0});
                         cancelled ->
                             ok
                     end
@@ -356,12 +354,13 @@ admit(Checked, Stream, Router, Config) ->
             ok
     end.
 
-%% Tells the connection how an admitted call ended, for the finish functions
-%% of its interceptors, then emits its stop: the connection emits it itself
-%% for a call stopped before it told.
-ended(Router, Id, Ref, {Started, Meta}, Status, Bytes) ->
-    ok = trevrpc_server_conn:ended(Router, Id, Ref, Status),
-    trevrpc_telemetry:stop(Started, Meta, Status, Bytes).
+%% Tells the connection how an admitted call ended, and the bytes of its
+%% single request and response messages: the connection, which emitted the
+%% call's telemetry start when it admitted it, alone emits its stop and runs
+%% its finish functions, whether the call tells it or something stops the
+%% call first, so that each is reported once.
+ended(Router, Id, Ref, Status, Bytes) ->
+    trevrpc_server_conn:ended(Router, Id, Ref, Status, Bytes).
 
 %% What the authorizer and the interceptors know of the call.
 call_info(#{request := #{method := Method, kind := Kind}} = Checked, Deadline) ->
@@ -541,7 +540,6 @@ serve(#{stream := Stream0, router := Router, route := Route, config := Config} =
             trevrpc_server_conn:reserve(Router, Id, Ref, trevrpc_zstd_stream:encoder_cost())
         end
     }),
-    Ending = {maps:get(started, Spec), maps:get(telemetry, Spec)},
     case run_interceptors(maps:get(interceptors, Config), Spec, Router, Id, Ref) of
         {ok, Intercepted} ->
             Handled = Call#call{context = Intercepted},
@@ -554,10 +552,10 @@ serve(#{stream := Stream0, router := Router, route := Route, config := Config} =
                     false -> ok
                 end,
             Result = handle(Kind, Handler, Handled, Config),
-            finish(Handled, Kind, Result, Router, Id, Ending);
+            finish(Handled, Kind, Result, Router, Id);
         {error, Status} ->
-            %% finish/6 logs an internal status.
-            finish(Call, Kind, {error, Status}, Router, Id, Ending)
+            %% finish/5 logs an internal status.
+            finish(Call, Kind, {error, Status}, Router, Id)
     end.
 
 flow(undefined, _Kind, _Route, Stream) ->
@@ -691,7 +689,7 @@ earliest(Deadline, Timeout) -> min(Deadline, erlang:monotonic_time(millisecond) 
 %% Writes the call's end: its single response message, if it has one, and
 %% its terminal STATUS, once the connection released its slots, then tells
 %% the connection how it ended and emits its stop.
-finish(Call, Kind, Result, Router, Id, Ending) ->
+finish(Call, Kind, Result, Router, Id) ->
     State = trevrpc_call:state(Call),
     #call_state{trailers = Trailers, max_frame_size = Max, answer = Answer} = State,
     %% A call that sent response datagrams announces them before its STATUS.
@@ -737,7 +735,6 @@ finish(Call, Kind, Result, Router, Id, Ending) ->
                 Router,
                 Id,
                 Call#call.ref,
-                Ending,
                 sent(Sent, Ended),
                 {State#call_state.request_bytes, ResponseBytes}
             ),

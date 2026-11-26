@@ -230,6 +230,9 @@ hooks_test_() ->
             {"telemetry: a call the admission refuses", fun telemetry_refused/0},
             {"telemetry: a malformed REQUEST", fun telemetry_malformed/0},
             {"telemetry: a call past its deadline", fun telemetry_deadline/0},
+            {"telemetry: a call whose deadline passes at once", fun telemetry_instant_deadline/0},
+            {"telemetry: a call stopped while it writes its end", fun telemetry_stopped_writing/0},
+            {"telemetry: a call whose connection closes", fun telemetry_closed_connection/0},
             {"reports: handler failures", fun handler_reports/0},
             {"reports: an incomplete shutdown", fun shutdown_report/0},
             {"optimistic call refused and replayed", fun replayed/0}
@@ -801,7 +804,75 @@ telemetry_deadline() ->
         end)
     end).
 
+%% A deadline that passes as soon as the call is admitted still pairs its
+%% events: the connection emits both.
+telemetry_instant_deadline() ->
+    with_events(fun() ->
+        with_server(#{}, fun(#{channel := Channel}) ->
+            [
+                begin
+                    {ok, _Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 1}),
+                    {_, _, _, Status} = events(),
+                    ?assertMatch(#{code := deadline_exceeded}, Status)
+                end
+             || _ <- lists:seq(1, 20)
+            ],
+            no_more_events()
+        end)
+    end).
+
+%% A call that the end of the graceful shutdown stops while it writes its
+%% end reports once, from the connection, which never heard how it ended.
+telemetry_stopped_writing() ->
+    with_events(fun() ->
+        Opts = #{graceful_shutdown_timeout => 200, channel => #{max_frame_size => 65536}},
+        with_server(Opts, fun(#{channel := Channel, server := Server}) ->
+            {ok, Call} = trevrpc_client:client_stream(Channel, ?BIG, #{timeout => 10000}),
+            ok = trevrpc_client:close_send(Call),
+            receive
+                {telemetry, start, _, _} = Started -> self() ! Started
+            after 5000 -> error(no_start)
+            end,
+            ok = trevrpc_server:stop(Server),
+            {_, _, _, Status} = events(),
+            ?assertMatch(#{code := unavailable}, Status),
+            no_more_events()
+        end)
+    end).
+
+%% A call whose connection closes under it reports once, from the
+%% connection's end.
+telemetry_closed_connection() ->
+    with_events(fun() ->
+        with_server(#{}, fun(#{channel := Channel}) ->
+            {ok, _Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 5000}),
+            receive
+                {telemetry, start, _, _} = Started -> self() ! Started
+            after 5000 -> error(no_start)
+            end,
+            trevrpc_channel:close(Channel),
+            {_, _, _, Status} = events(),
+            ?assertMatch(#{code := cancelled}, Status),
+            no_more_events()
+        end)
+    end).
+
 %%% Reports
+
+%% Text from the client cannot add lines to a text log.
+format_escapes_test() ->
+    {Format, Args} = trevrpc_log:format(#{
+        phase => misdirected_request,
+        authority => <<"evil\nINJECTED \\ ", 1, " "/utf8, 233/utf8>>,
+        raw => <<255, $\n>>
+    }),
+    Text = unicode:characters_to_binary(io_lib:format(Format, Args)),
+    ?assertEqual(nomatch, binary:match(Text, <<"\n">>)),
+    ?assertEqual(
+        <<"trevrpc misdirected_request: authority=evil\\nINJECTED \\\\ \\x01 ", 233/utf8,
+            " raw=<<\"", 255/utf8, "\\n\">>">>,
+        Text
+    ).
 
 handler_reports() ->
     with_reports(fun() ->
